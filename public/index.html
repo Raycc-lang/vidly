@@ -212,7 +212,7 @@
   #localTile {
     position: fixed;
     right: 22px; bottom: 110px;
-    width: 350px; aspect-ratio: 16/9;
+    width: 350px; min-height: 100px; aspect-ratio: 16/9;
     border-radius: 12px; overflow: hidden;
     background: #000; border: 1px solid var(--border);
     box-shadow: 0 12px 32px rgba(0,0,0,.5);
@@ -799,11 +799,12 @@ $('switchCamBtn').onclick = async () => {
         if (Math.abs(dx) > 3 || Math.abs(dy) > 3) hasMoved = true;
         const vp = getViewportBounds();
         const rect = localTile.getBoundingClientRect();
-        const tileW = rect.width;
-        const tileH = rect.height;
-        // Constrain to viewport (leave 8px margin)
-        const newRight = clamp(startRight - dx, 8, vp.w - tileW - 8);
-        const newBottom = clamp(startBottom - dy, 8, vp.h - tileH - 8);
+        const tileW = rect.width || 200;
+        const tileH = rect.height || 112;
+        // Constrain to viewport — keep at least 60px of the tile visible
+        const minVisible = 60;
+        const newRight = clamp(startRight - dx, -(tileW - minVisible), vp.w - minVisible);
+        const newBottom = clamp(startBottom - dy, -(tileH - minVisible), vp.h - minVisible);
         localTile.style.right = newRight + 'px';
         localTile.style.bottom = newBottom + 'px';
         localTile.style.left = 'auto';
@@ -819,6 +820,17 @@ $('switchCamBtn').onclick = async () => {
         if (hasMoved) {
             sessionStorage.setItem('vidly-pip-right', localTile.style.right);
             sessionStorage.setItem('vidly-pip-bottom', localTile.style.bottom);
+        }
+        // Ensure tile is visible after drag — snap back if off-screen
+        const vp = getViewportBounds();
+        const rect = localTile.getBoundingClientRect();
+        if (rect.right < 20 || rect.bottom < 20 || rect.left > vp.w - 20 || rect.top > vp.h - 20) {
+            localTile.style.right = '22px';
+            localTile.style.bottom = '110px';
+            localTile.style.left = 'auto';
+            localTile.style.top = 'auto';
+            sessionStorage.removeItem('vidly-pip-right');
+            sessionStorage.removeItem('vidly-pip-bottom');
         }
     }
 
@@ -966,6 +978,12 @@ function ensurePeer(peerId, polite, createDC, username) {
     if (localStream) {
         for (const track of localStream.getTracks()) {
             pc.addTrack(track, localStream);
+        }
+    }
+    // Also add mic-only stream if camera is off but mic is on.
+    if (micStream) {
+        for (const track of micStream.getTracks()) {
+            pc.addTrack(track, micStream);
         }
     }
 
