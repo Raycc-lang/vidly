@@ -549,6 +549,12 @@ let noiseAudioContext = null;
 let noiseSource = null;
 let noiseNode = null;
 let noiseDestination = null;
+let noiseWasmExports = null;
+let noiseWasmState = 0;
+let noiseWasmInPtr = 0;
+let noiseWasmOutPtr = 0;
+let noiseWasmFree = null;
+let noiseWasmDestroy = null;
 let processedMicTrack = null;
 let processedSourceTrack = null;
 let previewStream = null;    // preview stream during camera confirmation
@@ -779,7 +785,7 @@ function updateNoiseButton() {
 
 async function stopWasmNoise() {
     if (noiseNode) {
-        try { noiseNode.port.postMessage({ type: 'set-enabled', enabled: false }); } catch {}
+        try { noiseNode.onaudioprocess = null; } catch {}
         try { noiseNode.disconnect(); } catch {}
         noiseNode = null;
     }
@@ -793,10 +799,94 @@ async function stopWasmNoise() {
     }
     processedSourceTrack = null;
     noiseDestination = null;
+    if (noiseWasmDestroy && noiseWasmState) {
+        try { noiseWasmDestroy(noiseWasmState); } catch {}
+    }
+    if (noiseWasmFree) {
+        try { if (noiseWasmInPtr) noiseWasmFree(noiseWasmInPtr); } catch {}
+        try { if (noiseWasmOutPtr) noiseWasmFree(noiseWasmOutPtr); } catch {}
+    }
+    noiseWasmExports = null;
+    noiseWasmState = 0;
+    noiseWasmInPtr = 0;
+    noiseWasmOutPtr = 0;
+    noiseWasmFree = null;
+    noiseWasmDestroy = null;
     if (noiseAudioContext) {
         try { await noiseAudioContext.close(); } catch {}
         noiseAudioContext = null;
     }
+}
+
+function createRnnoiseImports(wasmModule) {
+    const importObject = {};
+    let memory = null;
+    let heapU8 = null;
+    const setMemory = (nextMemory) => {
+        memory = nextMemory;
+        heapU8 = new Uint8Array(memory.buffer);
+    };
+    const refreshHeap = () => {
+        if (memory && (!heapU8 || heapU8.buffer !== memory.buffer)) {
+            heapU8 = new Uint8Array(memory.buffer);
+        }
+    };
+    const resizeHeap = (requestedSize) => {
+        if (!memory) return 0;
+        const currentBytes = memory.buffer.byteLength;
+        if (requestedSize <= currentBytes) return 1;
+        const pagesNeeded = Math.ceil((requestedSize - currentBytes) / 65536);
+        try {
+            memory.grow(pagesNeeded);
+            refreshHeap();
+            return 1;
+        } catch {
+            return 0;
+        }
+    };
+    const memcpy = (dest, src, num) => {
+        refreshHeap();
+        if (!heapU8) return dest;
+        heapU8.copyWithin(dest >>> 0, src >>> 0, (src + num) >>> 0);
+        return dest;
+    };
+
+    for (const descriptor of WebAssembly.Module.imports(wasmModule)) {
+        if (!importObject[descriptor.module]) importObject[descriptor.module] = {};
+        if (descriptor.kind === 'function') {
+            if ((descriptor.module === 'a' && descriptor.name === 'a') || descriptor.name === 'emscripten_resize_heap') {
+                importObject[descriptor.module][descriptor.name] = resizeHeap;
+            } else if ((descriptor.module === 'a' && descriptor.name === 'b') || descriptor.name === 'emscripten_memcpy_js') {
+                importObject[descriptor.module][descriptor.name] = memcpy;
+            } else {
+                importObject[descriptor.module][descriptor.name] = () => 0;
+            }
+        } else if (descriptor.kind === 'memory') {
+            setMemory(new WebAssembly.Memory({ initial: 256, maximum: 32768 }));
+            importObject[descriptor.module][descriptor.name] = memory;
+        } else if (descriptor.kind === 'table') {
+            importObject[descriptor.module][descriptor.name] = new WebAssembly.Table({ initial: 0, element: 'anyfunc' });
+        } else if (descriptor.kind === 'global') {
+            importObject[descriptor.module][descriptor.name] = 0;
+        }
+    }
+
+    return { importObject, setMemory };
+}
+
+function getWasmExport(exports, names, required = true) {
+    for (const name of names) {
+        if (typeof exports[name] === 'function') return exports[name];
+    }
+    if (required) throw new Error(`RNNoise WASM export missing: ${names.join(' or ')}`);
+    return null;
+}
+
+function getWasmMemory(exports) {
+    for (const value of Object.values(exports)) {
+        if (value instanceof WebAssembly.Memory) return value;
+    }
+    throw new Error('RNNoise WASM memory export missing');
 }
 
 async function startWasmNoise() {
@@ -809,74 +899,76 @@ async function startWasmNoise() {
 
     try {
         noiseAudioContext = new AudioContextCtor({ sampleRate: 48000 });
-        if (!noiseAudioContext.audioWorklet) throw new Error('AudioWorklet is not supported');
         if (noiseAudioContext.state === 'suspended') await noiseAudioContext.resume();
-        // Load worklet via Blob URL to bypass browser cache issues with addModule()
-        const workletSrc = await (await fetch('noise-suppressor.js?v=' + Date.now())).text();
-        const workletBlob = new Blob([workletSrc], { type: 'application/javascript' });
-        const workletUrl = URL.createObjectURL(workletBlob);
-        try {
-            await noiseAudioContext.audioWorklet.addModule(workletUrl);
-        } finally {
-            URL.revokeObjectURL(workletUrl);
-        }
-
-        const sourceStream = new MediaStream([rawTrack]);
-        noiseSource = noiseAudioContext.createMediaStreamSource(sourceStream);
-        noiseNode = new AudioWorkletNode(noiseAudioContext, 'noise-suppressor', {
-            numberOfInputs: 1,
-            numberOfOutputs: 1,
-            outputChannelCount: [1]
-        });
-        const currentNoiseNode = noiseNode;
-        const fallbackFromWasmFailure = async (message) => {
-            if (noiseMode !== 'wasm') return;
-            console.warn('[Audio] RNNoise worklet failed', message || '');
-            toast('RNNoise unavailable; using browser noise cancellation', 'warn');
-            noiseMode = nativeNoiseSupported() ? 'native' : 'off';
-            await stopWasmNoise();
-            await publishMicTrack();
-            updateNoiseButton();
-        };
-
-        const readyPromise = new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('RNNoise worklet initialization timed out')), 5000);
-            noiseNode.port.onmessage = (event) => {
-                if (noiseNode !== currentNoiseNode) return;
-                if (event.data?.type === 'ready') {
-                    clearTimeout(timeout);
-                    resolve();
-                } else if (event.data?.type === 'failed') {
-                    clearTimeout(timeout);
-                    reject(new Error(event.data.message || 'RNNoise worklet initialization failed'));
-                } else if (event.data?.type === 'needs-wasm-binary') {
-                    clearTimeout(timeout);
-                    reject(new Error('RNNoise worklet requested legacy WASM binary path'));
-                }
-            };
-        });
 
         const response = await fetch('vendor/rnnoise.wasm');
         if (!response.ok) throw new Error(`RNNoise WASM fetch failed: ${response.status}`);
         const wasmBinary = await response.arrayBuffer();
         const wasmModule = await WebAssembly.compile(wasmBinary);
         console.debug('[Audio] RNNoise WASM imports', WebAssembly.Module.imports(wasmModule));
-        try {
-            currentNoiseNode.port.postMessage({ type: 'init', module: wasmModule }, [wasmModule]);
-        } catch (err) {
-            currentNoiseNode.port.postMessage({ type: 'init', module: wasmModule });
-        }
-        await readyPromise;
 
-        if (noiseNode !== currentNoiseNode) return false;
+        const rnnoiseImports = createRnnoiseImports(wasmModule);
+        const wasmInstance = new WebAssembly.Instance(wasmModule, rnnoiseImports.importObject);
+        noiseWasmExports = wasmInstance.exports;
+        const callCtors = getWasmExport(noiseWasmExports, ['___wasm_call_ctors', '__wasm_call_ctors', 'd'], false);
+        if (typeof callCtors === 'function') callCtors();
+
+        const rnnoiseCreate = getWasmExport(noiseWasmExports, ['_rnnoise_create', 'rnnoise_create', 'f']);
+        const rnnoiseProcessFrame = getWasmExport(noiseWasmExports, ['_rnnoise_process_frame', 'rnnoise_process_frame', 'j']);
+        const malloc = getWasmExport(noiseWasmExports, ['_malloc', 'malloc', 'g']);
+        noiseWasmFree = getWasmExport(noiseWasmExports, ['_free', 'free', 'i'], false);
+        noiseWasmDestroy = getWasmExport(noiseWasmExports, ['_rnnoise_destroy', 'rnnoise_destroy', 'h'], false);
+
+        const FRAME_SIZE = 480;
+        const PCM_SCALE = 32768;
+        const memory = getWasmMemory(noiseWasmExports);
+        rnnoiseImports.setMemory(memory);
+        let heapF32 = new Float32Array(memory.buffer);
+        const refreshHeap = () => {
+            if (heapF32.buffer !== memory.buffer) heapF32 = new Float32Array(memory.buffer);
+        };
+
+        noiseWasmState = rnnoiseCreate(0);
+        noiseWasmInPtr = malloc(FRAME_SIZE * Float32Array.BYTES_PER_ELEMENT);
+        noiseWasmOutPtr = malloc(FRAME_SIZE * Float32Array.BYTES_PER_ELEMENT);
+        if (!noiseWasmState || !noiseWasmInPtr || !noiseWasmOutPtr) {
+            throw new Error('RNNoise allocation failed');
+        }
+
+        const inputQueue = [];
+        const outputQueue = [];
+        const sourceStream = new MediaStream([rawTrack]);
+        noiseSource = noiseAudioContext.createMediaStreamSource(sourceStream);
+        noiseNode = noiseAudioContext.createScriptProcessor(512, 1, 1);
         noiseDestination = noiseAudioContext.createMediaStreamDestination();
+        noiseNode.onaudioprocess = (event) => {
+            const input = event.inputBuffer.getChannelData(0);
+            const output = event.outputBuffer.getChannelData(0);
+
+            for (let i = 0; i < input.length; i++) inputQueue.push(input[i]);
+
+            while (inputQueue.length >= FRAME_SIZE) {
+                refreshHeap();
+                const inHeap = heapF32.subarray(noiseWasmInPtr >> 2, (noiseWasmInPtr >> 2) + FRAME_SIZE);
+                for (let i = 0; i < FRAME_SIZE; i++) inHeap[i] = inputQueue.shift() * PCM_SCALE;
+                rnnoiseProcessFrame(noiseWasmState, noiseWasmOutPtr, noiseWasmInPtr);
+                refreshHeap();
+                const outHeap = heapF32.subarray(noiseWasmOutPtr >> 2, (noiseWasmOutPtr >> 2) + FRAME_SIZE);
+                for (let i = 0; i < FRAME_SIZE; i++) {
+                    outputQueue.push(Math.max(-1, Math.min(1, outHeap[i] / PCM_SCALE)));
+                }
+            }
+
+            for (let i = 0; i < output.length; i++) {
+                output[i] = outputQueue.length ? outputQueue.shift() : 0;
+            }
+        };
+
         noiseSource.connect(noiseNode).connect(noiseDestination);
         processedMicTrack = noiseDestination.stream.getAudioTracks()[0] || null;
         processedSourceTrack = rawTrack;
-        noiseNode.port.postMessage({ type: 'set-enabled', enabled: true });
         if (!processedMicTrack) {
-            await fallbackFromWasmFailure('RNNoise did not produce an output audio track');
-            return false;
+            throw new Error('RNNoise did not produce an output audio track');
         }
         return true;
     } catch (err) {
