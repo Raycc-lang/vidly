@@ -185,6 +185,9 @@
     display: grid; place-items: center;
     color: var(--muted); font-size: 13px;
   }
+  .tile.placeholder video {
+    display: none;
+  }
   .tile-label {
     position: absolute; left: 12px; bottom: 12px;
     display: flex; align-items: center; gap: 8px;
@@ -231,6 +234,18 @@
   #localTile.screensharing video { transform: none; }
   #localTile .tile-label { font-size: 11px; padding: 4px 8px; left: 8px; bottom: 8px; }
 
+  /* Resize handles — invisible, positioned at corners */
+  .resize-handle {
+    position: absolute;
+    width: 24px; height: 24px;
+    z-index: 10;
+    /* debug: background: rgba(255,0,0,.3); */
+  }
+  .resize-handle.nw { top: 0; left: 0; cursor: nw-resize; }
+  .resize-handle.ne { top: 0; right: 0; cursor: ne-resize; }
+  .resize-handle.sw { bottom: 0; left: 0; cursor: sw-resize; }
+  .resize-handle.se { bottom: 0; right: 0; cursor: se-resize; }
+
   /* Local PiP placeholder */
   #localPlaceholder {
     position: absolute; inset: 0;
@@ -276,41 +291,6 @@
     border: 1px solid rgba(255,255,255,.3);
   }
 
-  /* Chat preview strip */
-  .chat-preview {
-    display: none;
-    background: rgba(15, 17, 23, 0.7);
-    backdrop-filter: blur(8px);
-    border-top: 1px solid var(--border);
-    max-height: 80px;
-    overflow-y: auto;
-    padding: 6px 14px;
-    font-size: 12px;
-    color: var(--muted);
-    cursor: pointer;
-    flex-shrink: 0;
-    z-index: 6;
-  }
-  .chat-preview.visible { display: block; }
-  .chat-preview .cp-msg {
-    padding: 2px 0;
-    line-height: 1.4;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .chat-preview .cp-msg .cp-sender {
-    color: var(--accent);
-    font-weight: 600;
-    margin-right: 6px;
-  }
-  .chat-preview .cp-hint {
-    color: var(--muted);
-    font-style: italic;
-    text-align: center;
-    padding: 4px 0;
-  }
-
   /* Toolbar */
   .toolbar {
     display: flex; align-items: center; justify-content: center; gap: 10px;
@@ -326,30 +306,55 @@
   .toolbar .btn.icon { height: 50px; width: 50px; font-size: 20px; border-radius: 12px; }
   .toolbar .btn.icon.muted { background: #3a2222; color: #ffb4b4; }
 
-  /* Chat — bottom drawer */
+  /* Chat — unified preview + full panel */
   .chat {
-    display: flex;
-    flex-direction: column;
-    height: 0;
-    overflow: hidden;
     border-top: 1px solid var(--border);
     background: var(--card);
-    transition: height .3s cubic-bezier(.4,0,.2,1);
     flex-shrink: 0;
+    overflow: hidden;
+    transition: max-height .3s cubic-bezier(.4,0,.2,1);
+    max-height: 60px;
+    cursor: pointer;
   }
   .chat.open {
-    height: 280px;
+    max-height: 300px;
+    cursor: default;
   }
+  .chat-compact {
+    padding: 8px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .chat-compact .cc-msg {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chat-compact .cc-sender {
+    color: var(--accent);
+    font-weight: 600;
+    margin-right: 6px;
+  }
+  .chat-full {
+    display: none;
+    flex-direction: column;
+    height: 300px;
+  }
+  .chat.open .chat-compact { display: none; }
+  .chat.open .chat-full { display: flex; }
   .chat-head {
-    padding: 14px 16px;
+    padding: 12px 16px;
     font-weight: 600; font-size: 14px;
     border-bottom: 1px solid var(--border);
     display: flex; align-items: center; justify-content: space-between;
+    flex-shrink: 0;
   }
-  .chat-close { display: none; }
   .messages {
     flex: 1; overflow-y: auto;
-    padding: 14px;
+    padding: 12px 14px;
     display: flex; flex-direction: column; gap: 8px;
     scroll-behavior: smooth;
   }
@@ -362,11 +367,12 @@
   .msg.other { align-self: flex-start; background: #262a36; border-bottom-left-radius: 4px; }
   .msg.system { align-self: center; background: transparent; color: var(--muted); font-size: 12px; font-style: italic; }
   .chat-input {
-    display: flex; gap: 8px; padding: 12px;
+    display: flex; gap: 8px; padding: 10px 12px;
     border-top: 1px solid var(--border);
+    flex-shrink: 0;
   }
-  .chat-input .input { height: 40px; font-size: 14px; }
-  .chat-input .btn { height: 40px; }
+  .chat-input .input { height: 38px; font-size: 14px; }
+  .chat-input .btn { height: 38px; }
 
   /* Toasts */
   #toasts {
@@ -399,11 +405,25 @@
     .grid-wrap { padding: 10px; }
     .grid.n2, .grid.n3, .grid.n4 { grid-template-columns: 1fr; }
     #localTile {
-      width: 200px; right: 12px; bottom: 92px;
-      aspect-ratio: 9/16;
+      width: 170px; right: 12px; bottom: 92px;
+      aspect-ratio: 3/4;
       display: block;
     }
     .toolbar .btn.icon { height: 44px; width: 44px; font-size: 18px; }
+    .chat.open {
+      max-height: 60vh;
+    }
+    .chat.open .chat-full {
+      height: auto;
+      flex: 1;
+      min-height: 0;
+    }
+    .chat.open {
+      position: fixed;
+      inset: 0;
+      max-height: none;
+      z-index: 20;
+    }
   }
 </style>
 </head>
@@ -456,15 +476,20 @@
   </div>
 
   <aside class="chat" id="chat">
-    <div class="chat-head">
-      <span>Chat</span>
-      <button class="btn ghost chat-close" id="closeChat">✕</button>
+    <div class="chat-compact" id="chatCompact">
+      <!-- last 2 messages, shown when chat is closed -->
     </div>
-    <div class="messages" id="messages"></div>
-    <form class="chat-input" id="chatForm">
-      <input class="input" id="chatInput" placeholder="Type a message…" autocomplete="off" />
-      <button class="btn primary" type="submit">Send</button>
-    </form>
+    <div class="chat-full" id="chatFull">
+      <div class="chat-head">
+        <span>Chat</span>
+        <button class="btn ghost" id="closeChat">✕</button>
+      </div>
+      <div class="messages" id="messages"></div>
+      <form class="chat-input" id="chatForm">
+        <input class="input" id="chatInput" placeholder="Type a message…" autocomplete="off" />
+        <button class="btn primary" type="submit">Send</button>
+      </form>
+    </div>
   </aside>
 
   <div id="localTile">
@@ -481,9 +506,11 @@
       </div>
     </div>
     <div class="tile-label" id="localLabel">You</div>
+    <div class="resize-handle nw" data-corner="nw"></div>
+    <div class="resize-handle ne" data-corner="ne"></div>
+    <div class="resize-handle sw" data-corner="sw"></div>
+    <div class="resize-handle se" data-corner="se"></div>
   </div>
-
-  <div class="chat-preview" id="chatPreview"></div>
 
   <footer class="toolbar">
     <button class="btn icon" id="micBtn" title="Mute / unmute mic">🎙️</button>
@@ -510,7 +537,6 @@ let cameraStream = null;       // saved when screen sharing
 let screenStream = null;
 let screenAudioTrack = null;   // optional system/tab audio track from screen share
 let isSharing = false;
-let recentMessages = [];       // last 3 chat messages for preview strip
 let micEnabled = false;
 let camEnabled = false;
 let micStream = null;        // audio-only stream when mic is on but camera is off
@@ -587,7 +613,7 @@ async function showCall() {
     call.classList.add('active');
     $('roomLabel').textContent = roomId;
     $('localLabel').textContent = myUsername || 'You';
-    updateChatPreview();
+    updateChatCompact();
     await loadConfig();
     await initLocalMedia();
     connectWebSocket();
@@ -779,6 +805,14 @@ $('switchCamBtn').onclick = async () => {
     let isDragging = false;
     let startX, startY, startRight, startBottom;
     let hasMoved = false;
+    const rect0 = localTile.getBoundingClientRect();
+    const computedAspect = getComputedStyle(localTile).aspectRatio;
+    const aspectParts = computedAspect.split('/').map(v => parseFloat(v.trim()));
+    const tileAspect = rect0.width && rect0.height
+        ? rect0.width / rect0.height
+        : (aspectParts.length === 2 && aspectParts.every(Number.isFinite) && aspectParts[1]
+            ? aspectParts[0] / aspectParts[1]
+            : 16 / 9);
 
     function getViewportBounds() {
         return {
@@ -791,6 +825,7 @@ $('switchCamBtn').onclick = async () => {
 
     function onPointerDown(e) {
         // Only start drag from the tile itself, not from buttons inside it
+        if (e.target.closest('.resize-handle')) return;
         if (e.target.closest('button') || e.target.closest('.btn')) return;
         isDragging = true;
         hasMoved = false;
@@ -848,6 +883,62 @@ $('switchCamBtn').onclick = async () => {
         }
     }
 
+    // ─── Resize handles ──────────────────────────────
+    const MIN_W = 120, MAX_W = 600;
+    const handles = localTile.querySelectorAll('.resize-handle');
+    let isResizing = false;
+    let resizeCorner = '';
+    let resizeStartX, resizeStartY, resizeStartW, resizeStartH, resizeStartRight;
+
+    function onResizeDown(e) {
+        e.stopPropagation(); // don't trigger drag
+        isResizing = true;
+        resizeCorner = e.target.dataset.corner;
+        const pos = e.touches ? e.touches[0] : e;
+        resizeStartX = pos.clientX;
+        resizeStartY = pos.clientY;
+        const rect = localTile.getBoundingClientRect();
+        resizeStartW = rect.width;
+        resizeStartH = rect.height;
+        resizeStartRight = getViewportBounds().w - rect.right;
+        localTile.style.aspectRatio = '';
+        if (e.type === 'touchstart') e.preventDefault();
+    }
+
+    function onResizeMove(e) {
+        if (!isResizing) return;
+        const pos = e.touches ? e.touches[0] : e;
+        const dx = pos.clientX - resizeStartX;
+        const dy = pos.clientY - resizeStartY;
+
+        let newW;
+        if (resizeCorner === 'se' || resizeCorner === 'ne') {
+            newW = resizeStartW + dx;
+        } else {
+            newW = resizeStartW - dx;
+        }
+        newW = Math.max(MIN_W, Math.min(MAX_W, newW));
+        const newH = newW / tileAspect;
+
+        localTile.style.width = newW + 'px';
+        localTile.style.height = newH + 'px';
+
+        // Reposition if resizing from left corners (nw/sw)
+        if (resizeCorner === 'nw' || resizeCorner === 'sw') {
+            localTile.style.right = (resizeStartRight + (resizeStartW - newW)) + 'px';
+        }
+
+        if (e.type === 'touchmove') e.preventDefault();
+    }
+
+    function onResizeUp() {
+        if (!isResizing) return;
+        isResizing = false;
+        // Save size
+        sessionStorage.setItem('vidly-pip-w', localTile.style.width);
+        sessionStorage.setItem('vidly-pip-h', localTile.style.height);
+    }
+
     // Mouse events
     localTile.addEventListener('mousedown', onPointerDown);
     document.addEventListener('mousemove', onPointerMove);
@@ -858,12 +949,30 @@ $('switchCamBtn').onclick = async () => {
     document.addEventListener('touchmove', onPointerMove, { passive: false });
     document.addEventListener('touchend', onPointerUp);
 
+    handles.forEach(h => {
+        h.addEventListener('mousedown', onResizeDown);
+        h.addEventListener('touchstart', onResizeDown, { passive: false });
+    });
+    document.addEventListener('mousemove', onResizeMove);
+    document.addEventListener('touchmove', onResizeMove, { passive: false });
+    document.addEventListener('mouseup', onResizeUp);
+    document.addEventListener('touchend', onResizeUp);
+
     // Restore saved position
     const savedRight = sessionStorage.getItem('vidly-pip-right');
     const savedBottom = sessionStorage.getItem('vidly-pip-bottom');
     if (savedRight && savedBottom) {
         localTile.style.right = savedRight;
         localTile.style.bottom = savedBottom;
+    }
+
+    // Restore saved size
+    const savedW = sessionStorage.getItem('vidly-pip-w');
+    const savedH = sessionStorage.getItem('vidly-pip-h');
+    if (savedW && savedH) {
+        localTile.style.width = savedW;
+        localTile.style.height = savedH;
+        localTile.style.aspectRatio = '';
     }
 })();
 
@@ -990,10 +1099,38 @@ function ensurePeer(peerId, polite, createDC, username) {
     // Remote tracks → attach to remote MediaStream feeding the <video>.
     pc.ontrack = (e) => {
         console.log('[WebRTC] ontrack:', e.track.kind, e.track.id, 'readyState:', e.track.readyState);
-        remoteStream.addTrack(e.track);
-        tileEl.classList.remove('placeholder');
-        e.track.onended = () => {
-            try { remoteStream.removeTrack(e.track); } catch {}
+        const track = e.track;
+
+        // If this is a video track and we already have one, replace it (handles
+        // the case where peer re-enables camera after turning it off).
+        if (track.kind === 'video') {
+            const existing = remoteStream.getVideoTracks()[0];
+            if (existing) {
+                remoteStream.removeTrack(existing);
+            }
+            remoteStream.addTrack(track);
+            videoEl.srcObject = remoteStream;
+            videoEl.style.display = '';
+            tileEl.classList.remove('placeholder');
+
+            // When sender replaces track with null (camera off), track goes muted.
+            // Show placeholder so the video doesn't freeze on last frame.
+            track.onmute = () => {
+                tileEl.classList.add('placeholder');
+                videoEl.style.display = 'none';
+            };
+            // When sender provides a new track (camera back on), un-mute fires.
+            track.onunmute = () => {
+                tileEl.classList.remove('placeholder');
+                videoEl.style.display = '';
+            };
+        } else {
+            // Audio track — just add it
+            remoteStream.addTrack(track);
+        }
+
+        track.onended = () => {
+            try { remoteStream.removeTrack(track); } catch {}
         };
     };
 
@@ -1173,39 +1310,40 @@ function addMessage(kind, body, ts, senderName) {
     messagesEl.appendChild(el);
     messagesEl.scrollTop = messagesEl.scrollHeight;
 
-    // Track for chat preview strip (skip system messages)
     if (kind === 'own' || kind === 'other') {
-        const sender = kind === 'own' ? 'You' : (senderName || 'Peer');
-        recentMessages.push({ sender, body });
-        if (recentMessages.length > 3) recentMessages.shift();
-        updateChatPreview();
+        updateChatCompact();
     }
 }
 
-function updateChatPreview() {
-    const preview = $('chatPreview');
-    if (!preview) return;
-    preview.innerHTML = '';
-    if (recentMessages.length === 0) {
-        preview.classList.remove('visible');
+function updateChatCompact() {
+    const compact = $('chatCompact');
+    if (!compact) return;
+    // Don't update while chat is open (user is reading full messages)
+    if ($('chat').classList.contains('open')) return;
+
+    compact.innerHTML = '';
+    // Show last 2 messages
+    const msgs = messagesEl.querySelectorAll('.msg.own, .msg.other');
+    const last2 = Array.from(msgs).slice(-2);
+    if (last2.length === 0) {
+        compact.textContent = 'No messages yet';
         return;
     }
-    for (const m of recentMessages) {
+    for (const m of last2) {
         const row = document.createElement('div');
-        row.className = 'cp-msg';
+        row.className = 'cc-msg';
+        const sender = m.classList.contains('own') ? 'You' :
+            (m.querySelector('.meta')?.textContent || 'Peer');
+        const body = m.querySelector('span:not(.meta)')?.textContent || '';
         const s = document.createElement('span');
-        s.className = 'cp-sender';
-        s.textContent = m.sender + ':';
+        s.className = 'cc-sender';
+        s.textContent = sender + ':';
         row.appendChild(s);
         const t = document.createElement('span');
-        const trimmed = (m.body || '').length > 60
-            ? m.body.slice(0, 60) + '…'
-            : (m.body || '');
-        t.textContent = trimmed;
+        t.textContent = body.length > 50 ? body.slice(0, 50) + '…' : body;
         row.appendChild(t);
-        preview.appendChild(row);
+        compact.appendChild(row);
     }
-    preview.classList.add('visible');
 }
 
 $('chatForm').addEventListener('submit', (e) => {
@@ -1399,12 +1537,27 @@ window.addEventListener('beforeunload', () => {
 
 // ─── Chat panel toggle ────────────────────────────────────
 function toggleChat() {
-    $('chat').classList.toggle('open');
+    const chat = $('chat');
+    chat.classList.toggle('open');
+    if (chat.classList.contains('open')) {
+        // Scroll to bottom when opening
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+    } else {
+        // Update compact view when closing
+        updateChatCompact();
+    }
 }
 $('chatBtn').onclick = toggleChat;
-$('closeChat').onclick = () => {
+$('closeChat').onclick = (e) => {
+    e.stopPropagation();
     $('chat').classList.remove('open');
+    updateChatCompact();
 };
+$('chat').addEventListener('click', (e) => {
+    if (!$('chat').classList.contains('open')) {
+        toggleChat();
+    }
+});
 
 // ─── Copy invite link ─────────────────────────────────────
 $('copyLink').onclick = async () => {
