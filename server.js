@@ -26,6 +26,7 @@ const MIME = {
     '.woff': 'font/woff',
     '.woff2':'font/woff2',
     '.ttf':  'font/ttf',
+    '.wasm': 'application/wasm',
     '.map':  'application/json; charset=utf-8',
 };
 
