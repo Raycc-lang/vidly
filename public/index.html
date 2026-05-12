@@ -326,19 +326,19 @@
   .toolbar .btn.icon { height: 50px; width: 50px; font-size: 20px; border-radius: 12px; }
   .toolbar .btn.icon.muted { background: #3a2222; color: #ffb4b4; }
 
-  /* Chat */
+  /* Chat — bottom drawer */
   .chat {
-    position: absolute; top: 0; right: 0; bottom: 0;
-    width: 320px;
-    border-left: 1px solid var(--border);
-    display: flex; flex-direction: column;
+    display: flex;
+    flex-direction: column;
+    height: 0;
+    overflow: hidden;
+    border-top: 1px solid var(--border);
     background: var(--card);
-    transition: transform .3s cubic-bezier(.4,0,.2,1);
-    z-index: 8;
+    transition: height .3s cubic-bezier(.4,0,.2,1);
+    flex-shrink: 0;
   }
-  .chat.hidden {
-    transform: translateX(100%);
-    pointer-events: none;
+  .chat.open {
+    height: 280px;
   }
   .chat-head {
     padding: 14px 16px;
@@ -398,12 +398,6 @@
     .topbar { padding: 10px 12px; }
     .grid-wrap { padding: 10px; }
     .grid.n2, .grid.n3, .grid.n4 { grid-template-columns: 1fr; }
-    .chat {
-      position: fixed; inset: 0; width: 100%; z-index: 20;
-      border-left: none;
-    }
-    .chat.hidden { transform: translateX(100%); }
-    .chat-close { display: inline-flex; }
     #localTile {
       width: 200px; right: 12px; bottom: 92px;
       display: block;
@@ -446,9 +440,6 @@
       Room <code id="roomLabel">—</code>
       <button class="copy-btn" id="copyLink" title="Copy invite link">⧉ copy</button>
     </div>
-    <div class="top-actions">
-      <button class="btn ghost" id="toggleChatTop">💬 Chat</button>
-    </div>
   </header>
 
   <div class="stage">
@@ -461,19 +452,19 @@
         </div>
       </div>
     </div>
-
-    <aside class="chat hidden" id="chat">
-      <div class="chat-head">
-        <span>Chat</span>
-        <button class="btn ghost chat-close" id="closeChat">✕</button>
-      </div>
-      <div class="messages" id="messages"></div>
-      <form class="chat-input" id="chatForm">
-        <input class="input" id="chatInput" placeholder="Type a message…" autocomplete="off" />
-        <button class="btn primary" type="submit">Send</button>
-      </form>
-    </aside>
   </div>
+
+  <aside class="chat" id="chat">
+    <div class="chat-head">
+      <span>Chat</span>
+      <button class="btn ghost chat-close" id="closeChat">✕</button>
+    </div>
+    <div class="messages" id="messages"></div>
+    <form class="chat-input" id="chatForm">
+      <input class="input" id="chatInput" placeholder="Type a message…" autocomplete="off" />
+      <button class="btn primary" type="submit">Send</button>
+    </form>
+  </aside>
 
   <div id="localTile">
     <video id="localVideo" autoplay playsinline muted style="display:none;"></video>
@@ -667,6 +658,7 @@ async function initLocalMedia() {
     $('camBtn').classList.add('muted');
     $('camBtn').textContent = '🚫';
     showLocalPlaceholder();
+    localTile.style.display = 'none';
 }
 
 function showLocalPlaceholder() {
@@ -700,6 +692,7 @@ async function previewCamera() {
         });
         // Show preview in local video
         localVideo.srcObject = previewStream;
+        localTile.style.display = '';
         localVideo.style.display = '';
         localPlaceholder.classList.add('hidden');
         previewBtns.classList.add('active');
@@ -733,17 +726,26 @@ function confirmCamera() {
     $('camBtn').textContent = '📷';
     $('micBtn').classList.remove('muted');
     $('micBtn').textContent = '🎙️';
-    // Publish tracks to all connected peers
+
+    localTile.style.display = '';
+
+    // Replace tracks on existing senders (no renegotiation needed)
     for (const peer of peers.values()) {
-        // Remove old senders first
-        for (const sender of peer.pc.getSenders()) {
-            if (sender.track) {
-                try { peer.pc.removeTrack(sender); } catch {}
-            }
+        const senders = peer.pc.getSenders();
+        const videoSender = senders.find(s => s.track && s.track.kind === 'video');
+        const audioSender = senders.find(s => s.track && s.track.kind === 'audio');
+        const newVideo = localStream.getVideoTracks()[0];
+        const newAudio = localStream.getAudioTracks()[0];
+
+        if (videoSender && newVideo) {
+            try { videoSender.replaceTrack(newVideo); } catch {}
+        } else if (!videoSender && newVideo) {
+            try { peer.pc.addTrack(newVideo, localStream); } catch {}
         }
-        // Add new tracks
-        for (const track of localStream.getTracks()) {
-            try { peer.pc.addTrack(track, localStream); } catch {}
+        if (audioSender && newAudio) {
+            try { audioSender.replaceTrack(newAudio); } catch {}
+        } else if (!audioSender && newAudio) {
+            try { peer.pc.addTrack(newAudio, localStream); } catch {}
         }
     }
 
@@ -758,6 +760,7 @@ function cancelCamera() {
     }
     localVideo.srcObject = null;
     showLocalPlaceholder();
+    localTile.style.display = 'none';
 }
 // ─── Camera switch (front/back) ───────────────────────────
 $('switchCamBtn').onclick = async () => {
@@ -861,26 +864,7 @@ $('switchCamBtn').onclick = async () => {
         localTile.style.right = savedRight;
         localTile.style.bottom = savedBottom;
     }
-
-    // On chat toggle, constrain position so tile doesn't overlap chat
-    const chatEl = $('chat');
-    const observer = new MutationObserver(() => {
-        const chatHidden = chatEl.classList.contains('hidden');
-        const chatWidth = chatHidden ? 0 : chatEl.offsetWidth;
-        const vp = getViewportBounds();
-        const rect = localTile.getBoundingClientRect();
-        if (rect.right > vp.w - chatWidth - 8) {
-            localTile.style.right = (chatWidth + 8) + 'px';
-        }
-    });
-    observer.observe(chatEl, { attributes: true, attributeFilter: ['class'] });
 })();
-
-function publishTrackToPeers(track, stream) {
-    for (const peer of peers.values()) {
-        try { peer.pc.addTrack(track, stream); } catch {}
-    }
-}
 
 // ─── WebSocket signaling ──────────────────────────────────
 function connectWebSocket() {
@@ -1004,6 +988,7 @@ function ensurePeer(peerId, polite, createDC, username) {
 
     // Remote tracks → attach to remote MediaStream feeding the <video>.
     pc.ontrack = (e) => {
+        console.log('[WebRTC] ontrack:', e.track.kind, e.track.id, 'readyState:', e.track.readyState);
         remoteStream.addTrack(e.track);
         tileEl.classList.remove('placeholder');
         e.track.onended = () => {
@@ -1241,11 +1226,6 @@ $('micBtn').onclick = async () => {
             micStream = null;
         }
         if (localStream) localStream.getAudioTracks().forEach(t => { t.enabled = false; });
-        // Remove audio sender from peers
-        for (const peer of peers.values()) {
-            const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'audio');
-            if (sender) try { peer.pc.removeTrack(sender); } catch {}
-        }
         $('micBtn').classList.add('muted');
         $('micBtn').textContent = '🔇';
     } else {
@@ -1256,9 +1236,15 @@ $('micBtn').onclick = async () => {
                     audio: { echoCancellation: true, noiseSuppression: true }
                 });
                 micEnabled = true;
-                // Publish audio track to peers
                 const audioTrack = micStream.getAudioTracks()[0];
-                if (audioTrack) publishTrackToPeers(audioTrack, micStream);
+                for (const peer of peers.values()) {
+                    const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+                    if (sender) {
+                        try { sender.replaceTrack(audioTrack); } catch {}
+                    } else if (audioTrack) {
+                        try { peer.pc.addTrack(audioTrack, micStream); } catch {}
+                    }
+                }
             } catch (err) {
                 console.error('[WebRTC] mic getUserMedia failed', err);
                 toast('Could not access microphone: ' + (err.message || err.name), 'error');
@@ -1284,19 +1270,18 @@ $('camBtn').onclick = () => {
             // cameraStream is separate from localStream only in edge cases
         }
         if (localStream) localStream.getVideoTracks().forEach(t => t.stop());
-        // Remove video senders from peers
+        // Stop sending video without renegotiating.
         for (const peer of peers.values()) {
             const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
-            if (sender) try { peer.pc.removeTrack(sender); } catch {}
+            if (sender) try { sender.replaceTrack(null); } catch {}
         }
-        localStream = new MediaStream();
-        cameraStream = localStream;
         // Keep audio if mic is on
         if (micEnabled && micStream) {
             // micStream has the audio; it's already published
         }
         localVideo.srcObject = null;
         showLocalPlaceholder();
+        localTile.style.display = 'none';
         $('camBtn').classList.add('muted');
         $('camBtn').textContent = '🚫';
     }
@@ -1326,6 +1311,8 @@ async function startScreenShare() {
         const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
         if (sender) {
             try { await sender.replaceTrack(screenTrack); } catch (e) { console.warn(e); }
+        } else {
+            try { peer.pc.addTrack(screenTrack, screenStream); } catch (e) { console.warn(e); }
         }
     }
 
@@ -1339,6 +1326,7 @@ async function startScreenShare() {
 
     // Show local screen preview (un-mirrored).
     localVideo.srcObject = screenStream;
+    localTile.style.display = '';
     localVideo.style.display = '';
     localPlaceholder.classList.add('hidden');
     localTile.classList.add('screensharing');
@@ -1355,7 +1343,7 @@ async function stopScreenShare() {
         for (const peer of peers.values()) {
             const sender = peer.pc.getSenders().find(s => s.track === screenAudioTrack);
             if (sender) {
-                try { peer.pc.removeTrack(sender); } catch (e) { console.warn(e); }
+                try { await sender.replaceTrack(null); } catch (e) { console.warn(e); }
             }
         }
         screenAudioTrack = null;
@@ -1374,13 +1362,14 @@ async function stopScreenShare() {
         }
         localVideo.srcObject = cameraStream;
     } else {
-        // Camera was off — remove video sender, show placeholder
+        // Camera was off — stop sending video, hide placeholder tile
         for (const peer of peers.values()) {
             const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
             if (sender) try { sender.replaceTrack(null); } catch (e) { console.warn(e); }
         }
         localVideo.srcObject = null;
         showLocalPlaceholder();
+        localTile.style.display = 'none';
     }
     localTile.classList.remove('screensharing');
     isSharing = false;
@@ -1409,20 +1398,11 @@ window.addEventListener('beforeunload', () => {
 
 // ─── Chat panel toggle ────────────────────────────────────
 function toggleChat() {
-    $('chat').classList.toggle('hidden');
-    // Ensure local PiP tile is restored after chat closes (mobile fix)
-    if ($('chat').classList.contains('hidden')) {
-        localTile.style.display = '';
-    }
+    $('chat').classList.toggle('open');
 }
 $('chatBtn').onclick = toggleChat;
-$('toggleChatTop').onclick = toggleChat;
 $('closeChat').onclick = () => {
-    $('chat').classList.add('hidden');
-    localTile.style.display = '';
-};
-$('chatPreview').onclick = () => {
-    if ($('chat').classList.contains('hidden')) toggleChat();
+    $('chat').classList.remove('open');
 };
 
 // ─── Copy invite link ─────────────────────────────────────
