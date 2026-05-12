@@ -820,10 +820,6 @@ async function startWasmNoise() {
             numberOfOutputs: 1,
             outputChannelCount: [1]
         });
-        noiseDestination = noiseAudioContext.createMediaStreamDestination();
-        noiseSource.connect(noiseNode).connect(noiseDestination);
-        processedMicTrack = noiseDestination.stream.getAudioTracks()[0] || null;
-        processedSourceTrack = rawTrack;
         const currentNoiseNode = noiseNode;
         const fallbackFromWasmFailure = async (message) => {
             if (noiseMode !== 'wasm') return;
@@ -834,25 +830,47 @@ async function startWasmNoise() {
             await publishMicTrack();
             updateNoiseButton();
         };
-        noiseNode.port.postMessage({ type: 'set-enabled', enabled: true });
-        noiseNode.port.onmessage = async (event) => {
-            if (event.data?.type === 'needs-wasm-binary') {
-                try {
-                    const response = await fetch('vendor/rnnoise.wasm');
-                    if (!response.ok) throw new Error(`RNNoise WASM fetch failed: ${response.status}`);
-                    const wasmBinary = await response.arrayBuffer();
-                    if (noiseNode === currentNoiseNode) {
-                        currentNoiseNode.port.postMessage({ type: 'wasm-binary', binary: wasmBinary }, [wasmBinary]);
-                    }
-                } catch (err) {
-                    await fallbackFromWasmFailure(err?.message || String(err));
+
+        const readyPromise = new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('RNNoise worklet initialization timed out')), 5000);
+            noiseNode.port.onmessage = (event) => {
+                if (noiseNode !== currentNoiseNode) return;
+                if (event.data?.type === 'ready') {
+                    clearTimeout(timeout);
+                    resolve();
+                } else if (event.data?.type === 'failed') {
+                    clearTimeout(timeout);
+                    reject(new Error(event.data.message || 'RNNoise worklet initialization failed'));
+                } else if (event.data?.type === 'needs-wasm-binary') {
+                    clearTimeout(timeout);
+                    reject(new Error('RNNoise worklet requested legacy WASM binary path'));
                 }
-            }
-            if (event.data?.type === 'failed') {
-                await fallbackFromWasmFailure(event.data.message);
-            }
-        };
-        return Boolean(processedMicTrack);
+            };
+        });
+
+        const response = await fetch('vendor/rnnoise.wasm');
+        if (!response.ok) throw new Error(`RNNoise WASM fetch failed: ${response.status}`);
+        const wasmBinary = await response.arrayBuffer();
+        const wasmModule = await WebAssembly.compile(wasmBinary);
+        console.debug('[Audio] RNNoise WASM imports', WebAssembly.Module.imports(wasmModule));
+        try {
+            currentNoiseNode.port.postMessage({ type: 'init', module: wasmModule }, [wasmModule]);
+        } catch (err) {
+            currentNoiseNode.port.postMessage({ type: 'init', module: wasmModule });
+        }
+        await readyPromise;
+
+        if (noiseNode !== currentNoiseNode) return false;
+        noiseDestination = noiseAudioContext.createMediaStreamDestination();
+        noiseSource.connect(noiseNode).connect(noiseDestination);
+        processedMicTrack = noiseDestination.stream.getAudioTracks()[0] || null;
+        processedSourceTrack = rawTrack;
+        noiseNode.port.postMessage({ type: 'set-enabled', enabled: true });
+        if (!processedMicTrack) {
+            await fallbackFromWasmFailure('RNNoise did not produce an output audio track');
+            return false;
+        }
+        return true;
     } catch (err) {
         console.warn('[Audio] RNNoise setup failed', err);
         await stopWasmNoise();
