@@ -400,6 +400,7 @@
     .grid.n2, .grid.n3, .grid.n4 { grid-template-columns: 1fr; }
     #localTile {
       width: 200px; right: 12px; bottom: 92px;
+      aspect-ratio: 9/16;
       display: block;
     }
     .toolbar .btn.icon { height: 44px; width: 44px; font-size: 18px; }
@@ -732,8 +733,8 @@ function confirmCamera() {
     // Replace tracks on existing senders (no renegotiation needed)
     for (const peer of peers.values()) {
         const senders = peer.pc.getSenders();
-        const videoSender = senders.find(s => s.track && s.track.kind === 'video');
-        const audioSender = senders.find(s => s.track && s.track.kind === 'audio');
+        const videoSender = senders.find(s => s.track?.kind === 'video');
+        const audioSender = senders.find(s => s.track?.kind === 'audio');
         const newVideo = localStream.getVideoTracks()[0];
         const newAudio = localStream.getAudioTracks()[0];
 
@@ -1238,7 +1239,7 @@ $('micBtn').onclick = async () => {
                 micEnabled = true;
                 const audioTrack = micStream.getAudioTracks()[0];
                 for (const peer of peers.values()) {
-                    const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+                    const sender = peer.pc.getSenders().find(s => s.track?.kind === 'audio');
                     if (sender) {
                         try { sender.replaceTrack(audioTrack); } catch {}
                     } else if (audioTrack) {
@@ -1272,7 +1273,7 @@ $('camBtn').onclick = () => {
         if (localStream) localStream.getVideoTracks().forEach(t => t.stop());
         // Stop sending video without renegotiating.
         for (const peer of peers.values()) {
-            const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+            const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
             if (sender) try { sender.replaceTrack(null); } catch {}
         }
         // Keep audio if mic is on
@@ -1308,7 +1309,7 @@ async function startScreenShare() {
 
     // Replace the outgoing video track for every peer.
     for (const peer of peers.values()) {
-        const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
         if (sender) {
             try { await sender.replaceTrack(screenTrack); } catch (e) { console.warn(e); }
         } else {
@@ -1355,7 +1356,7 @@ async function stopScreenShare() {
     if (camEnabled) {
         const camTrack = cameraStream && cameraStream.getVideoTracks()[0];
         for (const peer of peers.values()) {
-            const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+            const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
             if (sender && camTrack) {
                 try { await sender.replaceTrack(camTrack); } catch (e) { console.warn(e); }
             }
@@ -1364,7 +1365,7 @@ async function stopScreenShare() {
     } else {
         // Camera was off — stop sending video, hide placeholder tile
         for (const peer of peers.values()) {
-            const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+            const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
             if (sender) try { sender.replaceTrack(null); } catch (e) { console.warn(e); }
         }
         localVideo.srcObject = null;
