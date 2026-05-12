@@ -129,6 +129,12 @@ wss.on('connection', (ws) => {
             for (const [id, peerWs] of room.entries()) {
                 existingPeers.push({ peerId: id, username: peerWs.username || null });
             }
+
+            // Reject if username already taken in this room
+            if (msg.username && existingPeers.some(p => p.username === msg.username.trim().slice(0, 32))) {
+                send(ws, { type: 'username-taken', username: msg.username.trim().slice(0, 32) });
+                return;
+            }
             room.set(ws.peerId, ws);
             ws.roomId = roomId;
             // Store username from join message as well (backup for set-username)

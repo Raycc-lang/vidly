@@ -308,6 +308,8 @@
 
   /* Chat — unified preview + full panel */
   .chat {
+    display: flex;
+    flex-direction: column;
     border-top: 1px solid var(--border);
     background: var(--card);
     flex-shrink: 0;
@@ -550,6 +552,7 @@ let ws = null;
 let wsBackoff = 1000;
 let wsReconnectTimer = null;
 let intentionalClose = false;
+let wakeLock = null;
 let iceServers = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
@@ -618,6 +621,13 @@ async function showCall() {
     await loadConfig();
     await initLocalMedia();
     connectWebSocket();
+    // Acquire wake lock to prevent screen sleep during call
+    try {
+        if ('wakeLock' in navigator) {
+            wakeLock = await navigator.wakeLock.request('screen');
+            wakeLock.addEventListener('release', () => { wakeLock = null; });
+        }
+    } catch {}
 }
 
 // ─── Landing handlers ─────────────────────────────────────
@@ -1022,7 +1032,8 @@ function handleSignaling(msg) {
     switch (msg.type) {
         case 'welcome':
             myPeerId = msg.peerId;
-            // Send username to server first, then join the room.
+            // Clean up stale peers from previous connection (reconnection)
+            for (const [id] of peers) removePeer(id);
             sendWs({ type: 'set-username', username: myUsername });
             sendWs({ type: 'join', roomId, username: myUsername });
             break;
@@ -1030,6 +1041,11 @@ function handleSignaling(msg) {
         case 'joined':
             // We are the joining peer — we initiate offers to existing peers.
             // Joining peer is "impolite" to avoid glare with simultaneous offers.
+            // Reconcile: remove any stale peers not in server's list.
+            const liveIds = new Set(msg.peers.map(p => p.peerId));
+            for (const [id] of peers) {
+                if (!liveIds.has(id)) removePeer(id);
+            }
             for (const p of msg.peers) {
                 ensurePeer(p.peerId, /*polite*/ false, /*createDC*/ true, p.username);
             }
@@ -1039,6 +1055,14 @@ function handleSignaling(msg) {
         case 'peer-joined':
             // We're an existing peer — wait for the joiner's offer.
             // Existing peer is "polite".
+            // Deduplicate: if a peer with the same username exists (stale entry from missed peer-left), remove it.
+            if (msg.username) {
+                for (const [id, p] of peers) {
+                    if (p.username === msg.username && id !== msg.peerId) {
+                        removePeer(id);
+                    }
+                }
+            }
             ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false, msg.username);
             toast((msg.username || 'Someone') + ' joined the call', 'success');
             updateEmptyState();
@@ -1056,6 +1080,11 @@ function handleSignaling(msg) {
 
         case 'room-full':
             toast('Room is full (max 4 people)', 'error');
+            setTimeout(() => { intentionalClose = true; ws && ws.close(); leaveCall(); }, 2000);
+            break;
+
+        case 'username-taken':
+            toast('Name "' + msg.username + '" is already taken in this room', 'error');
             setTimeout(() => { intentionalClose = true; ws && ws.close(); leaveCall(); }, 2000);
             break;
     }
@@ -1540,6 +1569,7 @@ $('leaveBtn').onclick = leaveCall;
 
 function leaveCall() {
     intentionalClose = true;
+    if (wakeLock) try { wakeLock.release(); } catch {}
     try { sendWs({ type: 'leave' }); } catch {}
     for (const id of Array.from(peers.keys())) removePeer(id);
     if (ws) try { ws.close(); } catch {}
@@ -1554,6 +1584,18 @@ function leaveCall() {
 window.addEventListener('beforeunload', () => {
     try { sendWs({ type: 'leave' }); } catch {}
     if (ws) try { ws.close(); } catch {}
+});
+
+// Re-acquire wake lock when page becomes visible (browser may release it)
+document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && roomId && !wakeLock) {
+        try {
+            if ('wakeLock' in navigator) {
+                wakeLock = await navigator.wakeLock.request('screen');
+                wakeLock.addEventListener('release', () => { wakeLock = null; });
+            }
+        } catch {}
+    }
 });
 
 // ─── Chat panel toggle ────────────────────────────────────
