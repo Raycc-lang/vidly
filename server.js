@@ -92,7 +92,7 @@ function leaveRoom(ws) {
     const room = rooms.get(roomId);
     if (!room) return;
     room.delete(peerId);
-    for (const peer of room.values()) send(peer, { type: 'peer-left', peerId });
+    for (const peer of room.values()) send(peer, { type: 'peer-left', peerId, username: ws.username || null });
     if (room.size === 0) rooms.delete(roomId);
     ws.roomId = null;
 }
@@ -105,6 +105,11 @@ wss.on('connection', (ws) => {
     ws.on('message', (raw) => {
         let msg;
         try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+        if (msg.type === 'set-username' && typeof msg.username === 'string') {
+            ws.username = msg.username.trim().slice(0, 32);
+            return;
+        }
 
         if (msg.type === 'join' && typeof msg.roomId === 'string') {
             // Leave old room if any
@@ -119,14 +124,20 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            const existing = Array.from(room.keys());
+            // Capture existing peers with their usernames before adding ourselves
+            const existingPeers = [];
+            for (const [id, peerWs] of room.entries()) {
+                existingPeers.push({ peerId: id, username: peerWs.username || null });
+            }
             room.set(ws.peerId, ws);
             ws.roomId = roomId;
+            // Store username from join message as well (backup for set-username)
+            if (msg.username) ws.username = msg.username.trim().slice(0, 32);
 
-            send(ws, { type: 'joined', roomId, peers: existing });
-            for (const peerId of existing) {
+            send(ws, { type: 'joined', roomId, peers: existingPeers });
+            for (const { peerId } of existingPeers) {
                 const peerWs = room.get(peerId);
-                if (peerWs) send(peerWs, { type: 'peer-joined', peerId: ws.peerId });
+                if (peerWs) send(peerWs, { type: 'peer-joined', peerId: ws.peerId, username: ws.username || null });
             }
             return;
         }

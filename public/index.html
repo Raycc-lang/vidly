@@ -121,7 +121,7 @@
   .footer-note { margin-top: 22px; color: var(--muted); font-size: 12px; text-align: center; }
 
   /* ─── Call screen ──────────────────────────────────────── */
-  #call { display: none; height: 100vh; flex-direction: column; }
+  #call { display: none; height: 100vh; height: 100dvh; flex-direction: column; }
   #call.active { display: flex; }
 
   .topbar {
@@ -212,20 +212,104 @@
   #localTile {
     position: fixed;
     right: 22px; bottom: 110px;
-    width: 220px; aspect-ratio: 16/9;
+    width: 350px; aspect-ratio: 16/9;
     border-radius: 12px; overflow: hidden;
     background: #000; border: 1px solid var(--border);
     box-shadow: 0 12px 32px rgba(0,0,0,.5);
     z-index: 6;
-    transition: transform .2s ease;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
   }
-  #localTile:hover { transform: translateY(-2px); }
+  #localTile.dragging { cursor: grabbing; transition: none !important; }
+  #localTile:not(.dragging) { transition: right .2s ease, bottom .2s ease; }
   #localTile video {
     width: 100%; height: 100%; object-fit: cover;
     transform: scaleX(-1); /* mirror */
   }
   #localTile.screensharing video { transform: none; }
   #localTile .tile-label { font-size: 11px; padding: 4px 8px; left: 8px; bottom: 8px; }
+
+  /* Local PiP placeholder */
+  #localPlaceholder {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    background: linear-gradient(135deg, #1a1d27 0%, #0f1117 100%);
+    z-index: 2;
+  }
+  #localPlaceholder.hidden { display: none; }
+  #localAvatar {
+    width: 48px; height: 48px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 700; color: #fff;
+  }
+  #localPlaceholder .cam-on-btn {
+    padding: 6px 14px; border-radius: 8px;
+    background: rgba(255,255,255,.08); border: 1px solid var(--border);
+    color: var(--text); font-size: 12px; cursor: pointer;
+    transition: background .15s;
+  }
+  #localPlaceholder .cam-on-btn:hover { background: rgba(255,255,255,.14); }
+  #previewBtns {
+    position: absolute; inset: 0; bottom: 0;
+    display: none; flex-direction: column; align-items: center; justify-content: flex-end;
+    padding-bottom: 8px; gap: 6px;
+    background: linear-gradient(to top, rgba(0,0,0,.7) 0%, rgba(0,0,0,.4) 50%, transparent 100%);
+    z-index: 3;
+  }
+  #previewBtns.active { display: flex; }
+  #previewBtns .btn-row { display: flex; gap: 6px; align-items: center; }
+  #previewBtns .btn-row button {
+    padding: 5px 12px; border-radius: 6px; border: none;
+    font-size: 11px; font-weight: 600; cursor: pointer;
+    transition: filter .15s;
+    display: inline-flex; align-items: center; gap: 4px;
+    backdrop-filter: blur(4px);
+  }
+  #previewBtns .btn-row button:hover { filter: brightness(1.1); }
+  #previewBtns .confirm-btn { background: var(--good); color: #000; }
+  #previewBtns .cancel-btn { background: var(--bad); color: #fff; }
+  #previewBtns .switch-cam-btn {
+    background: rgba(255,255,255,.2); color: #fff;
+    border: 1px solid rgba(255,255,255,.3);
+  }
+
+  /* Chat preview strip */
+  .chat-preview {
+    display: none;
+    background: rgba(15, 17, 23, 0.7);
+    backdrop-filter: blur(8px);
+    border-top: 1px solid var(--border);
+    max-height: 80px;
+    overflow-y: auto;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    flex-shrink: 0;
+    z-index: 6;
+  }
+  .chat-preview.visible { display: block; }
+  .chat-preview .cp-msg {
+    padding: 2px 0;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chat-preview .cp-msg .cp-sender {
+    color: var(--accent);
+    font-weight: 600;
+    margin-right: 6px;
+  }
+  .chat-preview .cp-hint {
+    color: var(--muted);
+    font-style: italic;
+    text-align: center;
+    padding: 4px 0;
+  }
 
   /* Toolbar */
   .toolbar {
@@ -235,6 +319,9 @@
     background: rgba(15, 17, 23, .85);
     backdrop-filter: blur(10px);
     z-index: 7;
+    flex-shrink: 0;
+    position: sticky;
+    bottom: 0;
   }
   .toolbar .btn.icon { height: 50px; width: 50px; font-size: 20px; border-radius: 12px; }
   .toolbar .btn.icon.muted { background: #3a2222; color: #ffb4b4; }
@@ -313,7 +400,8 @@
     .chat.hidden { transform: translateX(100%); display: flex; }
     .chat-close { display: inline-flex; }
     #localTile {
-      width: 130px; right: 12px; bottom: 92px;
+      width: 200px; right: 12px; bottom: 92px;
+      display: block;
     }
     .toolbar .btn.icon { height: 44px; width: 44px; font-size: 18px; }
   }
@@ -327,6 +415,10 @@
     <div class="brand"><span class="dot"></span> Vidly</div>
     <h1 class="title">Private video calls,<br/>just a link away.</h1>
     <p class="subtitle">Peer-to-peer, end-to-end. Up to 4 people. No accounts.</p>
+
+    <label style="display:block;margin-bottom:6px;font-size:13px;color:var(--muted);">Your name</label>
+    <input id="usernameInput" class="input" placeholder="Enter your name..." autocomplete="off" maxlength="32"
+           style="margin-bottom:18px;" />
 
     <button id="createBtn" class="btn primary full">＋ Create new room</button>
 
@@ -379,9 +471,22 @@
   </div>
 
   <div id="localTile">
-    <video id="localVideo" autoplay playsinline muted></video>
-    <div class="tile-label">You</div>
+    <video id="localVideo" autoplay playsinline muted style="display:none;"></video>
+    <div id="localPlaceholder">
+      <div id="localAvatar">Y</div>
+      <button class="cam-on-btn" id="camOnBtn">📷 Turn on camera</button>
+    </div>
+    <div id="previewBtns">
+      <div class="btn-row">
+        <button class="switch-cam-btn" id="switchCamBtn" title="Switch camera">🔄</button>
+        <button class="confirm-btn" id="confirmCamBtn">✓</button>
+        <button class="cancel-btn" id="cancelCamBtn">✕</button>
+      </div>
+    </div>
+    <div class="tile-label" id="localLabel">You</div>
   </div>
+
+  <div class="chat-preview" id="chatPreview"></div>
 
   <footer class="toolbar">
     <button class="btn icon" id="micBtn" title="Mute / unmute mic">🎙️</button>
@@ -406,10 +511,16 @@ const peers = new Map(); // peerId -> { pc, dc, polite, makingOffer, ignoreOffer
 let localStream = null;
 let cameraStream = null;       // saved when screen sharing
 let screenStream = null;
+let screenAudioTrack = null;   // optional system/tab audio track from screen share
 let isSharing = false;
-let micEnabled = true;
-let camEnabled = true;
+let recentMessages = [];       // last 3 chat messages for preview strip
+let micEnabled = false;
+let camEnabled = false;
+let micStream = null;        // audio-only stream when mic is on but camera is off
+let previewStream = null;    // preview stream during camera confirmation
 let myPeerId = null;
+let facingMode = 'user';     // 'user' = front camera, 'environment' = back camera
+let myUsername = '';
 let roomId = null;
 let ws = null;
 let wsBackoff = 1000;
@@ -428,6 +539,9 @@ const $ = (id) => document.getElementById(id);
 const landing = $('landing'), call = $('call');
 const grid = $('grid'), emptyState = $('emptyState');
 const localVideo = $('localVideo'), localTile = $('localTile');
+const localPlaceholder = $('localPlaceholder');
+const localAvatar = $('localAvatar');
+const previewBtns = $('previewBtns');
 const messagesEl = $('messages');
 
 // ─── Toast helper ─────────────────────────────────────────
@@ -459,9 +573,23 @@ function showLanding() {
     call.classList.remove('active');
 }
 async function showCall() {
+    // Ensure we have a username
+    if (!myUsername) {
+        const saved = localStorage.getItem('vidly-username');
+        if (saved) myUsername = saved;
+    }
+    if (!myUsername) {
+        // No username available — redirect to landing
+        toast('Please enter your name first', 'warn');
+        history.pushState({}, '', '/');
+        showLanding();
+        return;
+    }
     landing.style.display = 'none';
     call.classList.add('active');
     $('roomLabel').textContent = roomId;
+    $('localLabel').textContent = myUsername || 'You';
+    updateChatPreview();
     await loadConfig();
     await initLocalMedia();
     connectWebSocket();
@@ -477,12 +605,20 @@ function randomRoomId(n = 8) {
     return out;
 }
 $('createBtn').onclick = () => {
+    const name = $('usernameInput').value.trim();
+    if (!name) { toast('Please enter your name', 'warn'); $('usernameInput').focus(); return; }
+    myUsername = name;
+    localStorage.setItem('vidly-username', name);
     const id = randomRoomId();
     history.pushState({}, '', '/room/' + id);
     roomId = id;
     showCall();
 };
 $('joinBtn').onclick = () => {
+    const name = $('usernameInput').value.trim();
+    if (!name) { toast('Please enter your name', 'warn'); $('usernameInput').focus(); return; }
+    myUsername = name;
+    localStorage.setItem('vidly-username', name);
     const v = $('joinCode').value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
     if (!v) { toast('Enter a room code', 'warn'); return; }
     history.pushState({}, '', '/room/' + v);
@@ -504,11 +640,7 @@ async function loadConfig() {
             const username = url.searchParams.get('username');
             const credential = url.searchParams.get('credential');
             iceServers.push({
-                urls: 'turn:' + url.host + url.pathname,
-                username, credential
-            });
-            iceServers.push({
-                urls: 'turns:' + url.host + url.pathname,
+                urls: 'turn:' + url.host + url.pathname.replace(/\/$/, ""),
                 username, credential
             });
         }
@@ -519,14 +651,50 @@ async function loadConfig() {
 
 // ─── Local media ──────────────────────────────────────────
 async function initLocalMedia() {
+    // Camera and mic OFF by default — no permission prompt on load.
+    localStream = new MediaStream();
+    cameraStream = localStream;
+    camEnabled = false;
+    micEnabled = false;
+    showLocalPlaceholder();
+}
+
+function showLocalPlaceholder() {
+    localVideo.style.display = 'none';
+    localPlaceholder.classList.remove('hidden');
+    // Update avatar letter
+    const letter = (myUsername || 'Y').charAt(0).toUpperCase();
+    localAvatar.textContent = letter;
+}
+
+function hideLocalPlaceholder() {
+    localPlaceholder.classList.add('hidden');
+    localVideo.style.display = '';
+}
+
+async function previewCamera() {
     try {
-        localStream = await navigator.mediaDevices.getUserMedia({
-            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        // Release audio device first if micStream exists (to avoid AbortError)
+        if (micStream) {
+            micStream.getTracks().forEach(t => t.stop());
+            micStream = null;
+        }
+        previewStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                facingMode: facingMode,
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
+                frameRate: { ideal: 30 }
+            },
             audio: { echoCancellation: true, noiseSuppression: true }
         });
-        cameraStream = localStream;
+        // Show preview in local video
+        localVideo.srcObject = previewStream;
+        localVideo.style.display = '';
+        localPlaceholder.classList.add('hidden');
+        previewBtns.classList.add('active');
     } catch (err) {
-        console.error('getUserMedia failed', err);
+        console.error('[WebRTC] preview getUserMedia failed', err);
         let m = err.message || String(err);
         if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
             m = 'Camera blocked: please allow camera/mic access in browser settings.';
@@ -536,11 +704,160 @@ async function initLocalMedia() {
             m = 'Camera is in use by another application.';
         }
         toast(m, 'error');
-        // Continue with empty stream so chat-only mode still works.
-        localStream = new MediaStream();
-        cameraStream = localStream;
     }
-    localVideo.srcObject = localStream;
+}
+
+function confirmCamera() {
+    previewBtns.classList.remove('active');
+    if (!previewStream) return;
+
+    // Promote preview to live
+    cameraStream = previewStream;
+    localStream = previewStream;
+    previewStream = null;
+    camEnabled = true;
+    micEnabled = true;
+
+    // Update button states
+    $('camBtn').classList.remove('muted');
+    $('camBtn').textContent = '📷';
+    $('micBtn').classList.remove('muted');
+    $('micBtn').textContent = '🎙️';
+    // Publish tracks to all connected peers
+    for (const peer of peers.values()) {
+        // Remove old senders first
+        for (const sender of peer.pc.getSenders()) {
+            if (sender.track) {
+                try { peer.pc.removeTrack(sender); } catch {}
+            }
+        }
+        // Add new tracks
+        for (const track of localStream.getTracks()) {
+            try { peer.pc.addTrack(track, localStream); } catch {}
+        }
+    }
+
+    toast('Camera and mic are now on', 'success');
+}
+
+function cancelCamera() {
+    previewBtns.classList.remove('active');
+    if (previewStream) {
+        previewStream.getTracks().forEach(t => t.stop());
+        previewStream = null;
+    }
+    localVideo.srcObject = null;
+    showLocalPlaceholder();
+}
+// ─── Camera switch (front/back) ───────────────────────────
+$('switchCamBtn').onclick = async () => {
+    facingMode = facingMode === 'user' ? 'environment' : 'user';
+    // If preview is active, restart it with the new facing mode
+    if (previewStream) {
+        previewStream.getTracks().forEach(t => t.stop());
+        previewStream = null;
+    }
+    await previewCamera();
+};
+
+// ─── Draggable local tile ─────────────────────────────────
+(function initDraggable() {
+    let isDragging = false;
+    let startX, startY, startRight, startBottom;
+    let hasMoved = false;
+
+    function getViewportBounds() {
+        return {
+            w: window.innerWidth,
+            h: window.innerHeight
+        };
+    }
+
+    function clamp(val, min, max) { return Math.max(min, Math.min(max, val)); }
+
+    function onPointerDown(e) {
+        // Only start drag from the tile itself, not from buttons inside it
+        if (e.target.closest('button') || e.target.closest('.btn')) return;
+        isDragging = true;
+        hasMoved = false;
+        const pos = e.touches ? e.touches[0] : e;
+        startX = pos.clientX;
+        startY = pos.clientY;
+        const rect = localTile.getBoundingClientRect();
+        const vp = getViewportBounds();
+        startRight = vp.w - rect.right;
+        startBottom = vp.h - rect.bottom;
+        localTile.classList.add('dragging');
+        if (e.type === 'touchstart') e.preventDefault();
+    }
+
+    function onPointerMove(e) {
+        if (!isDragging) return;
+        const pos = e.touches ? e.touches[0] : e;
+        const dx = pos.clientX - startX;
+        const dy = pos.clientY - startY;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) hasMoved = true;
+        const vp = getViewportBounds();
+        const rect = localTile.getBoundingClientRect();
+        const tileW = rect.width;
+        const tileH = rect.height;
+        // Constrain to viewport (leave 8px margin)
+        const newRight = clamp(startRight - dx, 8, vp.w - tileW - 8);
+        const newBottom = clamp(startBottom - dy, 8, vp.h - tileH - 8);
+        localTile.style.right = newRight + 'px';
+        localTile.style.bottom = newBottom + 'px';
+        localTile.style.left = 'auto';
+        localTile.style.top = 'auto';
+        if (e.type === 'touchmove') e.preventDefault();
+    }
+
+    function onPointerUp(e) {
+        if (!isDragging) return;
+        isDragging = false;
+        localTile.classList.remove('dragging');
+        // Save position to sessionStorage
+        if (hasMoved) {
+            sessionStorage.setItem('vidly-pip-right', localTile.style.right);
+            sessionStorage.setItem('vidly-pip-bottom', localTile.style.bottom);
+        }
+    }
+
+    // Mouse events
+    localTile.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('mousemove', onPointerMove);
+    document.addEventListener('mouseup', onPointerUp);
+
+    // Touch events
+    localTile.addEventListener('touchstart', onPointerDown, { passive: false });
+    document.addEventListener('touchmove', onPointerMove, { passive: false });
+    document.addEventListener('touchend', onPointerUp);
+
+    // Restore saved position
+    const savedRight = sessionStorage.getItem('vidly-pip-right');
+    const savedBottom = sessionStorage.getItem('vidly-pip-bottom');
+    if (savedRight && savedBottom) {
+        localTile.style.right = savedRight;
+        localTile.style.bottom = savedBottom;
+    }
+
+    // On chat toggle, constrain position so tile doesn't overlap chat
+    const chatEl = $('chat');
+    const observer = new MutationObserver(() => {
+        const chatHidden = chatEl.classList.contains('hidden');
+        const chatWidth = chatHidden ? 0 : chatEl.offsetWidth;
+        const vp = getViewportBounds();
+        const rect = localTile.getBoundingClientRect();
+        if (rect.right > vp.w - chatWidth - 8) {
+            localTile.style.right = (chatWidth + 8) + 'px';
+        }
+    });
+    observer.observe(chatEl, { attributes: true, attributeFilter: ['class'] });
+})();
+
+function publishTrackToPeers(track, stream) {
+    for (const peer of peers.values()) {
+        try { peer.pc.addTrack(track, stream); } catch {}
+    }
 }
 
 // ─── WebSocket signaling ──────────────────────────────────
@@ -588,15 +905,16 @@ function handleSignaling(msg) {
     switch (msg.type) {
         case 'welcome':
             myPeerId = msg.peerId;
-            // Now that we have a peerId, join the room.
-            sendWs({ type: 'join', roomId });
+            // Send username to server first, then join the room.
+            sendWs({ type: 'set-username', username: myUsername });
+            sendWs({ type: 'join', roomId, username: myUsername });
             break;
 
         case 'joined':
             // We are the joining peer — we initiate offers to existing peers.
             // Joining peer is "impolite" to avoid glare with simultaneous offers.
-            for (const otherId of msg.peers) {
-                ensurePeer(otherId, /*polite*/ false, /*createDC*/ true);
+            for (const p of msg.peers) {
+                ensurePeer(p.peerId, /*polite*/ false, /*createDC*/ true, p.username);
             }
             updateEmptyState();
             break;
@@ -604,14 +922,14 @@ function handleSignaling(msg) {
         case 'peer-joined':
             // We're an existing peer — wait for the joiner's offer.
             // Existing peer is "polite".
-            ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false);
-            toast('Someone joined the call', 'success');
+            ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false, msg.username);
+            toast((msg.username || 'Someone') + ' joined the call', 'success');
             updateEmptyState();
             break;
 
         case 'peer-left':
             removePeer(msg.peerId);
-            toast('A participant left', '');
+            toast((msg.username || 'A participant') + ' left', '');
             updateEmptyState();
             break;
 
@@ -627,19 +945,20 @@ function handleSignaling(msg) {
 }
 
 // ─── Peer management ──────────────────────────────────────
-function ensurePeer(peerId, polite, createDC) {
+function ensurePeer(peerId, polite, createDC, username) {
     let peer = peers.get(peerId);
     if (peer) return peer;
 
     const pc = new RTCPeerConnection({ iceServers });
     const remoteStream = new MediaStream();
-    const { tileEl, videoEl, dot } = createTile(peerId);
+    const { tileEl, videoEl, dot } = createTile(peerId, username);
     videoEl.srcObject = remoteStream;
 
     peer = {
         pc, dc: null, polite,
         makingOffer: false, ignoreOffer: false,
-        videoEl, tileEl, remoteStream, dot
+        videoEl, tileEl, remoteStream, dot,
+        username: username || null
     };
     peers.set(peerId, peer);
 
@@ -758,7 +1077,7 @@ function removePeer(peerId) {
 }
 
 // ─── Tile / grid rendering ────────────────────────────────
-function createTile(peerId) {
+function createTile(peerId, username) {
     const tile = document.createElement('div');
     tile.className = 'tile placeholder';
     tile.dataset.peerId = peerId;
@@ -774,7 +1093,7 @@ function createTile(peerId) {
     dot.className = 'status-dot connecting';
     label.appendChild(dot);
     const txt = document.createElement('span');
-    txt.textContent = 'Peer ' + peerId.slice(0, 4);
+    txt.textContent = username || ('Peer ' + peerId.slice(0, 4));
     label.appendChild(txt);
     tile.appendChild(label);
 
@@ -799,13 +1118,13 @@ function attachDataChannel(peer, dc) {
     dc.onopen = () => {};
     dc.onmessage = (e) => {
         let msg; try { msg = JSON.parse(e.data); } catch { return; }
-        if (msg.type === 'chat') addMessage('other', msg.body, msg.ts);
+        if (msg.type === 'chat') addMessage('other', msg.body, msg.ts, msg.username);
     };
     dc.onclose = () => {};
 }
 
 function broadcastChat(text) {
-    const msg = { type: 'chat', body: text, ts: Date.now() };
+    const msg = { type: 'chat', body: text, ts: Date.now(), username: myUsername };
     const data = JSON.stringify(msg);
     for (const peer of peers.values()) {
         if (peer.dc && peer.dc.readyState === 'open') {
@@ -814,10 +1133,22 @@ function broadcastChat(text) {
     }
 }
 
-function addMessage(kind, body, ts) {
+function addMessage(kind, body, ts, senderName) {
     const el = document.createElement('div');
     el.className = 'msg ' + kind;
-    el.textContent = body;
+    // Show sender name for incoming messages
+    if (kind === 'other' && senderName) {
+        const nameEl = document.createElement('div');
+        nameEl.className = 'meta';
+        nameEl.textContent = senderName;
+        nameEl.style.marginBottom = '4px';
+        nameEl.style.marginTop = '0';
+        nameEl.style.color = 'var(--accent)';
+        el.appendChild(nameEl);
+    }
+    const bodyEl = document.createElement('span');
+    bodyEl.textContent = body;
+    el.appendChild(bodyEl);
     if (ts) {
         const meta = document.createElement('div');
         meta.className = 'meta';
@@ -827,6 +1158,43 @@ function addMessage(kind, body, ts) {
     }
     messagesEl.appendChild(el);
     messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    // Track for chat preview strip (skip system messages)
+    if (kind === 'own' || kind === 'other') {
+        const sender = kind === 'own' ? 'You' : (senderName || 'Peer');
+        recentMessages.push({ sender, body });
+        if (recentMessages.length > 3) recentMessages.shift();
+        updateChatPreview();
+    }
+}
+
+function updateChatPreview() {
+    const preview = $('chatPreview');
+    if (!preview) return;
+    preview.innerHTML = '';
+    if (recentMessages.length === 0) {
+        const hint = document.createElement('div');
+        hint.className = 'cp-hint';
+        hint.textContent = 'Tap 💬 to open chat';
+        preview.appendChild(hint);
+    } else {
+        for (const m of recentMessages) {
+            const row = document.createElement('div');
+            row.className = 'cp-msg';
+            const s = document.createElement('span');
+            s.className = 'cp-sender';
+            s.textContent = m.sender + ':';
+            row.appendChild(s);
+            const t = document.createElement('span');
+            const trimmed = (m.body || '').length > 60
+                ? m.body.slice(0, 60) + '…'
+                : (m.body || '');
+            t.textContent = trimmed;
+            row.appendChild(t);
+            preview.appendChild(row);
+        }
+    }
+    preview.classList.add('visible');
 }
 
 $('chatForm').addEventListener('submit', (e) => {
@@ -839,18 +1207,79 @@ $('chatForm').addEventListener('submit', (e) => {
 });
 
 // ─── Toolbar controls ─────────────────────────────────────
-$('micBtn').onclick = () => {
-    micEnabled = !micEnabled;
-    if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
-    $('micBtn').classList.toggle('muted', !micEnabled);
-    $('micBtn').textContent = micEnabled ? '🎙️' : '🔇';
+$('micBtn').onclick = async () => {
+    if (micEnabled) {
+        // Turn mic off
+        micEnabled = false;
+        if (micStream) {
+            micStream.getTracks().forEach(t => t.stop());
+            micStream = null;
+        }
+        if (localStream) localStream.getAudioTracks().forEach(t => { t.enabled = false; });
+        // Remove audio sender from peers
+        for (const peer of peers.values()) {
+            const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+            if (sender) try { peer.pc.removeTrack(sender); } catch {}
+        }
+        $('micBtn').classList.add('muted');
+        $('micBtn').textContent = '🔇';
+    } else {
+        // Turn mic on — camera is off, so request audio-only stream
+        if (!camEnabled) {
+            try {
+                micStream = await navigator.mediaDevices.getUserMedia({
+                    audio: { echoCancellation: true, noiseSuppression: true }
+                });
+                micEnabled = true;
+                // Publish audio track to peers
+                const audioTrack = micStream.getAudioTracks()[0];
+                if (audioTrack) publishTrackToPeers(audioTrack, micStream);
+            } catch (err) {
+                console.error('[WebRTC] mic getUserMedia failed', err);
+                toast('Could not access microphone: ' + (err.message || err.name), 'error');
+                return;
+            }
+        } else {
+            // Camera is on — just re-enable existing audio tracks
+            micEnabled = true;
+            if (localStream) localStream.getAudioTracks().forEach(t => { t.enabled = true; });
+        }
+        $('micBtn').classList.remove('muted');
+        $('micBtn').textContent = '🎙️';
+    }
 };
 $('camBtn').onclick = () => {
-    camEnabled = !camEnabled;
-    if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = camEnabled);
-    $('camBtn').classList.toggle('muted', !camEnabled);
-    $('camBtn').textContent = camEnabled ? '📷' : '🚫';
+    if (!camEnabled) {
+        previewCamera();
+    } else {
+        // Turn camera off
+        camEnabled = false;
+        // Stop camera tracks
+        if (cameraStream && cameraStream !== localStream) {
+            // cameraStream is separate from localStream only in edge cases
+        }
+        if (localStream) localStream.getVideoTracks().forEach(t => t.stop());
+        // Remove video senders from peers
+        for (const peer of peers.values()) {
+            const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+            if (sender) try { peer.pc.removeTrack(sender); } catch {}
+        }
+        localStream = new MediaStream();
+        cameraStream = localStream;
+        // Keep audio if mic is on
+        if (micEnabled && micStream) {
+            // micStream has the audio; it's already published
+        }
+        localVideo.srcObject = null;
+        showLocalPlaceholder();
+        $('camBtn').classList.add('muted');
+        $('camBtn').textContent = '🚫';
+    }
 };
+
+$('camOnBtn').onclick = previewCamera;
+$('confirmCamBtn').onclick = confirmCamera;
+$('cancelCamBtn').onclick = cancelCamera;
 
 $('screenBtn').onclick = async () => {
     if (isSharing) await stopScreenShare();
@@ -859,7 +1288,8 @@ $('screenBtn').onclick = async () => {
 
 async function startScreenShare() {
     try {
-        screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        // Request screen audio too — gracefully falls back if unsupported.
+        screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
     } catch (err) {
         toast('Could not start screen share: ' + (err.message || err.name), 'error');
         return;
@@ -874,8 +1304,18 @@ async function startScreenShare() {
         }
     }
 
+    // If screen audio is available, add it to all peer connections.
+    screenAudioTrack = screenStream.getAudioTracks()[0] || null;
+    if (screenAudioTrack) {
+        for (const peer of peers.values()) {
+            try { peer.pc.addTrack(screenAudioTrack, screenStream); } catch (e) { console.warn(e); }
+        }
+    }
+
     // Show local screen preview (un-mirrored).
     localVideo.srcObject = screenStream;
+    localVideo.style.display = '';
+    localPlaceholder.classList.add('hidden');
     localTile.classList.add('screensharing');
     isSharing = true;
     $('screenBtn').classList.add('active');
@@ -885,18 +1325,38 @@ async function startScreenShare() {
 }
 
 async function stopScreenShare() {
+    // Remove screen audio track from all peer connections.
+    if (screenAudioTrack) {
+        for (const peer of peers.values()) {
+            const sender = peer.pc.getSenders().find(s => s.track === screenAudioTrack);
+            if (sender) {
+                try { peer.pc.removeTrack(sender); } catch (e) { console.warn(e); }
+            }
+        }
+        screenAudioTrack = null;
+    }
     if (screenStream) {
         screenStream.getTracks().forEach(t => t.stop());
         screenStream = null;
     }
-    const camTrack = cameraStream && cameraStream.getVideoTracks()[0];
-    for (const peer of peers.values()) {
-        const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
-        if (sender && camTrack) {
-            try { await sender.replaceTrack(camTrack); } catch (e) { console.warn(e); }
+    if (camEnabled) {
+        const camTrack = cameraStream && cameraStream.getVideoTracks()[0];
+        for (const peer of peers.values()) {
+            const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+            if (sender && camTrack) {
+                try { await sender.replaceTrack(camTrack); } catch (e) { console.warn(e); }
+            }
         }
+        localVideo.srcObject = cameraStream;
+    } else {
+        // Camera was off — remove video sender, show placeholder
+        for (const peer of peers.values()) {
+            const sender = peer.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+            if (sender) try { sender.replaceTrack(null); } catch (e) { console.warn(e); }
+        }
+        localVideo.srcObject = null;
+        showLocalPlaceholder();
     }
-    localVideo.srcObject = cameraStream;
     localTile.classList.remove('screensharing');
     isSharing = false;
     $('screenBtn').classList.remove('active');
@@ -911,6 +1371,8 @@ function leaveCall() {
     if (ws) try { ws.close(); } catch {}
     if (localStream) localStream.getTracks().forEach(t => t.stop());
     if (screenStream) screenStream.getTracks().forEach(t => t.stop());
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    if (previewStream) previewStream.getTracks().forEach(t => t.stop());
     history.pushState({}, '', '/');
     location.reload();
 }
@@ -921,10 +1383,22 @@ window.addEventListener('beforeunload', () => {
 });
 
 // ─── Chat panel toggle ────────────────────────────────────
-function toggleChat() { $('chat').classList.toggle('hidden'); }
+function toggleChat() {
+    $('chat').classList.toggle('hidden');
+    // Ensure local PiP tile is restored after chat closes (mobile fix)
+    if ($('chat').classList.contains('hidden')) {
+        localTile.style.display = '';
+    }
+}
 $('chatBtn').onclick = toggleChat;
 $('toggleChatTop').onclick = toggleChat;
-$('closeChat').onclick = () => $('chat').classList.add('hidden');
+$('closeChat').onclick = () => {
+    $('chat').classList.add('hidden');
+    localTile.style.display = '';
+};
+$('chatPreview').onclick = () => {
+    if ($('chat').classList.contains('hidden')) toggleChat();
+};
 
 // ─── Copy invite link ─────────────────────────────────────
 $('copyLink').onclick = async () => {
@@ -938,6 +1412,11 @@ $('copyLink').onclick = async () => {
 };
 
 // ─── Start ────────────────────────────────────────────────
+// Pre-fill username from localStorage
+(function() {
+    const saved = localStorage.getItem('vidly-username');
+    if (saved) $('usernameInput').value = saved;
+})();
 route();
 </script>
 
