@@ -901,7 +901,7 @@ async function startWasmNoise() {
         noiseAudioContext = new AudioContextCtor({ sampleRate: 48000 });
         if (noiseAudioContext.state === 'suspended') await noiseAudioContext.resume();
 
-        const response = await fetch('vendor/rnnoise.wasm');
+        const response = await fetch(`vendor/rnnoise.wasm?v=${Date.now()}`);
         if (!response.ok) throw new Error(`RNNoise WASM fetch failed: ${response.status}`);
         const wasmBinary = await response.arrayBuffer();
         const wasmModule = await WebAssembly.compile(wasmBinary);
