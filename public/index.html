@@ -813,9 +813,9 @@ const GIPHY_API_KEY = 'z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn';
 const GIPHY_LIMIT = 20;
 const MEDIA_URL_RE = /^https?:\/\/\S+\.(jpe?g|png|gif|webp)(\?\S*)?$/i;
 const GIF_SERVICE_RE = /^https?:\/\/\S*(giphy\.com|tenor\.com)\/\S+$/i;
-const FILE_CHUNK_SIZE = 16 * 1024;
-const FILE_BUFFER_HIGH = 256 * 1024;
-const FILE_BUFFER_LOW = 64 * 1024;
+const FILE_CHUNK_SIZE = 64 * 1024;
+const FILE_BUFFER_HIGH = 512 * 1024;
+const FILE_BUFFER_LOW = 128 * 1024;
 const outgoingFiles = new Map(); // fileId -> { file, peers:Set, accepted:Set, completed:Set, rejected:Set, card }
 const incomingFiles = new Map(); // fileId -> { peer, meta, chunks, received, card, lastProgressSent }
 
@@ -2140,6 +2140,14 @@ $('chatForm').addEventListener('submit', (e) => {
     closeStickerPicker();
 });
 
+function handleFilePicked(file) {
+    if (file.type.startsWith('image/')) {
+        startFileOffer(file);
+    } else {
+        showPendingFile(file);
+    }
+}
+
 $('fileBtn').addEventListener('click', () => {
     $('fileInput').click();
 });
@@ -2147,7 +2155,23 @@ $('fileBtn').addEventListener('click', () => {
 $('fileInput').addEventListener('change', (e) => {
     const file = e.target.files && e.target.files[0];
     e.target.value = '';
-    if (file) showPendingFile(file);
+    if (file) handleFilePicked(file);
+});
+
+document.addEventListener('paste', (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+        if (item.type.startsWith('image/')) {
+            e.preventDefault();
+            const file = item.getAsFile();
+            if (file) {
+                if (!$('chat').classList.contains('open')) toggleChat();
+                startFileOffer(file);
+            }
+            return;
+        }
+    }
 });
 
 function handleDroppedFile(e) {
@@ -2157,7 +2181,7 @@ function handleDroppedFile(e) {
     e.stopPropagation();
     $('chat').classList.remove('drag-over');
     if (!$('chat').classList.contains('open')) toggleChat();
-    showPendingFile(file);
+    handleFilePicked(file);
 }
 
 $('chat').addEventListener('dragenter', (e) => {
