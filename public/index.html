@@ -817,6 +817,7 @@ const FILE_CHUNK_SIZE = 64 * 1024;
 const FILE_BUFFER_HIGH = 512 * 1024;
 const FILE_BUFFER_LOW = 128 * 1024;
 const outgoingFiles = new Map(); // fileId -> { file, peers:Set, accepted:Set, completed:Set, rejected:Set, card }
+const objectURLs = new Set();   // revoke on beforeunload to prevent memory leaks
 const incomingFiles = new Map(); // fileId -> { peer, meta, chunks, received, card, lastProgressSent }
 
 function createClientId() {
@@ -1726,6 +1727,7 @@ function setFileProgress(card, loaded, total) {
 function addCompletedFileMessage(kind, meta, blobOrUrl, ts, senderName) {
     const card = createFileCard(kind, meta, { ts, senderName, hideProgress: true, status: 'Complete' });
     const url = typeof blobOrUrl === 'string' ? blobOrUrl : URL.createObjectURL(blobOrUrl);
+    if (typeof blobOrUrl !== 'string') objectURLs.add(url);
     renderFilePreview(card, meta, url);
     messagesEl.appendChild(card.el);
     messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -1852,7 +1854,9 @@ function handleFileControl(peer, msg) {
         transfer.card.status.textContent = done === total ? 'Sent' : 'Sent to ' + done + ' of ' + total;
         if (done + transfer.rejected.size >= total) {
             transfer.card.bar.parentElement.style.display = 'none';
-            renderFilePreview(transfer.card, transfer.meta, URL.createObjectURL(transfer.file));
+            const previewUrl = URL.createObjectURL(transfer.file);
+            objectURLs.add(previewUrl);
+            renderFilePreview(transfer.card, transfer.meta, previewUrl);
             outgoingFiles.delete(msg.id);
         }
     } else if (msg.type === 'file-empty') {
@@ -2583,6 +2587,8 @@ function leaveCall() {
 }
 
 window.addEventListener('beforeunload', () => {
+    for (const url of objectURLs) URL.revokeObjectURL(url);
+    objectURLs.clear();
     try { sendWs({ type: 'leave' }); } catch {}
     if (ws) try { ws.close(); } catch {}
 });
