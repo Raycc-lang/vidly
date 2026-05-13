@@ -811,15 +811,7 @@ async function startWasmNoise() {
         noiseAudioContext = new AudioContextCtor({ sampleRate: 48000 });
         if (!noiseAudioContext.audioWorklet) throw new Error('AudioWorklet is not supported');
         if (noiseAudioContext.state === 'suspended') await noiseAudioContext.resume();
-        // Load worklet via Blob URL to bypass browser cache issues with addModule()
-        const workletSrc = await (await fetch('noise-suppressor.js?v=' + Date.now())).text();
-        const workletBlob = new Blob([workletSrc], { type: 'application/javascript' });
-        const workletUrl = URL.createObjectURL(workletBlob);
-        try {
-            await noiseAudioContext.audioWorklet.addModule(workletUrl);
-        } finally {
-            URL.revokeObjectURL(workletUrl);
-        }
+        await noiseAudioContext.audioWorklet.addModule('noise-suppressor.js');
 
         const sourceStream = new MediaStream([rawTrack]);
         noiseSource = noiseAudioContext.createMediaStreamSource(sourceStream);
