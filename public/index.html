@@ -1804,6 +1804,7 @@ function initStickerPicker() {
         grid.appendChild(actions);
     };
 
+    const hasHover = window.matchMedia('(hover: hover)').matches;
     const renderGifs = (gifs) => {
         grid.innerHTML = '';
         grid.className = 'gif-grid';
@@ -1828,7 +1829,10 @@ function initStickerPicker() {
             img.loading = 'lazy';
 
             btn.appendChild(img);
-            btn.addEventListener('click', () => renderGifPreview(gif));
+            btn.addEventListener('click', () => {
+                if (hasHover) sendGif(url);
+                else renderGifPreview(gif);
+            });
             grid.appendChild(btn);
         }
         if (!grid.children.length) setState('No results');
