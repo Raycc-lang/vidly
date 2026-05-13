@@ -233,6 +233,23 @@
   }
   #localTile.screensharing video { transform: none; }
   #localTile .tile-label { font-size: 11px; padding: 4px 8px; left: 8px; bottom: 8px; }
+  .reaction-float {
+    position: absolute;
+    left: 50%;
+    bottom: 18%;
+    transform: translateX(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    pointer-events: none;
+    z-index: 12;
+    animation: reactionFloat 2.6s ease-out forwards;
+  }
+  .reaction-float .emoji { font-size: clamp(32px, 6vw, 58px); line-height: 1; filter: drop-shadow(0 6px 12px rgba(0,0,0,.45)); }
+  .reaction-float .name {
+    max-width: 140px; padding: 4px 8px; border-radius: 999px;
+    background: rgba(0,0,0,.58); color: #fff; font-size: 11px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    backdrop-filter: blur(4px);
+  }
 
   /* Resize handles — invisible, positioned at corners */
   .resize-handle {
@@ -305,6 +322,28 @@
   }
   .toolbar .btn.icon { height: 50px; width: 50px; font-size: 20px; border-radius: 12px; }
   .toolbar .btn.icon.muted { background: #3a2222; color: #ffb4b4; }
+  .floating-panel {
+    position: fixed;
+    left: 50%; bottom: 86px;
+    transform: translateX(-50%);
+    z-index: 30;
+    display: none;
+    background: rgba(26, 29, 39, .96);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(10px);
+  }
+  .floating-panel.open { display: block; animation: pop .15s ease both; }
+  .reaction-panel { padding: 8px; }
+  .reaction-options { display: flex; gap: 6px; }
+  .reaction-option {
+    width: 42px; height: 42px; border: 1px solid transparent; border-radius: 10px;
+    background: transparent; font-size: 24px; cursor: pointer;
+    transition: background .15s, transform .08s;
+  }
+  .reaction-option:hover { background: rgba(255,255,255,.08); }
+  .reaction-option:active { transform: translateY(1px) scale(.96); }
 
   /* Chat — unified preview + full panel */
   .chat {
@@ -374,13 +413,57 @@
   .msg.own { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #fff; border-bottom-right-radius: 4px; }
   .msg.other { align-self: flex-start; background: #262a36; border-bottom-left-radius: 4px; }
   .msg.system { align-self: center; background: transparent; color: var(--muted); font-size: 12px; font-style: italic; }
+  .msg.media { width: min(260px, 80%); padding: 8px; }
+  .media-wrap { display: grid; gap: 6px; }
+  .media-loading { color: var(--muted); font-size: 12px; }
+  .chat-media {
+    display: block;
+    max-width: 100%;
+    max-height: 200px;
+    border-radius: 8px;
+    object-fit: contain;
+    background: rgba(0,0,0,.25);
+  }
+  .media-fallback {
+    color: inherit;
+    overflow-wrap: anywhere;
+    font-size: 13px;
+  }
   .chat-input {
     display: flex; gap: 8px; padding: 10px 12px;
     border-top: 1px solid var(--border);
     flex-shrink: 0;
+    position: relative;
   }
   .chat-input .input { height: 38px; font-size: 14px; }
   .chat-input .btn { height: 38px; }
+  .chat-input .btn.icon { width: 38px; padding: 0; font-size: 18px; }
+  .sticker-picker {
+    position: absolute;
+    right: 76px;
+    bottom: 56px;
+    width: 244px;
+    padding: 10px;
+    display: none;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    background: rgba(26, 29, 39, .98);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    z-index: 3;
+  }
+  .sticker-picker.open { display: grid; animation: pop .15s ease both; }
+  .sticker-option {
+    aspect-ratio: 1;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #12151c;
+    cursor: pointer;
+  }
+  .sticker-option:hover { background: #262b39; border-color: rgba(255,255,255,.18); }
+  .sticker-option img { width: 100%; height: 100%; object-fit: contain; display: block; }
 
   /* Toasts */
   #toasts {
@@ -406,6 +489,12 @@
   @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
   @keyframes pop { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: none; } }
   @keyframes slidein { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: none; } }
+  @keyframes reactionFloat {
+    0% { opacity: 0; transform: translate(-50%, 18px) scale(.78); }
+    14% { opacity: 1; transform: translate(-50%, 0) scale(1); }
+    76% { opacity: 1; transform: translate(-50%, -64px) scale(1.04); }
+    100% { opacity: 0; transform: translate(-50%, -94px) scale(.92); }
+  }
 
   /* Mobile */
   @media (max-width: 720px) {
@@ -489,6 +578,8 @@
       </div>
       <div class="messages" id="messages"></div>
       <form class="chat-input" id="chatForm">
+        <div class="sticker-picker" id="stickerPicker" aria-label="Sticker picker"></div>
+        <button class="btn ghost icon" id="stickerBtn" type="button" title="Stickers">✨</button>
         <input class="input" id="chatInput" placeholder="Type a message…" autocomplete="off" />
         <button class="btn primary" type="submit">Send</button>
       </form>
@@ -519,9 +610,13 @@
     <button class="btn icon" id="micBtn" title="Mute / unmute mic">🎙️</button>
     <button class="btn icon" id="camBtn" title="Camera on / off">📷</button>
     <button class="btn icon" id="screenBtn" title="Share screen">🖥️</button>
+    <button class="btn icon" id="reactionBtn" title="Send reaction">😊</button>
     <button class="btn icon" id="chatBtn" title="Toggle chat">💬</button>
     <button class="btn icon danger" id="leaveBtn" title="Leave call">⛔</button>
   </footer>
+  <div class="floating-panel reaction-panel" id="reactionPanel" aria-label="Emoji reactions">
+    <div class="reaction-options" id="reactionOptions"></div>
+  </div>
 </section>
 
 <div id="toasts"></div>
@@ -570,6 +665,17 @@ const localPlaceholder = $('localPlaceholder');
 const localAvatar = $('localAvatar');
 const previewBtns = $('previewBtns');
 const messagesEl = $('messages');
+const REACTIONS = ['👍', '❤️', '😂', '🎉', '😮', '👏'];
+const STICKERS = [
+    { url: '/stickers/spark.gif', label: 'Spark' },
+    { url: '/stickers/party.gif', label: 'Party' },
+    { url: '/stickers/wave.gif', label: 'Wave' },
+    { url: '/stickers/heart.gif', label: 'Heart' },
+    { url: '/stickers/thumbs.gif', label: 'Thumbs up' },
+    { url: '/stickers/star.gif', label: 'Star' },
+];
+const MEDIA_URL_RE = /^https?:\/\/\S+\.(jpe?g|png|gif|webp)(\?\S*)?$/i;
+const GIF_SERVICE_RE = /^https?:\/\/\S*(giphy\.com|tenor\.com)\/\S+$/i;
 
 // ─── Toast helper ─────────────────────────────────────────
 function toast(message, type = '') {
@@ -1277,6 +1383,15 @@ function removePeer(peerId) {
     layoutGrid();
 }
 
+function sendDataMessage(msg) {
+    const data = JSON.stringify(msg);
+    for (const peer of peers.values()) {
+        if (peer.dc && peer.dc.readyState === 'open') {
+            try { peer.dc.send(data); } catch {}
+        }
+    }
+}
+
 // ─── Tile / grid rendering ────────────────────────────────
 function createTile(peerId, username) {
     const tile = document.createElement('div');
@@ -1319,19 +1434,43 @@ function attachDataChannel(peer, dc) {
     dc.onopen = () => {};
     dc.onmessage = (e) => {
         let msg; try { msg = JSON.parse(e.data); } catch { return; }
-        if (msg.type === 'chat') addMessage('other', msg.body, msg.ts, msg.username);
+        if (msg.username) peer.username = msg.username;
+        if (msg.type === 'chat') {
+            addMessage('other', msg.body, msg.ts, msg.username);
+        } else if (msg.type === 'media') {
+            addMediaMessage('other', msg.url, msg.kind, msg.ts, msg.username);
+        } else if (msg.type === 'reaction') {
+            renderReaction(peer.tileEl, msg.emoji, msg.username || peer.username || 'Peer');
+        }
     };
     dc.onclose = () => {};
 }
 
 function broadcastChat(text) {
     const msg = { type: 'chat', body: text, ts: Date.now(), username: myUsername };
-    const data = JSON.stringify(msg);
-    for (const peer of peers.values()) {
-        if (peer.dc && peer.dc.readyState === 'open') {
-            try { peer.dc.send(data); } catch {}
-        }
+    sendDataMessage(msg);
+}
+
+function broadcastMedia(url, kind) {
+    const msg = { type: 'media', url, kind, ts: Date.now(), username: myUsername };
+    sendDataMessage(msg);
+    addMediaMessage('own', url, kind, msg.ts);
+}
+
+function broadcastReaction(emoji) {
+    const msg = { type: 'reaction', emoji, ts: Date.now(), username: myUsername };
+    sendDataMessage(msg);
+    renderReaction(localTile, emoji, myUsername || 'You');
+}
+
+function detectMedia(text) {
+    const url = text.trim();
+    if (MEDIA_URL_RE.test(url)) {
+        const kind = /\.gif(?:\?\S*)?$/i.test(url) ? 'gif' : 'image';
+        return { url, kind };
     }
+    if (GIF_SERVICE_RE.test(url)) return { url, kind: 'gif' };
+    return null;
 }
 
 function addMessage(kind, body, ts, senderName) {
@@ -1365,6 +1504,87 @@ function addMessage(kind, body, ts, senderName) {
     }
 }
 
+function appendSenderName(el, kind, senderName) {
+    if (kind !== 'other' || !senderName) return;
+    const nameEl = document.createElement('div');
+    nameEl.className = 'meta';
+    nameEl.textContent = senderName;
+    nameEl.style.marginBottom = '4px';
+    nameEl.style.marginTop = '0';
+    nameEl.style.color = 'var(--accent)';
+    el.appendChild(nameEl);
+}
+
+function appendMessageTime(el, ts) {
+    if (!ts) return;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const d = new Date(ts);
+    meta.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    el.appendChild(meta);
+}
+
+function addMediaMessage(kind, url, mediaKind, ts, senderName) {
+    const el = document.createElement('div');
+    el.className = 'msg media ' + kind;
+    appendSenderName(el, kind, senderName);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'media-wrap';
+    const loading = document.createElement('div');
+    loading.className = 'media-loading';
+    loading.textContent = 'Loading media…';
+    wrap.appendChild(loading);
+
+    const img = document.createElement('img');
+    img.className = 'chat-media';
+    img.alt = mediaKind === 'gif' ? 'Shared GIF' : 'Shared image';
+    img.loading = 'lazy';
+    img.onload = () => loading.remove();
+    img.onerror = () => {
+        img.remove();
+        loading.remove();
+        const fallback = document.createElement('a');
+        fallback.className = 'media-fallback';
+        fallback.href = url;
+        fallback.target = '_blank';
+        fallback.rel = 'noopener noreferrer';
+        fallback.textContent = url;
+        wrap.appendChild(fallback);
+    };
+    img.src = url;
+    wrap.appendChild(img);
+    el.appendChild(wrap);
+    appendMessageTime(el, ts);
+    messagesEl.appendChild(el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    updateChatCompact();
+}
+
+function renderReaction(tile, emoji, senderName) {
+    const target = tile || localTile;
+    if (!target) return;
+    const wasHiddenLocalTile = target === localTile && localTile.style.display === 'none';
+    if (target === localTile) localTile.style.display = '';
+    const el = document.createElement('div');
+    el.className = 'reaction-float';
+    const emojiEl = document.createElement('div');
+    emojiEl.className = 'emoji';
+    emojiEl.textContent = emoji;
+    const nameEl = document.createElement('div');
+    nameEl.className = 'name';
+    nameEl.textContent = senderName || 'Someone';
+    el.appendChild(emojiEl);
+    el.appendChild(nameEl);
+    target.appendChild(el);
+    setTimeout(() => {
+        el.remove();
+        if (wasHiddenLocalTile && !camEnabled && !isSharing && !previewStream) {
+            localTile.style.display = 'none';
+        }
+    }, 2800);
+}
+
 function updateChatCompact() {
     const compact = $('chatCompact');
     if (!compact) return;
@@ -1384,7 +1604,7 @@ function updateChatCompact() {
         row.className = 'cc-msg';
         const sender = m.classList.contains('own') ? 'You' :
             (m.querySelector('.meta')?.textContent || 'Peer');
-        const body = m.querySelector('span:not(.meta)')?.textContent || '';
+        const body = m.classList.contains('media') ? '[media]' : (m.querySelector('span:not(.meta)')?.textContent || '');
         const s = document.createElement('span');
         s.className = 'cc-sender';
         s.textContent = sender + ':';
@@ -1400,10 +1620,81 @@ $('chatForm').addEventListener('submit', (e) => {
     e.preventDefault();
     const v = $('chatInput').value.trim();
     if (!v) return;
-    broadcastChat(v);
-    addMessage('own', v, Date.now());
+    const media = detectMedia(v);
+    if (media) {
+        broadcastMedia(media.url, media.kind);
+    } else {
+        broadcastChat(v);
+        addMessage('own', v, Date.now());
+    }
     $('chatInput').value = '';
+    closeStickerPicker();
 });
+
+function initReactionPanel() {
+    const panel = $('reactionPanel');
+    const options = $('reactionOptions');
+    if (!panel || !options) return;
+    for (const emoji of REACTIONS) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'reaction-option';
+        btn.textContent = emoji;
+        btn.title = 'React ' + emoji;
+        btn.addEventListener('click', () => {
+            broadcastReaction(emoji);
+            panel.classList.remove('open');
+        });
+        options.appendChild(btn);
+    }
+    $('reactionBtn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        panel.classList.toggle('open');
+        closeStickerPicker();
+    });
+}
+
+function initStickerPicker() {
+    const picker = $('stickerPicker');
+    if (!picker) return;
+    for (const sticker of STICKERS) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'sticker-option';
+        btn.title = sticker.label;
+        const img = document.createElement('img');
+        img.src = sticker.url;
+        img.alt = sticker.label;
+        btn.appendChild(img);
+        btn.addEventListener('click', () => {
+            broadcastMedia(sticker.url, 'gif');
+            closeStickerPicker();
+            $('chatInput').focus();
+        });
+        picker.appendChild(btn);
+    }
+    $('stickerBtn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        picker.classList.toggle('open');
+        $('reactionPanel')?.classList.remove('open');
+    });
+}
+
+function closeStickerPicker() {
+    $('stickerPicker')?.classList.remove('open');
+}
+
+document.addEventListener('click', (e) => {
+    if (!$('reactionPanel')?.contains(e.target) && e.target !== $('reactionBtn')) {
+        $('reactionPanel')?.classList.remove('open');
+    }
+    if (!$('stickerPicker')?.contains(e.target) && e.target !== $('stickerBtn')) {
+        closeStickerPicker();
+    }
+});
+
+initReactionPanel();
+initStickerPicker();
 
 // ─── Toolbar controls ─────────────────────────────────────
 $('micBtn').onclick = async () => {
