@@ -335,8 +335,16 @@
     backdrop-filter: blur(10px);
   }
   .floating-panel.open { display: block; animation: pop .15s ease both; }
-  .reaction-panel { padding: 8px; }
-  .reaction-options { display: flex; gap: 6px; }
+  .reaction-panel {
+    padding: 8px;
+    max-width: calc(100vw - 24px);
+  }
+  .reaction-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    max-width: 282px;
+  }
   .reaction-option {
     width: 42px; height: 42px; border: 1px solid transparent; border-radius: 10px;
     background: transparent; font-size: 24px; cursor: pointer;
@@ -442,10 +450,11 @@
     position: absolute;
     right: 76px;
     bottom: 56px;
-    width: 244px;
+    width: 300px;
+    max-width: calc(100vw - 24px);
     padding: 10px;
     display: none;
-    grid-template-columns: repeat(3, 1fr);
+    flex-direction: column;
     gap: 8px;
     background: rgba(26, 29, 39, .98);
     border: 1px solid var(--border);
@@ -453,17 +462,49 @@
     box-shadow: var(--shadow);
     z-index: 3;
   }
-  .sticker-picker.open { display: grid; animation: pop .15s ease both; }
+  .sticker-picker.open { display: flex; animation: pop .15s ease both; }
+  .gif-search {
+    width: 100%;
+    height: 38px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #12151c;
+    color: var(--text);
+    font: inherit;
+    outline: none;
+  }
+  .gif-search:focus { border-color: rgba(122, 162, 255, .55); }
+  .gif-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    max-height: 300px;
+    overflow-y: auto;
+    padding-right: 2px;
+  }
+  .gif-state {
+    color: var(--muted);
+    font-size: 13px;
+    padding: 18px 8px;
+    text-align: center;
+  }
   .sticker-option {
     aspect-ratio: 1;
-    padding: 6px;
+    padding: 0;
     border: 1px solid var(--border);
     border-radius: 10px;
     background: #12151c;
     cursor: pointer;
+    overflow: hidden;
+    transition: transform .12s, border-color .15s, background .15s;
   }
-  .sticker-option:hover { background: #262b39; border-color: rgba(255,255,255,.18); }
-  .sticker-option img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .sticker-option:hover {
+    background: #262b39;
+    border-color: rgba(255,255,255,.18);
+    transform: translateY(-1px);
+  }
+  .sticker-option img { width: 100%; height: 100%; object-fit: cover; display: block; }
 
   /* Toasts */
   #toasts {
@@ -507,6 +548,17 @@
       display: block;
     }
     .toolbar .btn.icon { height: 44px; width: 44px; font-size: 18px; }
+    .reaction-options { max-width: 138px; }
+    .sticker-picker {
+      right: 12px;
+      left: 12px;
+      width: auto;
+      max-width: none;
+    }
+    .gif-grid {
+      grid-template-columns: repeat(2, 1fr);
+      max-height: 250px;
+    }
     .chat.open {
       max-height: none;
       position: fixed;
@@ -578,8 +630,8 @@
       </div>
       <div class="messages" id="messages"></div>
       <form class="chat-input" id="chatForm">
-        <div class="sticker-picker" id="stickerPicker" aria-label="Sticker picker"></div>
-        <button class="btn ghost icon" id="stickerBtn" type="button" title="Stickers">✨</button>
+        <div class="sticker-picker" id="stickerPicker" aria-label="GIF picker"></div>
+        <button class="btn ghost icon" id="stickerBtn" type="button" title="GIFs">✨</button>
         <input class="input" id="chatInput" placeholder="Type a message…" autocomplete="off" />
         <button class="btn primary" type="submit">Send</button>
       </form>
@@ -665,15 +717,9 @@ const localPlaceholder = $('localPlaceholder');
 const localAvatar = $('localAvatar');
 const previewBtns = $('previewBtns');
 const messagesEl = $('messages');
-const REACTIONS = ['👍', '❤️', '😂', '🎉', '😮', '👏'];
-const STICKERS = [
-    { url: '/stickers/spark.gif', label: 'Spark' },
-    { url: '/stickers/party.gif', label: 'Party' },
-    { url: '/stickers/wave.gif', label: 'Wave' },
-    { url: '/stickers/heart.gif', label: 'Heart' },
-    { url: '/stickers/thumbs.gif', label: 'Thumbs up' },
-    { url: '/stickers/star.gif', label: 'Star' },
-];
+const REACTIONS = ['❤️', '😂', '🎉', '😮', '👏', '🤗'];
+const GIPHY_API_KEY = 'z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn';
+const GIPHY_LIMIT = 20;
 const MEDIA_URL_RE = /^https?:\/\/\S+\.(jpe?g|png|gif|webp)(\?\S*)?$/i;
 const GIF_SERVICE_RE = /^https?:\/\/\S*(giphy\.com|tenor\.com)\/\S+$/i;
 
@@ -1657,26 +1703,107 @@ function initReactionPanel() {
 function initStickerPicker() {
     const picker = $('stickerPicker');
     if (!picker) return;
-    for (const sticker of STICKERS) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'sticker-option';
-        btn.title = sticker.label;
-        const img = document.createElement('img');
-        img.src = sticker.url;
-        img.alt = sticker.label;
-        btn.appendChild(img);
-        btn.addEventListener('click', () => {
-            broadcastMedia(sticker.url, 'gif');
-            closeStickerPicker();
-            $('chatInput').focus();
+
+    let debounceTimer = null;
+    let requestId = 0;
+
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'gif-search';
+    search.placeholder = 'Search GIPHY';
+    search.autocomplete = 'off';
+
+    const grid = document.createElement('div');
+    grid.className = 'gif-grid';
+
+    picker.replaceChildren(search, grid);
+
+    const setState = (message) => {
+        grid.innerHTML = '';
+        const state = document.createElement('div');
+        state.className = 'gif-state';
+        state.textContent = message;
+        grid.appendChild(state);
+    };
+
+    const gifUrl = (gif) => (
+        gif?.images?.original?.url ||
+        gif?.images?.downsized_medium?.url ||
+        gif?.images?.fixed_width_small?.url
+    );
+
+    const renderGifs = (gifs) => {
+        grid.innerHTML = '';
+        if (!gifs.length) {
+            setState('No results');
+            return;
+        }
+        for (const gif of gifs) {
+            const url = gifUrl(gif);
+            const thumb = gif?.images?.fixed_width_small?.url;
+            if (!url || !thumb) continue;
+
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'sticker-option';
+            btn.title = gif.title || 'GIPHY GIF';
+
+            const img = document.createElement('img');
+            img.src = thumb;
+            img.alt = gif.title || 'GIPHY GIF';
+            img.loading = 'lazy';
+
+            btn.appendChild(img);
+            btn.addEventListener('click', () => {
+                broadcastMedia(url, 'gif');
+                closeStickerPicker();
+                $('chatInput').focus();
+            });
+            grid.appendChild(btn);
+        }
+        if (!grid.children.length) setState('No results');
+    };
+
+    const fetchGifs = async (query = '') => {
+        const currentRequest = ++requestId;
+        setState('Loading...');
+        const params = new URLSearchParams({
+            api_key: GIPHY_API_KEY,
+            limit: String(GIPHY_LIMIT),
+            rating: 'g',
         });
-        picker.appendChild(btn);
-    }
+        const trimmedQuery = query.trim();
+        const endpoint = trimmedQuery
+            ? 'https://api.giphy.com/v1/gifs/search'
+            : 'https://api.giphy.com/v1/gifs/trending';
+        if (trimmedQuery) params.set('q', trimmedQuery);
+
+        try {
+            const res = await fetch(`${endpoint}?${params}`);
+            if (!res.ok) throw new Error('GIPHY request failed');
+            const json = await res.json();
+            if (currentRequest !== requestId) return;
+            renderGifs(Array.isArray(json.data) ? json.data : []);
+        } catch (err) {
+            if (currentRequest === requestId) setState('No results');
+        }
+    };
+
+    search.addEventListener('input', () => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => fetchGifs(search.value), 300);
+    });
+
+    search.addEventListener('click', (e) => e.stopPropagation());
+    grid.addEventListener('click', (e) => e.stopPropagation());
+
+    fetchGifs();
+
     $('stickerBtn').addEventListener('click', (e) => {
         e.stopPropagation();
-        picker.classList.toggle('open');
+        const isOpen = picker.classList.toggle('open');
         $('reactionPanel')?.classList.remove('open');
+        if (isOpen) search.focus();
     });
 }
 
