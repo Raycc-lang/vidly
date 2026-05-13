@@ -517,7 +517,6 @@
 
   <footer class="toolbar">
     <button class="btn icon" id="micBtn" title="Mute / unmute mic">🎙️</button>
-    <button class="btn icon" id="noiseBtn" title="Noise cancellation off">◒</button>
     <button class="btn icon" id="camBtn" title="Camera on / off">📷</button>
     <button class="btn icon" id="screenBtn" title="Share screen">🖥️</button>
     <button class="btn icon" id="chatBtn" title="Toggle chat">💬</button>
@@ -544,13 +543,6 @@ let isSharing = false;
 let micEnabled = false;
 let camEnabled = false;
 let micStream = null;        // audio-only stream when mic is on but camera is off
-let noiseMode = 'off';       // off | wasm | native
-let noiseAudioContext = null;
-let noiseSource = null;
-let noiseNode = null;
-let noiseDestination = null;
-let processedMicTrack = null;
-let processedSourceTrack = null;
 let previewStream = null;    // preview stream during camera confirmation
 let myPeerId = null;
 let facingMode = 'user';     // 'user' = front camera, 'environment' = back camera
@@ -701,7 +693,6 @@ async function initLocalMedia() {
     micEnabled = false;
     $('micBtn').classList.add('muted');
     $('micBtn').textContent = '🔇';
-    updateNoiseButton();
     $('camBtn').classList.add('muted');
     $('camBtn').textContent = '🚫';
     showLocalPlaceholder();
@@ -721,161 +712,6 @@ function hideLocalPlaceholder() {
     localVideo.style.display = '';
 }
 
-function nativeNoiseSupported() {
-    return Boolean(navigator.mediaDevices?.getSupportedConstraints?.().noiseSuppression);
-}
-
-function micConstraints() {
-    return {
-        echoCancellation: true,
-        autoGainControl: true,
-        noiseSuppression: noiseMode === 'native'
-    };
-}
-
-function getRawMicTrack() {
-    return (micStream && micStream.getAudioTracks()[0])
-        || (localStream && localStream.getAudioTracks()[0])
-        || null;
-}
-
-function getOutboundMicTrack() {
-    return noiseMode === 'wasm' && processedMicTrack ? processedMicTrack : getRawMicTrack();
-}
-
-function findMicSender(peer) {
-    return peer.micSender
-        || peer.pc.getSenders().find(s => s.track?.kind === 'audio' && s.track !== screenAudioTrack)
-        || null;
-}
-
-async function publishMicTrack() {
-    const track = micEnabled ? getOutboundMicTrack() : null;
-    const stream = noiseMode === 'wasm' && processedMicTrack ? noiseDestination?.stream : (micStream || localStream);
-    for (const peer of peers.values()) {
-        const sender = findMicSender(peer);
-        if (sender) {
-            try { await sender.replaceTrack(track); } catch (e) { console.warn(e); }
-        } else if (track && stream) {
-            try { peer.micSender = peer.pc.addTrack(track, stream); } catch (e) { console.warn(e); }
-        }
-    }
-}
-
-function updateNoiseButton() {
-    const btn = $('noiseBtn');
-    btn.classList.toggle('active', noiseMode !== 'off');
-    if (noiseMode === 'wasm') {
-        btn.textContent = '◉';
-        btn.title = 'Noise cancellation: RNNoise WASM';
-    } else if (noiseMode === 'native') {
-        btn.textContent = '◍';
-        btn.title = 'Noise cancellation: browser native';
-    } else {
-        btn.textContent = '◒';
-        btn.title = 'Noise cancellation off';
-    }
-}
-
-async function stopWasmNoise() {
-    if (noiseNode) {
-        try { noiseNode.port.postMessage({ type: 'set-enabled', enabled: false }); } catch {}
-        try { noiseNode.disconnect(); } catch {}
-        noiseNode = null;
-    }
-    if (noiseSource) {
-        try { noiseSource.disconnect(); } catch {}
-        noiseSource = null;
-    }
-    if (processedMicTrack) {
-        try { processedMicTrack.stop(); } catch {}
-        processedMicTrack = null;
-    }
-    processedSourceTrack = null;
-    noiseDestination = null;
-    if (noiseAudioContext) {
-        try { await noiseAudioContext.close(); } catch {}
-        noiseAudioContext = null;
-    }
-}
-
-async function startWasmNoise() {
-    const rawTrack = getRawMicTrack();
-    if (!rawTrack) return false;
-    if (!window.AudioContext && !window.webkitAudioContext) return false;
-    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-
-    await stopWasmNoise();
-
-    try {
-        noiseAudioContext = new AudioContextCtor({ sampleRate: 48000 });
-        if (!noiseAudioContext.audioWorklet) throw new Error('AudioWorklet is not supported');
-        if (noiseAudioContext.state === 'suspended') await noiseAudioContext.resume();
-        await noiseAudioContext.audioWorklet.addModule('noise-suppressor.js');
-
-        const sourceStream = new MediaStream([rawTrack]);
-        noiseSource = noiseAudioContext.createMediaStreamSource(sourceStream);
-        noiseNode = new AudioWorkletNode(noiseAudioContext, 'noise-suppressor', {
-            numberOfInputs: 1,
-            numberOfOutputs: 1,
-            outputChannelCount: [1]
-        });
-        noiseDestination = noiseAudioContext.createMediaStreamDestination();
-        noiseSource.connect(noiseNode).connect(noiseDestination);
-        processedMicTrack = noiseDestination.stream.getAudioTracks()[0] || null;
-        processedSourceTrack = rawTrack;
-        noiseNode.port.postMessage({ type: 'set-enabled', enabled: true });
-        noiseNode.port.onmessage = async (event) => {
-            if (event.data?.type === 'failed' && noiseMode === 'wasm') {
-                console.warn('[Audio] RNNoise worklet failed', event.data.message || '');
-                toast('RNNoise unavailable; using browser noise cancellation', 'warn');
-                noiseMode = nativeNoiseSupported() ? 'native' : 'off';
-                await stopWasmNoise();
-                await publishMicTrack();
-                updateNoiseButton();
-            }
-        };
-        return Boolean(processedMicTrack);
-    } catch (err) {
-        console.warn('[Audio] RNNoise setup failed', err);
-        await stopWasmNoise();
-        return false;
-    }
-}
-
-async function syncNoiseProcessing() {
-    if (noiseMode !== 'wasm') {
-        await stopWasmNoise();
-        const rawTrack = getRawMicTrack();
-        if (rawTrack && rawTrack.applyConstraints) {
-            try { await rawTrack.applyConstraints({ noiseSuppression: noiseMode === 'native' }); } catch {}
-        }
-        await publishMicTrack();
-        updateNoiseButton();
-        return;
-    }
-
-    const rawTrack = getRawMicTrack();
-    if (!rawTrack) {
-        await stopWasmNoise();
-        updateNoiseButton();
-        return;
-    }
-    if (!processedMicTrack || processedSourceTrack !== rawTrack) {
-        const ok = await startWasmNoise();
-        if (!ok) {
-            noiseMode = nativeNoiseSupported() ? 'native' : 'off';
-            toast(noiseMode === 'native'
-                ? 'RNNoise unavailable; using browser noise cancellation'
-                : 'Noise cancellation is not supported in this browser', 'warn');
-        }
-    } else if (noiseAudioContext?.state === 'suspended') {
-        try { await noiseAudioContext.resume(); } catch {}
-    }
-    await publishMicTrack();
-    updateNoiseButton();
-}
-
 async function previewCamera() {
     try {
         // Release audio device first if micStream exists (to avoid AbortError)
@@ -890,7 +726,7 @@ async function previewCamera() {
                 height: { ideal: 1080 },
                 frameRate: { ideal: 30 }
             },
-            audio: micConstraints()
+            audio: { echoCancellation: true, noiseSuppression: true }
         });
         // Show preview in local video
         localVideo.srcObject = previewStream;
@@ -912,7 +748,7 @@ async function previewCamera() {
     }
 }
 
-async function confirmCamera() {
+function confirmCamera() {
     previewBtns.classList.remove('active');
     if (!previewStream) return;
 
@@ -931,16 +767,13 @@ async function confirmCamera() {
 
     localTile.style.display = '';
 
-    await syncNoiseProcessing();
-    const newAudio = getOutboundMicTrack();
-    const newAudioStream = noiseMode === 'wasm' && processedMicTrack ? noiseDestination?.stream : localStream;
-
     // Replace tracks on existing senders (no renegotiation needed)
     for (const peer of peers.values()) {
         const senders = peer.pc.getSenders();
         const videoSender = senders.find(s => s.track?.kind === 'video');
-        const audioSender = findMicSender(peer);
+        const audioSender = senders.find(s => s.track?.kind === 'audio');
         const newVideo = localStream.getVideoTracks()[0];
+        const newAudio = localStream.getAudioTracks()[0];
 
         if (videoSender && newVideo) {
             try { videoSender.replaceTrack(newVideo); } catch {}
@@ -950,7 +783,7 @@ async function confirmCamera() {
         if (audioSender && newAudio) {
             try { audioSender.replaceTrack(newAudio); } catch {}
         } else if (!audioSender && newAudio) {
-            try { peer.micSender = peer.pc.addTrack(newAudio, newAudioStream); } catch {}
+            try { peer.pc.addTrack(newAudio, localStream); } catch {}
         }
     }
 
@@ -1271,21 +1104,21 @@ function ensurePeer(peerId, polite, createDC, username) {
         pc, dc: null, polite,
         makingOffer: false, ignoreOffer: false,
         videoEl, tileEl, remoteStream, dot,
-        username: username || null,
-        micSender: null
+        username: username || null
     };
     peers.set(peerId, peer);
 
     // Add our local tracks to the connection.
     if (localStream) {
-        for (const track of localStream.getVideoTracks()) {
+        for (const track of localStream.getTracks()) {
             pc.addTrack(track, localStream);
         }
     }
-    const micTrack = micEnabled ? getOutboundMicTrack() : null;
-    const micPublishStream = noiseMode === 'wasm' && processedMicTrack ? noiseDestination?.stream : (micStream || localStream);
-    if (micTrack && micPublishStream) {
-        peer.micSender = pc.addTrack(micTrack, micPublishStream);
+    // Also add mic-only stream if camera is off but mic is on.
+    if (micStream) {
+        for (const track of micStream.getTracks()) {
+            pc.addTrack(track, micStream);
+        }
     }
 
     // ICE candidates → ship to peer via signaling server.
@@ -1577,8 +1410,6 @@ $('micBtn').onclick = async () => {
     if (micEnabled) {
         // Turn mic off
         micEnabled = false;
-        await publishMicTrack();
-        await stopWasmNoise();
         if (micStream) {
             micStream.getTracks().forEach(t => t.stop());
             micStream = null;
@@ -1591,10 +1422,18 @@ $('micBtn').onclick = async () => {
         if (!camEnabled) {
             try {
                 micStream = await navigator.mediaDevices.getUserMedia({
-                    audio: micConstraints()
+                    audio: { echoCancellation: true, noiseSuppression: true }
                 });
                 micEnabled = true;
-                await syncNoiseProcessing();
+                const audioTrack = micStream.getAudioTracks()[0];
+                for (const peer of peers.values()) {
+                    const sender = peer.pc.getSenders().find(s => s.track?.kind === 'audio');
+                    if (sender) {
+                        try { sender.replaceTrack(audioTrack); } catch {}
+                    } else if (audioTrack) {
+                        try { peer.pc.addTrack(audioTrack, micStream); } catch {}
+                    }
+                }
             } catch (err) {
                 console.error('[WebRTC] mic getUserMedia failed', err);
                 toast('Could not access microphone: ' + (err.message || err.name), 'error');
@@ -1604,22 +1443,10 @@ $('micBtn').onclick = async () => {
             // Camera is on — just re-enable existing audio tracks
             micEnabled = true;
             if (localStream) localStream.getAudioTracks().forEach(t => { t.enabled = true; });
-            await syncNoiseProcessing();
         }
         $('micBtn').classList.remove('muted');
         $('micBtn').textContent = '🎙️';
     }
-};
-
-$('noiseBtn').onclick = async () => {
-    if (noiseMode === 'off') {
-        noiseMode = 'wasm';
-    } else if (noiseMode === 'wasm' && nativeNoiseSupported()) {
-        noiseMode = 'native';
-    } else {
-        noiseMode = 'off';
-    }
-    await syncNoiseProcessing();
 };
 $('camBtn').onclick = () => {
     if (!camEnabled) {
@@ -1746,7 +1573,6 @@ function leaveCall() {
     try { sendWs({ type: 'leave' }); } catch {}
     for (const id of Array.from(peers.keys())) removePeer(id);
     if (ws) try { ws.close(); } catch {}
-    stopWasmNoise();
     if (localStream) localStream.getTracks().forEach(t => t.stop());
     if (screenStream) screenStream.getTracks().forEach(t => t.stop());
     if (micStream) micStream.getTracks().forEach(t => t.stop());
