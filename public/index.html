@@ -784,6 +784,7 @@ let previewStream = null;    // preview stream during camera confirmation
 let myPeerId = null;
 let facingMode = 'user';     // 'user' = front camera, 'environment' = back camera
 let myUsername = '';
+let clientId = '';
 let roomId = null;
 let ws = null;
 let wsBackoff = 1000;
@@ -817,6 +818,32 @@ const FILE_BUFFER_HIGH = 256 * 1024;
 const FILE_BUFFER_LOW = 64 * 1024;
 const outgoingFiles = new Map(); // fileId -> { file, peers:Set, accepted:Set, completed:Set, rejected:Set, card }
 const incomingFiles = new Map(); // fileId -> { peer, meta, chunks, received, card, lastProgressSent }
+
+function createClientId() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0'));
+    return [
+        hex.slice(0, 4).join(''),
+        hex.slice(4, 6).join(''),
+        hex.slice(6, 8).join(''),
+        hex.slice(8, 10).join(''),
+        hex.slice(10, 16).join('')
+    ].join('-');
+}
+
+function getClientId() {
+    if (clientId) return clientId;
+    clientId = localStorage.getItem('vidly-client-id');
+    if (!clientId) {
+        clientId = createClientId();
+        localStorage.setItem('vidly-client-id', clientId);
+    }
+    return clientId;
+}
 
 // ─── Toast helper ─────────────────────────────────────────
 function toast(message, type = '') {
@@ -1282,7 +1309,7 @@ function handleSignaling(msg) {
             // Clean up stale peers from previous connection (reconnection)
             for (const [id] of peers) removePeer(id);
             sendWs({ type: 'set-username', username: myUsername });
-            sendWs({ type: 'join', roomId, username: myUsername });
+            sendWs({ type: 'join', roomId, username: myUsername, clientId: getClientId() });
             break;
 
         case 'joined':

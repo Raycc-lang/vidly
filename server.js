@@ -116,8 +116,20 @@ wss.on('connection', (ws) => {
             leaveRoom(ws);
 
             const roomId = msg.roomId;
+            const username = typeof msg.username === 'string' ? msg.username.trim().slice(0, 32) : '';
+            const clientId = typeof msg.clientId === 'string' ? msg.clientId.trim().slice(0, 64) : '';
             let room = rooms.get(roomId);
             if (!room) { room = new Map(); rooms.set(roomId, room); }
+
+            if (clientId) {
+                for (const peerWs of room.values()) {
+                    if (peerWs.clientId === clientId) {
+                        leaveRoom(peerWs);
+                        peerWs.close();
+                        break;
+                    }
+                }
+            }
 
             if (room.size >= 4) {
                 send(ws, { type: 'room-full' });
@@ -131,14 +143,15 @@ wss.on('connection', (ws) => {
             }
 
             // Reject if username already taken in this room
-            if (msg.username && existingPeers.some(p => p.username === msg.username.trim().slice(0, 32))) {
-                send(ws, { type: 'username-taken', username: msg.username.trim().slice(0, 32) });
+            if (username && existingPeers.some(p => p.username === username)) {
+                send(ws, { type: 'username-taken', username });
                 return;
             }
             room.set(ws.peerId, ws);
             ws.roomId = roomId;
+            ws.clientId = clientId || null;
             // Store username from join message as well (backup for set-username)
-            if (msg.username) ws.username = msg.username.trim().slice(0, 32);
+            if (username) ws.username = username;
 
             send(ws, { type: 'joined', roomId, peers: existingPeers });
             for (const { peerId } of existingPeers) {
