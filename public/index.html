@@ -404,6 +404,7 @@
   .msg.own { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #fff; border-bottom-right-radius: 4px; }
   .msg.other { align-self: flex-start; background: #262a36; border-bottom-left-radius: 4px; }
   .msg.system { align-self: center; background: transparent; color: var(--muted); font-size: 12px; font-style: italic; }
+  .msg.file.system { align-self: stretch; max-width: 100%; font-style: normal; }
   .msg.reaction {
     align-self: center;
     max-width: min(280px, 88%);
@@ -423,6 +424,7 @@
     vertical-align: -2px;
   }
   .msg.media { width: min(260px, 80%); padding: 8px; }
+  .msg.file { width: min(300px, 86%); padding: 10px; }
   .media-wrap { display: grid; gap: 6px; }
   .media-loading { color: var(--muted); font-size: 12px; }
   .chat-media {
@@ -437,6 +439,56 @@
     color: inherit;
     overflow-wrap: anywhere;
     font-size: 13px;
+  }
+  .file-card { display: grid; gap: 8px; min-width: 0; }
+  .file-row { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .file-icon {
+    width: 34px; height: 34px; border-radius: 8px;
+    display: grid; place-items: center;
+    background: rgba(255,255,255,.11);
+    flex: 0 0 auto;
+    font-size: 18px;
+  }
+  .file-info { min-width: 0; flex: 1; }
+  .file-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-size, .file-status { color: var(--muted); font-size: 11px; }
+  .msg.own .file-size, .msg.own .file-status { color: rgba(255,255,255,.78); }
+  .file-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .file-actions .btn { height: 30px; padding: 0 10px; font-size: 12px; }
+  .file-progress {
+    height: 6px;
+    background: rgba(255,255,255,.13);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .file-progress > span {
+    display: block; height: 100%; width: 0%;
+    background: currentColor;
+    opacity: .9;
+    transition: width .15s ease;
+  }
+  .file-download { color: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
+  .file-thumb {
+    display: block;
+    max-width: 100%;
+    max-height: 210px;
+    border-radius: 8px;
+    object-fit: contain;
+    background: rgba(0,0,0,.25);
+  }
+  .file-pending {
+    display: none;
+    gap: 8px;
+    padding: 10px 12px;
+    border-top: 1px solid var(--border);
+    background: rgba(0,0,0,.12);
+  }
+  .file-pending.open { display: grid; }
+  .file-pending .file-actions { justify-content: flex-end; }
+  .chat.drag-over .messages {
+    outline: 2px dashed var(--accent);
+    outline-offset: -8px;
+    background: rgba(90,160,255,.08);
   }
   .chat-input {
     display: flex; gap: 8px; padding: 10px 12px;
@@ -664,8 +716,11 @@
         <button class="btn ghost" id="closeChat">✕</button>
       </div>
       <div class="messages" id="messages"></div>
+      <div class="file-pending" id="filePending"></div>
       <form class="chat-input" id="chatForm">
         <div class="sticker-picker" id="stickerPicker" aria-label="GIF picker"></div>
+        <input id="fileInput" type="file" hidden />
+        <button class="btn ghost icon" id="fileBtn" type="button" title="Send file">📎</button>
         <button class="btn ghost icon" id="stickerBtn" type="button" title="GIFs">✨</button>
         <input class="input" id="chatInput" placeholder="Type a message…" autocomplete="off" />
         <button class="btn primary" type="submit">Send</button>
@@ -757,6 +812,11 @@ const GIPHY_API_KEY = 'z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn';
 const GIPHY_LIMIT = 20;
 const MEDIA_URL_RE = /^https?:\/\/\S+\.(jpe?g|png|gif|webp)(\?\S*)?$/i;
 const GIF_SERVICE_RE = /^https?:\/\/\S*(giphy\.com|tenor\.com)\/\S+$/i;
+const FILE_CHUNK_SIZE = 16 * 1024;
+const FILE_BUFFER_HIGH = 256 * 1024;
+const FILE_BUFFER_LOW = 64 * 1024;
+const outgoingFiles = new Map(); // fileId -> { file, peers:Set, accepted:Set, completed:Set, rejected:Set, card }
+const incomingFiles = new Map(); // fileId -> { peer, meta, chunks, received, card, lastProgressSent }
 
 // ─── Toast helper ─────────────────────────────────────────
 function toast(message, type = '') {
@@ -1288,7 +1348,7 @@ function ensurePeer(peerId, polite, createDC, username) {
     videoEl.srcObject = remoteStream;
 
     peer = {
-        pc, dc: null, polite,
+        pc, dc: null, fileDc: null, polite,
         makingOffer: false, ignoreOffer: false,
         videoEl, tileEl, remoteStream, dot,
         username: username || null
@@ -1413,8 +1473,13 @@ function ensurePeer(peerId, polite, createDC, username) {
     if (createDC) {
         const dc = pc.createDataChannel('chat');
         attachDataChannel(peer, dc);
+        const fileDc = pc.createDataChannel('file');
+        attachFileDataChannel(peer, fileDc);
     }
-    pc.ondatachannel = (e) => attachDataChannel(peer, e.channel);
+    pc.ondatachannel = (e) => {
+        if (e.channel.label === 'file') attachFileDataChannel(peer, e.channel);
+        else attachDataChannel(peer, e.channel);
+    };
 
     return peer;
 }
@@ -1458,6 +1523,9 @@ function sendSignal(to, payload) {
 function removePeer(peerId) {
     const peer = peers.get(peerId);
     if (!peer) return;
+    for (const [fileId, transfer] of incomingFiles) {
+        if (transfer.peer === peer) incomingFiles.delete(fileId);
+    }
     try { peer.pc.close(); } catch {}
     if (peer.tileEl && peer.tileEl.parentNode) peer.tileEl.parentNode.removeChild(peer.tileEl);
     peers.delete(peerId);
@@ -1470,6 +1538,16 @@ function sendDataMessage(msg) {
         if (peer.dc && peer.dc.readyState === 'open') {
             try { peer.dc.send(data); } catch {}
         }
+    }
+}
+
+function sendPeerDataMessage(peer, msg) {
+    if (peer?.dc?.readyState !== 'open') return false;
+    try {
+        peer.dc.send(JSON.stringify(msg));
+        return true;
+    } catch {
+        return false;
     }
 }
 
@@ -1522,9 +1600,339 @@ function attachDataChannel(peer, dc) {
             addMediaMessage('other', msg.url, msg.kind, msg.ts, msg.username);
         } else if (msg.type === 'reaction') {
             addReactionMessage('other', msg.emoji, msg.ts, msg.username || peer.username || 'Peer');
+        } else if (msg.type && msg.type.startsWith('file-')) {
+            handleFileControl(peer, msg);
         }
     };
     dc.onclose = () => {};
+}
+
+function attachFileDataChannel(peer, dc) {
+    peer.fileDc = dc;
+    dc.binaryType = 'arraybuffer';
+    dc.bufferedAmountLowThreshold = FILE_BUFFER_LOW;
+    dc.onmessage = (e) => handleFileChunk(peer, e.data);
+    dc.onclose = () => {};
+}
+
+function fileId() {
+    return 'file-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
+}
+
+function formatBytes(bytes) {
+    if (!bytes) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let i = 0;
+    while (value >= 1024 && i < units.length - 1) {
+        value /= 1024;
+        i++;
+    }
+    return (value >= 10 || i === 0 ? value.toFixed(0) : value.toFixed(1)) + ' ' + units[i];
+}
+
+function isImageFile(meta) {
+    return (meta.type || '').startsWith('image/');
+}
+
+function createFileCard(kind, meta, opts = {}) {
+    const el = document.createElement('div');
+    el.className = 'msg file ' + kind;
+    appendSenderName(el, kind, opts.senderName);
+
+    const card = document.createElement('div');
+    card.className = 'file-card';
+
+    const row = document.createElement('div');
+    row.className = 'file-row';
+    const icon = document.createElement('div');
+    icon.className = 'file-icon';
+    icon.textContent = isImageFile(meta) ? '🖼️' : '📄';
+    row.appendChild(icon);
+
+    const info = document.createElement('div');
+    info.className = 'file-info';
+    const name = document.createElement('div');
+    name.className = 'file-name';
+    name.textContent = meta.name || 'Untitled file';
+    const size = document.createElement('div');
+    size.className = 'file-size';
+    size.textContent = formatBytes(meta.size || 0);
+    info.appendChild(name);
+    info.appendChild(size);
+    row.appendChild(info);
+    card.appendChild(row);
+
+    const status = document.createElement('div');
+    status.className = 'file-status';
+    status.textContent = opts.status || '';
+    card.appendChild(status);
+
+    const progress = document.createElement('div');
+    progress.className = 'file-progress';
+    const bar = document.createElement('span');
+    progress.appendChild(bar);
+    if (opts.hideProgress) progress.style.display = 'none';
+    card.appendChild(progress);
+
+    const actions = document.createElement('div');
+    actions.className = 'file-actions';
+    if (opts.actions) {
+        for (const action of opts.actions) actions.appendChild(action);
+    }
+    if (!actions.childNodes.length) actions.style.display = 'none';
+    card.appendChild(actions);
+
+    const preview = document.createElement('div');
+    card.appendChild(preview);
+
+    el.appendChild(card);
+    appendMessageTime(el, opts.ts);
+    return { el, status, bar, actions, preview };
+}
+
+function setFileProgress(card, loaded, total) {
+    const pct = total ? Math.max(0, Math.min(100, Math.round((loaded / total) * 100))) : 0;
+    card.bar.style.width = pct + '%';
+}
+
+function addCompletedFileMessage(kind, meta, blobOrUrl, ts, senderName) {
+    const card = createFileCard(kind, meta, { ts, senderName, hideProgress: true, status: 'Complete' });
+    const url = typeof blobOrUrl === 'string' ? blobOrUrl : URL.createObjectURL(blobOrUrl);
+    renderFilePreview(card, meta, url);
+    messagesEl.appendChild(card.el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    updateChatCompact();
+}
+
+function renderFilePreview(card, meta, url) {
+    card.preview.innerHTML = '';
+    if (isImageFile(meta)) {
+        const img = document.createElement('img');
+        img.className = 'file-thumb';
+        img.alt = meta.name || 'Shared image';
+        img.src = url;
+        card.preview.appendChild(img);
+    } else {
+        const link = document.createElement('a');
+        link.className = 'file-download';
+        link.href = url;
+        link.download = meta.name || 'download';
+        link.textContent = 'Download';
+        card.preview.appendChild(link);
+    }
+}
+
+function showPendingFile(file) {
+    const pending = $('filePending');
+    if (!pending) return;
+    pending.innerHTML = '';
+    pending.classList.add('open');
+
+    const sendBtn = document.createElement('button');
+    sendBtn.className = 'btn primary';
+    sendBtn.type = 'button';
+    sendBtn.textContent = 'Send';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn ghost';
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel';
+    const card = createFileCard('system', file, {
+        status: 'Ready to send',
+        hideProgress: true,
+        actions: [cancelBtn, sendBtn]
+    });
+    pending.appendChild(card.el);
+
+    let previewUrl = null;
+    if (isImageFile(file)) {
+        previewUrl = URL.createObjectURL(file);
+        const img = document.createElement('img');
+        img.className = 'file-thumb';
+        img.alt = file.name;
+        img.src = previewUrl;
+        card.preview.appendChild(img);
+    }
+
+    cancelBtn.onclick = () => {
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        pending.classList.remove('open');
+        pending.innerHTML = '';
+    };
+    sendBtn.onclick = () => {
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        pending.classList.remove('open');
+        pending.innerHTML = '';
+        startFileOffer(file);
+    };
+}
+
+function startFileOffer(file) {
+    const readyPeers = Array.from(peers.values()).filter(peer =>
+        peer.dc?.readyState === 'open' && peer.fileDc?.readyState === 'open'
+    );
+    if (!readyPeers.length) {
+        toast('No connected peers ready for file transfer', 'warn');
+        return;
+    }
+    const id = fileId();
+    const meta = { id, name: file.name, size: file.size, type: file.type || 'application/octet-stream', ts: Date.now(), username: myUsername };
+    const card = createFileCard('own', meta, { status: 'Waiting for acceptance', ts: meta.ts });
+    messagesEl.appendChild(card.el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    updateChatCompact();
+
+    outgoingFiles.set(id, {
+        file, meta, card,
+        peers: new Set(readyPeers),
+        accepted: new Set(),
+        completed: new Set(),
+        rejected: new Set()
+    });
+    for (const peer of readyPeers) {
+        sendPeerDataMessage(peer, { type: 'file-offer', file: meta });
+    }
+}
+
+function handleFileControl(peer, msg) {
+    if (msg.type === 'file-offer' && msg.file) {
+        receiveFileOffer(peer, msg.file);
+    } else if (msg.type === 'file-accept') {
+        const transfer = outgoingFiles.get(msg.id);
+        if (!transfer || transfer.accepted.has(peer)) return;
+        transfer.accepted.add(peer);
+        transfer.card.status.textContent = 'Sending...';
+        sendFileToPeer(peer, transfer).catch(() => {
+            transfer.card.status.textContent = 'Transfer failed';
+        });
+    } else if (msg.type === 'file-reject') {
+        const transfer = outgoingFiles.get(msg.id);
+        if (!transfer) return;
+        transfer.rejected.add(peer);
+        transfer.card.status.textContent = 'Declined by ' + (peer.username || 'peer');
+    } else if (msg.type === 'file-progress') {
+        const transfer = outgoingFiles.get(msg.id);
+        if (!transfer) return;
+        setFileProgress(transfer.card, msg.received || 0, transfer.file.size);
+        transfer.card.status.textContent = 'Sending ' + Math.round(((msg.received || 0) / transfer.file.size) * 100) + '%';
+    } else if (msg.type === 'file-complete') {
+        const transfer = outgoingFiles.get(msg.id);
+        if (!transfer) return;
+        transfer.completed.add(peer);
+        setFileProgress(transfer.card, transfer.file.size, transfer.file.size);
+        const done = transfer.completed.size;
+        const total = transfer.peers.size;
+        transfer.card.status.textContent = done === total ? 'Sent' : 'Sent to ' + done + ' of ' + total;
+        if (done + transfer.rejected.size >= total) {
+            transfer.card.bar.parentElement.style.display = 'none';
+            renderFilePreview(transfer.card, transfer.meta, URL.createObjectURL(transfer.file));
+            outgoingFiles.delete(msg.id);
+        }
+    } else if (msg.type === 'file-empty') {
+        completeIncomingFile(peer, msg.id);
+    }
+}
+
+function receiveFileOffer(peer, meta) {
+    if (incomingFiles.has(meta.id)) return;
+    const acceptBtn = document.createElement('button');
+    acceptBtn.className = 'btn primary';
+    acceptBtn.type = 'button';
+    acceptBtn.textContent = 'Accept';
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'btn ghost';
+    rejectBtn.type = 'button';
+    rejectBtn.textContent = 'Reject';
+    const card = createFileCard('other', meta, {
+        senderName: meta.username || peer.username,
+        ts: meta.ts,
+        status: 'Incoming file',
+        hideProgress: true,
+        actions: [rejectBtn, acceptBtn]
+    });
+    messagesEl.appendChild(card.el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    updateChatCompact();
+
+    const transfer = { peer, meta, chunks: [], received: 0, card, lastProgressSent: 0 };
+    incomingFiles.set(meta.id, transfer);
+    acceptBtn.onclick = () => {
+        if (peer.activeIncomingFileId) {
+            toast('Finish the current file from this peer first', 'warn');
+            return;
+        }
+        card.actions.style.display = 'none';
+        card.status.textContent = 'Receiving...';
+        card.bar.parentElement.style.display = '';
+        peer.activeIncomingFileId = meta.id;
+        sendPeerDataMessage(peer, { type: 'file-accept', id: meta.id });
+    };
+    rejectBtn.onclick = () => {
+        incomingFiles.delete(meta.id);
+        card.actions.style.display = 'none';
+        card.status.textContent = 'Declined';
+        sendPeerDataMessage(peer, { type: 'file-reject', id: meta.id });
+    };
+}
+
+async function sendFileToPeer(peer, transfer) {
+    const dc = peer.fileDc;
+    if (!dc || dc.readyState !== 'open') throw new Error('file channel is closed');
+    if (transfer.file.size === 0) {
+        sendPeerDataMessage(peer, { type: 'file-empty', id: transfer.meta.id });
+        return;
+    }
+    let offset = 0;
+    while (offset < transfer.file.size) {
+        if (dc.readyState !== 'open') throw new Error('file channel is closed');
+        const chunk = await transfer.file.slice(offset, offset + FILE_CHUNK_SIZE).arrayBuffer();
+        await waitForFileBuffer(dc);
+        dc.send(chunk);
+        offset += chunk.byteLength;
+    }
+}
+
+function waitForFileBuffer(dc) {
+    if (dc.bufferedAmount <= FILE_BUFFER_HIGH) return Promise.resolve();
+    return new Promise((resolve) => {
+        const done = () => {
+            dc.removeEventListener('bufferedamountlow', done);
+            resolve();
+        };
+        dc.addEventListener('bufferedamountlow', done);
+    });
+}
+
+function handleFileChunk(peer, data) {
+    if (!(data instanceof ArrayBuffer)) return;
+    let transfer = incomingFiles.get(peer.activeIncomingFileId);
+    if (!transfer || transfer.peer !== peer) transfer = null;
+    if (!transfer) return;
+    transfer.chunks.push(data);
+    transfer.received += data.byteLength;
+    setFileProgress(transfer.card, transfer.received, transfer.meta.size);
+    transfer.card.status.textContent = 'Receiving ' + Math.round((transfer.received / transfer.meta.size) * 100) + '%';
+
+    const now = Date.now();
+    if (now - transfer.lastProgressSent > 250 || transfer.received >= transfer.meta.size) {
+        transfer.lastProgressSent = now;
+        sendPeerDataMessage(peer, { type: 'file-progress', id: transfer.meta.id, received: transfer.received });
+    }
+    if (transfer.received >= transfer.meta.size) {
+        completeIncomingFile(peer, transfer.meta.id);
+    }
+}
+
+function completeIncomingFile(peer, id) {
+    const transfer = incomingFiles.get(id);
+    if (!transfer || transfer.peer !== peer) return;
+    const blob = new Blob(transfer.chunks, { type: transfer.meta.type || 'application/octet-stream' });
+    transfer.card.el.remove();
+    incomingFiles.delete(transfer.meta.id);
+    if (peer.activeIncomingFileId === transfer.meta.id) peer.activeIncomingFileId = null;
+    addCompletedFileMessage('other', transfer.meta, blob, Date.now(), transfer.meta.username || peer.username);
+    sendPeerDataMessage(peer, { type: 'file-complete', id: transfer.meta.id });
+    toast('Received ' + transfer.meta.name, 'success');
 }
 
 function broadcastChat(text) {
@@ -1676,7 +2084,9 @@ function updateChatCompact() {
         row.className = 'cc-msg';
         const sender = m.classList.contains('own') ? 'You' :
             (m.querySelector('.meta')?.textContent || 'Peer');
-        const body = m.classList.contains('media') ? '[media]' : (m.querySelector('span:not(.meta)')?.textContent || '');
+        const body = m.classList.contains('media') ? '[media]' :
+            (m.classList.contains('file') ? '[file] ' + (m.querySelector('.file-name')?.textContent || '') :
+            (m.querySelector('span:not(.meta)')?.textContent || ''));
         const s = document.createElement('span');
         s.className = 'cc-sender';
         s.textContent = sender + ':';
@@ -1702,6 +2112,40 @@ $('chatForm').addEventListener('submit', (e) => {
     $('chatInput').value = '';
     closeStickerPicker();
 });
+
+$('fileBtn').addEventListener('click', () => {
+    $('fileInput').click();
+});
+
+$('fileInput').addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (file) showPendingFile(file);
+});
+
+function handleDroppedFile(e) {
+    const file = e.dataTransfer?.files?.[0];
+    if (!file) return;
+    e.preventDefault();
+    e.stopPropagation();
+    $('chat').classList.remove('drag-over');
+    if (!$('chat').classList.contains('open')) toggleChat();
+    showPendingFile(file);
+}
+
+$('chat').addEventListener('dragenter', (e) => {
+    if (!e.dataTransfer?.types?.includes('Files')) return;
+    e.preventDefault();
+    $('chat').classList.add('drag-over');
+});
+$('chat').addEventListener('dragover', (e) => {
+    if (!e.dataTransfer?.types?.includes('Files')) return;
+    e.preventDefault();
+});
+$('chat').addEventListener('dragleave', (e) => {
+    if (!$('chat').contains(e.relatedTarget)) $('chat').classList.remove('drag-over');
+});
+$('chat').addEventListener('drop', handleDroppedFile);
 
 function initReactionPanel() {
     const panel = $('reactionPanel');
