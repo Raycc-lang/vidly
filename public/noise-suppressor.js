@@ -1,3 +1,5 @@
+import createRNNWasmModuleSync from './vendor/rnnoise-sync.js';
+
 const FRAME_SIZE = 480;
 const RING_SIZE = FRAME_SIZE * 16;
 const PCM_SCALE = 32768;
@@ -17,58 +19,22 @@ class NoiseSuppressorProcessor extends AudioWorkletProcessor {
         this.outputWrite = 0;
         this.outputCount = 0;
 
-        this.port.onmessage = async (event) => {
+        this.port.onmessage = (event) => {
             if (event.data && event.data.type === 'set-enabled') {
                 this.enabled = Boolean(event.data.enabled);
                 if (!this.enabled) {
                     this.clearRings();
                 }
             }
-            if (event.data && event.data.type === 'wasm-binary') {
-                try {
-                    const { default: createModule } = await import('./vendor/rnnoise-sync.js');
-                    const Module = createModule({ wasmBinary: event.data.binary });
-                    Module['wasmBinary'] = event.data.binary;
-                    this.initWithModule(Module);
-                } catch (err) {
-                    this.failed = true;
-                    this.port.postMessage({ type: 'failed', message: err?.message || String(err) });
-                }
-            }
         };
 
-        // Worklet will be initialized externally via 'init' message with WASM binary
-        this.Module = null;
-        this.state = null;
-        this.inPtr = null;
-        this.outPtr = null;
-        this.inHeap = null;
-        this.outHeap = null;
-
-        // Try to import and initialize RNNoise WASM synchronously
-        this.tryInit();
-    }
-
-    async tryInit() {
         try {
-            // Dynamic import inside worklet — may fail in some browsers
-            const { default: createModule } = await import('./vendor/rnnoise-sync.js');
-            const Module = createModule();
-            this.initWithModule(Module);
-        } catch (err) {
-            console.warn('[NoiseWorklet] Sync init failed, waiting for binary from main thread:', err?.message || err);
-            this.port.postMessage({ type: 'needs-wasm-binary' });
-        }
-    }
-
-    initWithModule(Module) {
-        try {
-            this.Module = Module;
-            this.state = Module._rnnoise_create(0);
-            this.inPtr = Module._malloc(FRAME_SIZE * Float32Array.BYTES_PER_ELEMENT);
-            this.outPtr = Module._malloc(FRAME_SIZE * Float32Array.BYTES_PER_ELEMENT);
-            this.inHeap = Module.HEAPF32.subarray(this.inPtr >> 2, (this.inPtr >> 2) + FRAME_SIZE);
-            this.outHeap = Module.HEAPF32.subarray(this.outPtr >> 2, (this.outPtr >> 2) + FRAME_SIZE);
+            this.Module = createRNNWasmModuleSync();
+            this.state = this.Module._rnnoise_create(0);
+            this.inPtr = this.Module._malloc(FRAME_SIZE * Float32Array.BYTES_PER_ELEMENT);
+            this.outPtr = this.Module._malloc(FRAME_SIZE * Float32Array.BYTES_PER_ELEMENT);
+            this.inHeap = this.Module.HEAPF32.subarray(this.inPtr >> 2, (this.inPtr >> 2) + FRAME_SIZE);
+            this.outHeap = this.Module.HEAPF32.subarray(this.outPtr >> 2, (this.outPtr >> 2) + FRAME_SIZE);
             this.ready = Boolean(this.state && this.inPtr && this.outPtr);
             this.port.postMessage({ type: this.ready ? 'ready' : 'failed' });
         } catch (err) {

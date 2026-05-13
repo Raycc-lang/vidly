@@ -824,32 +824,15 @@ async function startWasmNoise() {
         noiseSource.connect(noiseNode).connect(noiseDestination);
         processedMicTrack = noiseDestination.stream.getAudioTracks()[0] || null;
         processedSourceTrack = rawTrack;
-        const currentNoiseNode = noiseNode;
-        const fallbackFromWasmFailure = async (message) => {
-            if (noiseMode !== 'wasm') return;
-            console.warn('[Audio] RNNoise worklet failed', message || '');
-            toast('RNNoise unavailable; using browser noise cancellation', 'warn');
-            noiseMode = nativeNoiseSupported() ? 'native' : 'off';
-            await stopWasmNoise();
-            await publishMicTrack();
-            updateNoiseButton();
-        };
         noiseNode.port.postMessage({ type: 'set-enabled', enabled: true });
         noiseNode.port.onmessage = async (event) => {
-            if (event.data?.type === 'needs-wasm-binary') {
-                try {
-                    const response = await fetch('vendor/rnnoise.wasm');
-                    if (!response.ok) throw new Error(`RNNoise WASM fetch failed: ${response.status}`);
-                    const wasmBinary = await response.arrayBuffer();
-                    if (noiseNode === currentNoiseNode) {
-                        currentNoiseNode.port.postMessage({ type: 'wasm-binary', binary: wasmBinary }, [wasmBinary]);
-                    }
-                } catch (err) {
-                    await fallbackFromWasmFailure(err?.message || String(err));
-                }
-            }
-            if (event.data?.type === 'failed') {
-                await fallbackFromWasmFailure(event.data.message);
+            if (event.data?.type === 'failed' && noiseMode === 'wasm') {
+                console.warn('[Audio] RNNoise worklet failed', event.data.message || '');
+                toast('RNNoise unavailable; using browser noise cancellation', 'warn');
+                noiseMode = nativeNoiseSupported() ? 'native' : 'off';
+                await stopWasmNoise();
+                await publishMicTrack();
+                updateNoiseButton();
             }
         };
         return Boolean(processedMicTrack);
