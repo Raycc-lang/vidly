@@ -81,6 +81,7 @@ const server = http.createServer((req, res) => {
 // ─── WebSocket signaling ────────────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 const rooms = new Map(); // roomId -> Map<peerId, ws>
+const watchers = new Map(); // roomId -> Set<ws>
 
 function send(ws, msg) {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
@@ -88,18 +89,37 @@ function send(ws, msg) {
 
 function leaveRoom(ws) {
     const { roomId, peerId } = ws;
-    if (!roomId) return;
-    const room = rooms.get(roomId);
-    if (!room) return;
-    room.delete(peerId);
-    for (const peer of room.values()) send(peer, { type: 'peer-left', peerId, username: ws.username || null });
-    if (room.size === 0) rooms.delete(roomId);
-    ws.roomId = null;
+    if (roomId) {
+        const room = rooms.get(roomId);
+        if (room) {
+            room.delete(peerId);
+            for (const peer of room.values()) send(peer, { type: 'peer-left', peerId, username: ws.username || null });
+            const roomWatchers = watchers.get(roomId);
+            if (roomWatchers) {
+                for (const watcher of roomWatchers) send(watcher, { type: 'peer-left', peerId, username: ws.username || null });
+            }
+            if (room.size === 0) rooms.delete(roomId);
+        }
+        ws.roomId = null;
+    }
+    unwatchRoom(ws);
+}
+
+function unwatchRoom(ws) {
+    const { watchingRoom } = ws;
+    if (!watchingRoom) return;
+    const roomWatchers = watchers.get(watchingRoom);
+    if (roomWatchers) {
+        roomWatchers.delete(ws);
+        if (roomWatchers.size === 0) watchers.delete(watchingRoom);
+    }
+    ws.watchingRoom = null;
 }
 
 wss.on('connection', (ws) => {
     ws.peerId = crypto.randomUUID();
     ws.roomId = null;
+    ws.watchingRoom = null;
     send(ws, { type: 'welcome', peerId: ws.peerId });
 
     ws.on('message', (raw) => {
@@ -157,6 +177,30 @@ wss.on('connection', (ws) => {
             for (const { peerId } of existingPeers) {
                 const peerWs = room.get(peerId);
                 if (peerWs) send(peerWs, { type: 'peer-joined', peerId: ws.peerId, username: ws.username || null });
+            }
+            const roomWatchers = watchers.get(roomId);
+            if (roomWatchers) {
+                for (const watcher of roomWatchers) send(watcher, { type: 'peer-joined', peerId: ws.peerId, username: ws.username || null });
+            }
+            return;
+        }
+
+        if (msg.type === 'watch' && typeof msg.roomId === 'string') {
+            leaveRoom(ws);
+            unwatchRoom(ws);
+
+            const roomId = msg.roomId;
+            let roomWatchers = watchers.get(roomId);
+            if (!roomWatchers) { roomWatchers = new Set(); watchers.set(roomId, roomWatchers); }
+            roomWatchers.add(ws);
+            ws.watchingRoom = roomId;
+
+            send(ws, { type: 'watching', roomId });
+            const room = rooms.get(roomId);
+            if (room) {
+                for (const [peerId, peerWs] of room.entries()) {
+                    send(ws, { type: 'peer-joined', peerId, username: peerWs.username || null });
+                }
             }
             return;
         }
