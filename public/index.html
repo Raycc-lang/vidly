@@ -778,6 +778,7 @@ let screenStream = null;
 let screenAudioTrack = null;   // optional system/tab audio track from screen share
 let screenTrackCheck = null;   // interval for screen track liveness
 let isSharing = false;
+let loadingHistory = false;
 let micEnabled = false;
 let camEnabled = false;
 let micStream = null;        // audio-only stream when mic is on but camera is off
@@ -787,6 +788,7 @@ let facingMode = 'user';     // 'user' = front camera, 'environment' = back came
 let myUsername = '';
 let clientId = '';
 let roomId = null;
+const CHAT_MAX = 200; // max messages per room in localStorage
 let ws = null;
 let wsBackoff = 1000;
 let wsReconnectTimer = null;
@@ -894,6 +896,7 @@ async function showCall() {
     $('roomLabel').textContent = roomId;
     $('localLabel').textContent = myUsername || 'You';
     updateChatCompact();
+    loadChatHistory();
     await loadConfig();
     await initLocalMedia();
     connectWebSocket();
@@ -2004,6 +2007,33 @@ function detectMedia(text) {
     return null;
 }
 
+// ─── Chat history (localStorage) ─────────────────────────
+function chatKey() { return 'vidly-chat-' + roomId; }
+
+function saveChatMsg(msg) {
+    if (!roomId || loadingHistory) return;
+    try {
+        const arr = JSON.parse(localStorage.getItem(chatKey()) || '[]');
+        arr.push(msg);
+        if (arr.length > CHAT_MAX) arr.splice(0, arr.length - CHAT_MAX);
+        localStorage.setItem(chatKey(), JSON.stringify(arr));
+    } catch {}
+}
+
+function loadChatHistory() {
+    if (!roomId) return;
+    loadingHistory = true;
+    try {
+        const arr = JSON.parse(localStorage.getItem(chatKey()) || '[]');
+        for (const m of arr) {
+            if (m.type === 'chat') addMessage(m.kind, m.body, m.ts, m.senderName);
+            else if (m.type === 'media') addMediaMessage(m.kind, m.url, m.mediaKind, m.ts, m.senderName);
+            else if (m.type === 'reaction') addReactionMessage(m.kind, m.emoji, m.ts, m.senderName);
+        }
+    } catch {}
+    loadingHistory = false;
+}
+
 function addMessage(kind, body, ts, senderName) {
     const el = document.createElement('div');
     el.className = 'msg ' + kind;
@@ -2032,6 +2062,7 @@ function addMessage(kind, body, ts, senderName) {
 
     if (kind === 'own' || kind === 'other') {
         updateChatCompact();
+        saveChatMsg({ type: 'chat', kind, body, ts, senderName });
     }
 }
 
@@ -2090,6 +2121,7 @@ function addMediaMessage(kind, url, mediaKind, ts, senderName) {
     messagesEl.appendChild(el);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     updateChatCompact();
+    saveChatMsg({ type: 'media', kind, url, mediaKind, ts, senderName });
 }
 
 function addReactionMessage(kind, emoji, ts, senderName) {
@@ -2105,6 +2137,7 @@ function addReactionMessage(kind, emoji, ts, senderName) {
     if (ts) el.title = new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     messagesEl.appendChild(el);
     messagesEl.scrollTop = messagesEl.scrollHeight;
+    saveChatMsg({ type: 'reaction', kind, emoji, ts, senderName });
 }
 
 function updateChatCompact() {
