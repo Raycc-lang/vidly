@@ -1069,7 +1069,7 @@ function confirmCamera() {
     toast('Camera and mic are now on', 'success');
 }
 
-function cancelCamera() {
+async function cancelCamera() {
     previewBtns.classList.remove('active');
     if (previewStream) {
         previewStream.getTracks().forEach(t => t.stop());
@@ -1078,6 +1078,31 @@ function cancelCamera() {
     localVideo.srcObject = null;
     showLocalPlaceholder();
     localTile.style.display = 'none';
+
+    // previewCamera() stopped the audio-only micStream to free the mic device.
+    // If the mic was on before previewing, re-acquire it so peers keep hearing us.
+    if (micEnabled && !micStream) {
+        try {
+            micStream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true }
+            });
+            const audioTrack = micStream.getAudioTracks()[0];
+            for (const peer of peers.values()) {
+                const sender = peer.pc.getSenders().find(s => s.track?.kind === 'audio');
+                if (sender) {
+                    try { sender.replaceTrack(audioTrack); } catch {}
+                } else if (audioTrack) {
+                    try { peer.pc.addTrack(audioTrack, micStream); } catch {}
+                }
+            }
+        } catch (err) {
+            console.error('[WebRTC] failed to restore mic after cancel', err);
+            micEnabled = false;
+            $('micBtn').classList.add('muted');
+            $('micBtn').textContent = '🔇';
+            toast('Microphone was released and could not be restored', 'warn');
+        }
+    }
 }
 // ─── Camera switch (front/back) ───────────────────────────
 $('switchCamBtn').onclick = async () => {
@@ -2652,6 +2677,7 @@ $('leaveBtn').onclick = leaveCall;
 
 function leaveCall() {
     intentionalClose = true;
+    if (screenTrackCheck) { clearInterval(screenTrackCheck); screenTrackCheck = null; }
     if (wakeLock) try { wakeLock.release(); } catch {}
     try { sendWs({ type: 'leave' }); } catch {}
     for (const id of Array.from(peers.keys())) removePeer(id);
