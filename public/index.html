@@ -776,6 +776,7 @@ let localStream = null;
 let cameraStream = null;       // saved when screen sharing
 let screenStream = null;
 let screenAudioTrack = null;   // optional system/tab audio track from screen share
+let screenTrackCheck = null;   // interval for screen track liveness
 let isSharing = false;
 let micEnabled = false;
 let camEnabled = false;
@@ -1472,10 +1473,20 @@ function ensurePeer(peerId, polite, createDC, username) {
         }
     };
 
-    // ICE failure → try restartIce().
-    pc.oniceconnectionstatechange = () => {
-        if (pc.iceConnectionState === 'failed') {
+    // ICE failure/disconnection → try restartIce() + force renegotiation.
+    pc.oniceconnectionstatechange = async () => {
+        const state = pc.iceConnectionState;
+        if (state === 'failed' || state === 'disconnected') {
+            console.warn('[WebRTC] ICE', state, '— restarting');
             try { pc.restartIce(); } catch {}
+            // restartIce() sets a flag but may not trigger onnegotiationneeded.
+            // Force a renegotiation to ensure the new ICE credentials are exchanged.
+            if (pc.signalingState === 'stable') {
+                try {
+                    await pc.setLocalDescription();
+                    sendSignal(peerId, { description: pc.localDescription });
+                } catch (e) { console.warn('[WebRTC] forced renegotiation failed', e); }
+            }
         }
     };
 
@@ -2528,10 +2539,29 @@ async function startScreenShare() {
     $('screenBtn').classList.add('active');
 
     // Auto-revert when user clicks "Stop sharing" in the browser UI.
-    screenTrack.onended = () => stopScreenShare();
+    screenTrack.onended = () => {
+        console.log('[ScreenShare] track ended, reverting');
+        stopScreenShare();
+    };
+
+    // Periodic liveness check — catches silent track death (browser kills capture,
+    // tab discarded, OS power management) where onended doesn't fire reliably.
+    if (screenTrackCheck) clearInterval(screenTrackCheck);
+    screenTrackCheck = setInterval(() => {
+        if (!isSharing) { clearInterval(screenTrackCheck); screenTrackCheck = null; return; }
+        if (screenTrack.readyState === 'ended') {
+            console.warn('[ScreenShare] track ended silently, reverting');
+            clearInterval(screenTrackCheck);
+            screenTrackCheck = null;
+            stopScreenShare();
+        }
+    }, 3000);
 }
 
 async function stopScreenShare() {
+    // Clear liveness check interval.
+    if (screenTrackCheck) { clearInterval(screenTrackCheck); screenTrackCheck = null; }
+
     // Remove screen audio track from all peer connections.
     if (screenAudioTrack) {
         for (const peer of peers.values()) {
@@ -2548,13 +2578,28 @@ async function stopScreenShare() {
     }
     if (camEnabled) {
         const camTrack = cameraStream && cameraStream.getVideoTracks()[0];
+        // Guard against stale camera track (e.g. camera ended while screen sharing).
+        if (camTrack && camTrack.readyState === 'ended') {
+            console.warn('[ScreenShare] camera track ended while sharing, reverting to no-video');
+            camEnabled = false;
+            cameraStream = null;
+        }
+        const activeCamTrack = cameraStream && cameraStream.getVideoTracks()[0];
         for (const peer of peers.values()) {
             const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
-            if (sender && camTrack) {
-                try { await sender.replaceTrack(camTrack); } catch (e) { console.warn(e); }
+            if (sender && activeCamTrack) {
+                try { await sender.replaceTrack(activeCamTrack); } catch (e) { console.warn(e); }
+            } else if (sender) {
+                try { sender.replaceTrack(null); } catch (e) { console.warn(e); }
             }
         }
-        localVideo.srcObject = cameraStream;
+        if (activeCamTrack) {
+            localVideo.srcObject = cameraStream;
+        } else {
+            localVideo.srcObject = null;
+            showLocalPlaceholder();
+            localTile.style.display = 'none';
+        }
     } else {
         // Camera was off — stop sending video, hide placeholder tile
         for (const peer of peers.values()) {
