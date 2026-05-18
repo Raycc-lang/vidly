@@ -787,6 +787,10 @@ let screenAudioTrack = null;   // optional system/tab audio track from screen sh
 let screenTrackCheck = null;   // interval for screen track liveness
 let isSharing = false;
 const ENABLE_SCREEN_AUDIO = true; // Screen audio rides the existing audio sender via replaceTrack().
+// Audio mixer state — active only during screen share when both mic+screen audio
+// must be transmitted on the single negotiated audio sender. Uses Web Audio to
+// sum mic and screen-audio into one MediaStreamTrack; no SDP renegotiation needed.
+let audioMixer = null; // { ctx, dest, micNode, micSrcStream, screenNode, screenSrcStream, mixedTrack }
 let loadingHistory = false;
 let micEnabled = false;
 let camEnabled = false;
@@ -1006,6 +1010,9 @@ async function previewCamera() {
     try {
         // Release audio device first if micStream exists (to avoid AbortError)
         if (micStream) {
+            // Drop the soon-to-be-stopped track from the mixer so it doesn't
+            // hold a dead MediaStreamAudioSourceNode during the preview.
+            if (audioMixer) setMixerMicTrack(null);
             micStream.getTracks().forEach(t => t.stop());
             micStream = null;
         }
@@ -1058,21 +1065,28 @@ function confirmCamera() {
     localTile.style.display = '';
 
     // Replace tracks on existing senders (no renegotiation needed)
+    const newVideoTrack = localStream.getVideoTracks()[0];
+    const newAudioTrack = localStream.getAudioTracks()[0];
+    // If screen share is active, audio sender carries the mixed track — feed
+    // the new camera-mic into the mixer instead of touching the sender.
+    if (audioMixer && newAudioTrack) {
+        setMixerMicTrack(newAudioTrack);
+    }
     for (const peer of peers.values()) {
         const videoSender = findSenderByKind(peer.pc, 'video');
         const audioSender = findSenderByKind(peer.pc, 'audio');
-        const newVideo = localStream.getVideoTracks()[0];
-        const newAudio = localStream.getAudioTracks()[0];
 
-        if (videoSender && newVideo) {
-            try { videoSender.replaceTrack(newVideo); } catch {}
-        } else if (!videoSender && newVideo) {
-            try { peer.pc.addTrack(newVideo, localStream); } catch {}
+        if (videoSender && newVideoTrack) {
+            try { videoSender.replaceTrack(newVideoTrack); } catch {}
+        } else if (!videoSender && newVideoTrack) {
+            try { peer.pc.addTrack(newVideoTrack, localStream); } catch {}
         }
-        if (audioSender && newAudio) {
-            try { audioSender.replaceTrack(newAudio); } catch {}
-        } else if (!audioSender && newAudio) {
-            try { peer.pc.addTrack(newAudio, localStream); } catch {}
+        if (!audioMixer) {
+            if (audioSender && newAudioTrack) {
+                try { audioSender.replaceTrack(newAudioTrack); } catch {}
+            } else if (!audioSender && newAudioTrack) {
+                try { peer.pc.addTrack(newAudioTrack, localStream); } catch {}
+            }
         }
     }
 
@@ -1098,12 +1112,18 @@ async function cancelCamera() {
                 audio: { echoCancellation: true, noiseSuppression: true }
             });
             const audioTrack = micStream.getAudioTracks()[0];
-            for (const peer of peers.values()) {
-                const sender = findSenderByKind(peer.pc, 'audio');
-                if (sender) {
-                    try { sender.replaceTrack(audioTrack); } catch {}
-                } else if (audioTrack) {
-                    try { peer.pc.addTrack(audioTrack, micStream); } catch {}
+            if (audioMixer) {
+                // Mixer owns the sender's track during screen share — feed mic
+                // back into the mix instead of replacing the sender.
+                setMixerMicTrack(audioTrack);
+            } else {
+                for (const peer of peers.values()) {
+                    const sender = findSenderByKind(peer.pc, 'audio');
+                    if (sender) {
+                        try { sender.replaceTrack(audioTrack); } catch {}
+                    } else if (audioTrack) {
+                        try { peer.pc.addTrack(audioTrack, micStream); } catch {}
+                    }
                 }
             }
         } catch (err) {
@@ -1481,6 +1501,14 @@ function ensurePeer(peerId, polite, createDC, username) {
     if (!findSenderByKind(pc, 'audio') && typeof pc.addTransceiver === 'function') {
         try { pc.addTransceiver('audio', { direction: 'sendrecv' }); } catch {}
     }
+    // Late join during screen share: route the mixed mic+screen audio onto this
+    // peer's audio sender so they hear both, just like everyone else.
+    if (audioMixer && audioMixer.mixedTrack) {
+        const audioSender = findSenderByKind(pc, 'audio');
+        if (audioSender) {
+            try { audioSender.replaceTrack(audioMixer.mixedTrack); } catch (e) { console.warn(e); }
+        }
+    }
 
     // ICE candidates → ship to peer via signaling server.
     pc.onicecandidate = (e) => {
@@ -1663,6 +1691,84 @@ function getActiveAudioTrack() {
     const localAudioTrack = localStream && localStream.getAudioTracks()[0];
     if (localAudioTrack && localAudioTrack.readyState !== 'ended') return localAudioTrack;
     return null;
+}
+
+// ─── Audio mixer (mic + screen audio → single sender track) ───────
+// During screen share we want both mic and tab/system audio transmitted on the
+// single, already-negotiated audio sender. Web Audio mixes them into a single
+// MediaStreamTrack which we hand to sender.replaceTrack(). No SDP renegotiation.
+function createAudioMixer(micTrack, screenTrack) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) {
+        console.warn('[Mixer] AudioContext unavailable');
+        return null;
+    }
+    const ctx = new AC();
+    // Best-effort: contexts created outside a gesture start suspended on some
+    // browsers; resume is safe regardless of state.
+    try { ctx.resume(); } catch {}
+    const dest = ctx.createMediaStreamDestination();
+    const mixer = {
+        ctx, dest,
+        micNode: null, micSrcStream: null,
+        screenNode: null, screenSrcStream: null,
+        mixedTrack: dest.stream.getAudioTracks()[0]
+    };
+    setMixerMicTrack.call(mixer, micTrack, true);
+    setMixerScreenTrack.call(mixer, screenTrack, true);
+    return mixer;
+}
+
+// Both setters accept `this` (the mixer) so they can be reused for the global
+// `audioMixer` via `.call(audioMixer, ...)` or during construction.
+function setMixerMicTrack(track, _internal) {
+    const m = _internal ? this : audioMixer;
+    if (!m) return;
+    if (m.micNode) {
+        try { m.micNode.disconnect(); } catch {}
+        m.micNode = null;
+        m.micSrcStream = null;
+    }
+    if (track && track.readyState !== 'ended') {
+        try {
+            m.micSrcStream = new MediaStream([track]);
+            m.micNode = m.ctx.createMediaStreamSource(m.micSrcStream);
+            m.micNode.connect(m.dest);
+        } catch (e) {
+            console.warn('[Mixer] failed to attach mic track', e);
+            m.micNode = null;
+            m.micSrcStream = null;
+        }
+    }
+}
+
+function setMixerScreenTrack(track, _internal) {
+    const m = _internal ? this : audioMixer;
+    if (!m) return;
+    if (m.screenNode) {
+        try { m.screenNode.disconnect(); } catch {}
+        m.screenNode = null;
+        m.screenSrcStream = null;
+    }
+    if (track && track.readyState !== 'ended') {
+        try {
+            m.screenSrcStream = new MediaStream([track]);
+            m.screenNode = m.ctx.createMediaStreamSource(m.screenSrcStream);
+            m.screenNode.connect(m.dest);
+        } catch (e) {
+            console.warn('[Mixer] failed to attach screen track', e);
+        }
+    }
+}
+
+async function destroyAudioMixer() {
+    if (!audioMixer) return;
+    const m = audioMixer;
+    audioMixer = null;
+    try { m.micNode?.disconnect(); } catch {}
+    try { m.screenNode?.disconnect(); } catch {}
+    try { m.mixedTrack?.stop(); } catch {}
+    try { await m.ctx.close(); } catch {}
 }
 
 function cancelPeerIceRestart(peer) {
@@ -2636,6 +2742,9 @@ $('micBtn').onclick = async () => {
     if (micEnabled) {
         // Turn mic off
         micEnabled = false;
+        // Detach mic from the screen-audio mixer first so the underlying track
+        // can be stopped without leaving a dead source node hanging on.
+        if (audioMixer) setMixerMicTrack(null);
         if (micStream) {
             micStream.getTracks().forEach(t => t.stop());
             micStream = null;
@@ -2652,12 +2761,18 @@ $('micBtn').onclick = async () => {
                 });
                 micEnabled = true;
                 const audioTrack = micStream.getAudioTracks()[0];
-                for (const peer of peers.values()) {
-                    const sender = findSenderByKind(peer.pc, 'audio');
-                    if (sender) {
-                        try { sender.replaceTrack(audioTrack); } catch {}
-                    } else if (audioTrack) {
-                        try { peer.pc.addTrack(audioTrack, micStream); } catch {}
+                if (audioMixer) {
+                    // Mixer owns the sender's track during screen share.
+                    // Add the new mic into the mix; do NOT replace the sender's track.
+                    setMixerMicTrack(audioTrack);
+                } else {
+                    for (const peer of peers.values()) {
+                        const sender = findSenderByKind(peer.pc, 'audio');
+                        if (sender) {
+                            try { sender.replaceTrack(audioTrack); } catch {}
+                        } else if (audioTrack) {
+                            try { peer.pc.addTrack(audioTrack, micStream); } catch {}
+                        }
                     }
                 }
             } catch (err) {
@@ -2669,6 +2784,13 @@ $('micBtn').onclick = async () => {
             // Camera is on — just re-enable existing audio tracks
             micEnabled = true;
             if (localStream) localStream.getAudioTracks().forEach(t => { t.enabled = true; });
+            // Reattach mic to the mixer if screen share is active (it was
+            // detached when mic turned off so the source node didn't dangle).
+            if (audioMixer) {
+                const reAttach = (localStream && localStream.getAudioTracks()[0])
+                    || (micStream && micStream.getAudioTracks()[0]);
+                if (reAttach) setMixerMicTrack(reAttach);
+            }
         }
         $('micBtn').classList.remove('muted');
         $('micBtn').textContent = '🎙️';
@@ -2741,18 +2863,37 @@ async function startScreenShare() {
         }
     }
 
-    // Send screen audio by replacing the already-negotiated audio sender. Do not
-    // add a new audio track here; that creates a transceiver and renegotiates.
+    // Send screen audio mixed with mic on the already-negotiated audio sender.
+    // Mic + screen audio are summed in a Web Audio graph and the resulting
+    // MediaStreamTrack rides the existing sender via replaceTrack(). No SDP
+    // renegotiation, single Opus stream out, no remote-side changes.
     screenAudioTrack = ENABLE_SCREEN_AUDIO ? (screenStream.getAudioTracks()[0] || null) : null;
     if (screenAudioTrack) {
-        for (const peer of peers.values()) {
-            const sender = findSenderByKind(peer.pc, 'audio');
-            if (sender) {
-                try { await sender.replaceTrack(screenAudioTrack); } catch (e) { console.warn(e); }
-            } else {
-                console.warn('[ScreenShare] screen audio available but no negotiated audio sender exists');
+        const micTrack = getActiveAudioTrack();
+        audioMixer = createAudioMixer(micTrack, screenAudioTrack);
+        if (audioMixer && audioMixer.mixedTrack) {
+            for (const peer of peers.values()) {
+                const sender = findSenderByKind(peer.pc, 'audio');
+                if (sender) {
+                    try { await sender.replaceTrack(audioMixer.mixedTrack); } catch (e) { console.warn(e); }
+                } else {
+                    console.warn('[ScreenShare] screen audio available but no negotiated audio sender exists');
+                }
+            }
+        } else {
+            // Fallback: mixer construction failed → screen audio only on sender
+            for (const peer of peers.values()) {
+                const sender = findSenderByKind(peer.pc, 'audio');
+                if (sender) {
+                    try { await sender.replaceTrack(screenAudioTrack); } catch (e) { console.warn(e); }
+                }
             }
         }
+        // If screen audio track ends on its own, drop it from the mix so the
+        // mic continues uninterrupted on the sender.
+        screenAudioTrack.addEventListener('ended', () => {
+            if (audioMixer) setMixerScreenTrack(null);
+        });
     }
 
     // Show local screen preview (un-mirrored).
@@ -2790,7 +2931,7 @@ async function stopScreenShare() {
 
     // Restore the previous mic/camera audio sender. This avoids addTrack/removeTrack
     // and keeps screen-share stop from triggering renegotiation.
-    if (screenAudioTrack) {
+    if (screenAudioTrack || audioMixer) {
         const restoreAudioTrack = getActiveAudioTrack();
         for (const peer of peers.values()) {
             const sender = findSenderByKind(peer.pc, 'audio');
@@ -2799,6 +2940,7 @@ async function stopScreenShare() {
             }
         }
         screenAudioTrack = null;
+        await destroyAudioMixer();
     }
     if (screenStream) {
         screenStream.getTracks().forEach(t => t.stop());
@@ -2857,6 +2999,7 @@ function leaveCall() {
     if (screenStream) screenStream.getTracks().forEach(t => t.stop());
     if (micStream) micStream.getTracks().forEach(t => t.stop());
     if (previewStream) previewStream.getTracks().forEach(t => t.stop());
+    destroyAudioMixer();
     history.pushState({}, '', '/');
     location.reload();
 }
