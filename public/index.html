@@ -405,23 +405,23 @@
   .msg.other { align-self: flex-start; background: #262a36; border-bottom-left-radius: 4px; }
   .msg.system { align-self: center; background: transparent; color: var(--muted); font-size: 12px; font-style: italic; }
   .msg.file.system { align-self: stretch; max-width: 100%; font-style: normal; }
-  .msg.reaction {
-    align-self: center;
-    max-width: min(280px, 88%);
-    padding: 6px 12px;
-    background: rgba(255,255,255,.06);
-    border: 1px solid rgba(255,255,255,.07);
-    color: var(--muted);
-    font-size: 12px;
-    text-align: center;
-    border-radius: 999px;
+  /* Reactions float on the user tile rather than appearing in chat. */
+  .tile-reaction {
+    position: absolute;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    font-size: 56px;
+    pointer-events: none;
+    text-shadow: 0 2px 8px rgba(0,0,0,.7);
+    animation: reactionFloat 1.8s ease-out forwards;
+    z-index: 20;
   }
-  .msg.reaction .reaction-emoji {
-    color: var(--text);
-    font-size: 18px;
-    line-height: 1;
-    margin-left: 5px;
-    vertical-align: -2px;
+  @keyframes reactionFloat {
+    0%   { opacity: 0; transform: translate(-50%, 20px) scale(.6); }
+    20%  { opacity: 1; transform: translate(-50%, 0) scale(1.15); }
+    60%  { opacity: 1; transform: translate(-50%, -60px) scale(1); }
+    100% { opacity: 0; transform: translate(-50%, -160px) scale(.9); }
   }
   .msg.media { width: min(260px, 80%); padding: 8px; }
   .msg.file { width: min(300px, 86%); padding: 10px; }
@@ -722,6 +722,7 @@
         <input id="fileInput" type="file" hidden />
         <button class="btn ghost icon" id="fileBtn" type="button" title="Send file">📎</button>
         <button class="btn ghost icon" id="stickerBtn" type="button" title="GIFs">✨</button>
+        <button class="btn ghost icon" id="reactionBtn" type="button" title="Send reaction">😊</button>
         <input class="input" id="chatInput" placeholder="Type a message…" autocomplete="off" />
         <button class="btn primary" type="submit">Send</button>
       </form>
@@ -752,7 +753,6 @@
     <button class="btn icon" id="micBtn" title="Mute / unmute mic">🎙️</button>
     <button class="btn icon" id="camBtn" title="Camera on / off">📷</button>
     <button class="btn icon" id="screenBtn" title="Share screen">🖥️</button>
-    <button class="btn icon" id="reactionBtn" title="Send reaction">😊</button>
     <button class="btn icon" id="chatBtn" title="Toggle chat">💬</button>
     <button class="btn icon danger" id="leaveBtn" title="Leave call">⛔</button>
   </footer>
@@ -778,6 +778,7 @@ let screenStream = null;
 let screenAudioTrack = null;   // optional system/tab audio track from screen share
 let screenTrackCheck = null;   // interval for screen track liveness
 let isSharing = false;
+const ENABLE_SCREEN_AUDIO = true; // Screen audio rides the existing audio sender via replaceTrack().
 let loadingHistory = false;
 let micEnabled = false;
 let camEnabled = false;
@@ -792,6 +793,8 @@ const CHAT_MAX = 200; // max messages per room in localStorage
 let ws = null;
 let wsBackoff = 1000;
 let wsReconnectTimer = null;
+let wsHeartbeatTimer = null;
+let lastWsMessageAt = 0;
 let intentionalClose = false;
 let wakeLock = null;
 let iceServers = [
@@ -1048,9 +1051,8 @@ function confirmCamera() {
 
     // Replace tracks on existing senders (no renegotiation needed)
     for (const peer of peers.values()) {
-        const senders = peer.pc.getSenders();
-        const videoSender = senders.find(s => s.track?.kind === 'video');
-        const audioSender = senders.find(s => s.track?.kind === 'audio');
+        const videoSender = findSenderByKind(peer.pc, 'video');
+        const audioSender = findSenderByKind(peer.pc, 'audio');
         const newVideo = localStream.getVideoTracks()[0];
         const newAudio = localStream.getAudioTracks()[0];
 
@@ -1088,7 +1090,7 @@ async function cancelCamera() {
             });
             const audioTrack = micStream.getAudioTracks()[0];
             for (const peer of peers.values()) {
-                const sender = peer.pc.getSenders().find(s => s.track?.kind === 'audio');
+                const sender = findSenderByKind(peer.pc, 'audio');
                 if (sender) {
                     try { sender.replaceTrack(audioTrack); } catch {}
                 } else if (audioTrack) {
@@ -1294,15 +1296,19 @@ $('switchCamBtn').onclick = async () => {
 // ─── WebSocket signaling ──────────────────────────────────
 function connectWebSocket() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     ws = new WebSocket(proto + '//' + location.host + '/ws');
     setWsDot('connecting');
 
     ws.onopen = () => {
         wsBackoff = 1000;
+        lastWsMessageAt = Date.now();
         setWsDot('connected');
+        startWsHeartbeat();
     };
 
     ws.onmessage = (e) => {
+        lastWsMessageAt = Date.now();
         let msg;
         try { msg = JSON.parse(e.data); } catch { return; }
         handleSignaling(msg);
@@ -1310,15 +1316,43 @@ function connectWebSocket() {
 
     ws.onclose = () => {
         setWsDot('failed');
+        stopWsHeartbeat();
         if (intentionalClose) return;
         if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
         wsReconnectTimer = setTimeout(() => {
             wsBackoff = Math.min(wsBackoff * 2, 10000);
+            ws = null;
             connectWebSocket();
         }, wsBackoff);
     };
 
     ws.onerror = () => { /* close handler will retry */ };
+}
+
+function startWsHeartbeat() {
+    stopWsHeartbeat();
+    wsHeartbeatTimer = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        sendWs({ type: 'ping', ts: Date.now() });
+    }, 20000);
+}
+
+function stopWsHeartbeat() {
+    if (!wsHeartbeatTimer) return;
+    clearInterval(wsHeartbeatTimer);
+    wsHeartbeatTimer = null;
+}
+
+function checkWebSocketHealth() {
+    if (!roomId || intentionalClose) return;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        ws = null;
+        connectWebSocket();
+        return;
+    }
+    if (ws.readyState === WebSocket.OPEN && Date.now() - lastWsMessageAt > 45000) {
+        sendWs({ type: 'ping', ts: Date.now(), check: true });
+    }
 }
 
 function setWsDot(state) {
@@ -1334,15 +1368,21 @@ function sendWs(obj) {
 
 function handleSignaling(msg) {
     switch (msg.type) {
+        case 'pong':
+            lastWsMessageAt = Date.now();
+            break;
+
         case 'welcome':
             myPeerId = msg.peerId;
-            // Clean up stale peers from previous connection (reconnection)
-            for (const [id] of peers) removePeer(id);
             sendWs({ type: 'set-username', username: myUsername });
             sendWs({ type: 'join', roomId, username: myUsername, clientId: getClientId() });
             break;
 
         case 'joined':
+            if (!msg.resumed && peers.size > 0) {
+                for (const [id] of peers) removePeer(id);
+            }
+            if (msg.peerId) myPeerId = msg.peerId;
             // We are the joining peer — we initiate offers to existing peers.
             // Joining peer is "impolite" to avoid glare with simultaneous offers.
             // Reconcile: remove any stale peers not in server's list.
@@ -1405,8 +1445,10 @@ function ensurePeer(peerId, polite, createDC, username) {
     videoEl.srcObject = remoteStream;
 
     peer = {
+        id: peerId,
         pc, dc: null, fileDc: null, polite,
         makingOffer: false, ignoreOffer: false,
+        iceRestartTimer: null,
         videoEl, tileEl, remoteStream, dot,
         username: username || null
     };
@@ -1423,6 +1465,11 @@ function ensurePeer(peerId, polite, createDC, username) {
         for (const track of micStream.getTracks()) {
             pc.addTrack(track, micStream);
         }
+    }
+    // Keep an audio sender available even when mic/camera are off. Screen audio
+    // can later use replaceTrack() without adding a transceiver mid-call.
+    if (!findSenderByKind(pc, 'audio') && typeof pc.addTransceiver === 'function') {
+        try { pc.addTransceiver('audio', { direction: 'sendrecv' }); } catch {}
     }
 
     // ICE candidates → ship to peer via signaling server.
@@ -1501,20 +1548,16 @@ function ensurePeer(peerId, polite, createDC, username) {
         }
     };
 
-    // ICE failure/disconnection → try restartIce() + force renegotiation.
+    // ICE failure → restart immediately. ICE disconnection is common on mobile
+    // network changes, so only restart if it persists long enough to matter.
     pc.oniceconnectionstatechange = async () => {
         const state = pc.iceConnectionState;
-        if (state === 'failed' || state === 'disconnected') {
-            console.warn('[WebRTC] ICE', state, '— restarting');
-            try { pc.restartIce(); } catch {}
-            // restartIce() sets a flag but may not trigger onnegotiationneeded.
-            // Force a renegotiation to ensure the new ICE credentials are exchanged.
-            if (pc.signalingState === 'stable') {
-                try {
-                    await pc.setLocalDescription();
-                    sendSignal(peerId, { description: pc.localDescription });
-                } catch (e) { console.warn('[WebRTC] forced renegotiation failed', e); }
-            }
+        if (state === 'failed') {
+            restartPeerIce(peer, 'failed');
+        } else if (state === 'disconnected') {
+            schedulePeerIceRestart(peer);
+        } else if (state === 'connected' || state === 'completed' || state === 'closed') {
+            cancelPeerIceRestart(peer);
         }
     };
 
@@ -1525,6 +1568,7 @@ function ensurePeer(peerId, polite, createDC, username) {
      * the transceiver set.
      */
     pc.onnegotiationneeded = async () => {
+        if (peer.makingOffer || pc.signalingState !== 'stable') return;
         try {
             peer.makingOffer = true;
             await pc.setLocalDescription();
@@ -1587,9 +1631,69 @@ function sendSignal(to, payload) {
     sendWs({ type: 'signal', to, payload });
 }
 
+function findSenderByKind(pc, kind) {
+    const sender = pc.getSenders().find(s => s.track?.kind === kind);
+    if (sender) return sender;
+    if (typeof pc.getTransceivers === 'function') {
+        const transceiver = pc.getTransceivers().find(t =>
+            t.sender &&
+            t.receiver?.track?.kind === kind &&
+            (t.direction === 'sendrecv' || t.direction === 'sendonly' ||
+             t.currentDirection === 'sendrecv' || t.currentDirection === 'sendonly')
+        );
+        if (transceiver?.sender) return transceiver.sender;
+    }
+    return null;
+}
+
+function getActiveAudioTrack() {
+    if (!micEnabled) return null;
+    const micTrack = micStream && micStream.getAudioTracks()[0];
+    if (micTrack && micTrack.readyState !== 'ended') return micTrack;
+    const localAudioTrack = localStream && localStream.getAudioTracks()[0];
+    if (localAudioTrack && localAudioTrack.readyState !== 'ended') return localAudioTrack;
+    return null;
+}
+
+function cancelPeerIceRestart(peer) {
+    if (!peer?.iceRestartTimer) return;
+    clearTimeout(peer.iceRestartTimer);
+    peer.iceRestartTimer = null;
+}
+
+function schedulePeerIceRestart(peer) {
+    if (!peer || peer.iceRestartTimer) return;
+    peer.iceRestartTimer = setTimeout(() => {
+        peer.iceRestartTimer = null;
+        if (peer.pc.iceConnectionState === 'disconnected' || peer.pc.iceConnectionState === 'failed') {
+            restartPeerIce(peer, 'sustained disconnected');
+        }
+    }, 8000);
+}
+
+async function restartPeerIce(peer, reason) {
+    const { pc } = peer;
+    if (pc.signalingState !== 'stable' || peer.makingOffer) {
+        schedulePeerIceRestart(peer);
+        return;
+    }
+    console.warn('[WebRTC] ICE', reason, '- restarting');
+    try { pc.restartIce(); } catch {}
+    try {
+        peer.makingOffer = true;
+        await pc.setLocalDescription();
+        sendSignal(peer.id, { description: pc.localDescription });
+    } catch (e) {
+        console.warn('[WebRTC] ICE restart negotiation failed', e);
+    } finally {
+        peer.makingOffer = false;
+    }
+}
+
 function removePeer(peerId) {
     const peer = peers.get(peerId);
     if (!peer) return;
+    cancelPeerIceRestart(peer);
     for (const [fileId, transfer] of incomingFiles) {
         if (transfer.peer === peer) incomingFiles.delete(fileId);
     }
@@ -1666,7 +1770,7 @@ function attachDataChannel(peer, dc) {
         } else if (msg.type === 'media') {
             addMediaMessage('other', msg.url, msg.kind, msg.ts, msg.username);
         } else if (msg.type === 'reaction') {
-            addReactionMessage('other', msg.emoji, msg.ts, msg.username || peer.username || 'Peer');
+            addReactionMessage('other', msg.emoji, msg.ts, msg.username || peer.username || 'Peer', peer.id);
         } else if (msg.type && msg.type.startsWith('file-')) {
             handleFileControl(peer, msg);
         }
@@ -2053,7 +2157,7 @@ function loadChatHistory() {
         for (const m of arr) {
             if (m.type === 'chat') addMessage(m.kind, m.body, m.ts, m.senderName);
             else if (m.type === 'media') addMediaMessage(m.kind, m.url, m.mediaKind, m.ts, m.senderName);
-            else if (m.type === 'reaction') addReactionMessage(m.kind, m.emoji, m.ts, m.senderName);
+            // Reactions are ephemeral floating overlays; skip during history replay.
         }
     } catch {}
     loadingHistory = false;
@@ -2149,20 +2253,37 @@ function addMediaMessage(kind, url, mediaKind, ts, senderName) {
     saveChatMsg({ type: 'media', kind, url, mediaKind, ts, senderName });
 }
 
-function addReactionMessage(kind, emoji, ts, senderName) {
-    const el = document.createElement('div');
-    el.className = 'msg reaction';
-    const nameEl = document.createElement('span');
-    nameEl.textContent = kind === 'own' ? 'You' : (senderName || 'Peer');
-    const emojiEl = document.createElement('span');
-    emojiEl.className = 'reaction-emoji';
-    emojiEl.textContent = emoji;
-    el.appendChild(nameEl);
-    el.appendChild(emojiEl);
-    if (ts) el.title = new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    messagesEl.appendChild(el);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-    saveChatMsg({ type: 'reaction', kind, emoji, ts, senderName });
+// Reactions are now displayed as a floating emoji on the relevant user's
+// video tile (own tile for sender, peer tile for receiver). They are not
+// persisted to chat history.
+function addReactionMessage(kind, emoji, ts, senderName, fromPeerId) {
+    if (!emoji) return;
+    let target = null;
+    if (kind === 'own') {
+        target = localTile;
+    } else if (fromPeerId) {
+        const peer = peers.get(fromPeerId);
+        target = peer?.tileEl || null;
+    }
+    if (!target) {
+        // Fallback: pick a peer tile by sender name
+        if (senderName) {
+            for (const peer of peers.values()) {
+                if (peer.username === senderName && peer.tileEl) { target = peer.tileEl; break; }
+            }
+        }
+    }
+    if (!target) target = localTile; // ultimate fallback
+    showReactionOnTile(target, emoji);
+}
+
+function showReactionOnTile(targetEl, emoji) {
+    if (!targetEl) return;
+    const span = document.createElement('span');
+    span.className = 'tile-reaction';
+    span.textContent = emoji;
+    targetEl.appendChild(span);
+    setTimeout(() => { try { span.remove(); } catch {} }, 1900);
 }
 
 function updateChatCompact() {
@@ -2501,7 +2622,7 @@ $('micBtn').onclick = async () => {
                 micEnabled = true;
                 const audioTrack = micStream.getAudioTracks()[0];
                 for (const peer of peers.values()) {
-                    const sender = peer.pc.getSenders().find(s => s.track?.kind === 'audio');
+                    const sender = findSenderByKind(peer.pc, 'audio');
                     if (sender) {
                         try { sender.replaceTrack(audioTrack); } catch {}
                     } else if (audioTrack) {
@@ -2535,7 +2656,7 @@ $('camBtn').onclick = () => {
         if (localStream) localStream.getVideoTracks().forEach(t => t.stop());
         // Stop sending video without renegotiating.
         for (const peer of peers.values()) {
-            const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
+            const sender = findSenderByKind(peer.pc, 'video');
             if (sender) try { sender.replaceTrack(null); } catch {}
         }
         // Keep audio if mic is on
@@ -2561,17 +2682,25 @@ $('screenBtn').onclick = async () => {
 
 async function startScreenShare() {
     try {
-        // Request screen audio too — gracefully falls back if unsupported.
-        screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        screenStream = await navigator.mediaDevices.getDisplayMedia({
+            video: {
+                frameRate: { ideal: 15, max: 30 },
+                width: { max: 1920 },
+                height: { max: 1080 }
+            },
+            audio: ENABLE_SCREEN_AUDIO
+        });
     } catch (err) {
         toast('Could not start screen share: ' + (err.message || err.name), 'error');
         return;
     }
     const screenTrack = screenStream.getVideoTracks()[0];
+    try { screenTrack.contentHint = 'detail'; } catch {}
+    try { await screenTrack.applyConstraints({ frameRate: { max: 30 } }); } catch {}
 
     // Replace the outgoing video track for every peer.
     for (const peer of peers.values()) {
-        const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
+        const sender = findSenderByKind(peer.pc, 'video');
         if (sender) {
             try { await sender.replaceTrack(screenTrack); } catch (e) { console.warn(e); }
         } else {
@@ -2579,11 +2708,17 @@ async function startScreenShare() {
         }
     }
 
-    // If screen audio is available, add it to all peer connections.
-    screenAudioTrack = screenStream.getAudioTracks()[0] || null;
+    // Send screen audio by replacing the already-negotiated audio sender. Do not
+    // add a new audio track here; that creates a transceiver and renegotiates.
+    screenAudioTrack = ENABLE_SCREEN_AUDIO ? (screenStream.getAudioTracks()[0] || null) : null;
     if (screenAudioTrack) {
         for (const peer of peers.values()) {
-            try { peer.pc.addTrack(screenAudioTrack, screenStream); } catch (e) { console.warn(e); }
+            const sender = findSenderByKind(peer.pc, 'audio');
+            if (sender) {
+                try { await sender.replaceTrack(screenAudioTrack); } catch (e) { console.warn(e); }
+            } else {
+                console.warn('[ScreenShare] screen audio available but no negotiated audio sender exists');
+            }
         }
     }
 
@@ -2620,12 +2755,14 @@ async function stopScreenShare() {
     // Clear liveness check interval.
     if (screenTrackCheck) { clearInterval(screenTrackCheck); screenTrackCheck = null; }
 
-    // Remove screen audio track from all peer connections.
+    // Restore the previous mic/camera audio sender. This avoids addTrack/removeTrack
+    // and keeps screen-share stop from triggering renegotiation.
     if (screenAudioTrack) {
+        const restoreAudioTrack = getActiveAudioTrack();
         for (const peer of peers.values()) {
-            const sender = peer.pc.getSenders().find(s => s.track === screenAudioTrack);
+            const sender = findSenderByKind(peer.pc, 'audio');
             if (sender) {
-                try { await sender.replaceTrack(null); } catch (e) { console.warn(e); }
+                try { await sender.replaceTrack(restoreAudioTrack); } catch (e) { console.warn(e); }
             }
         }
         screenAudioTrack = null;
@@ -2644,7 +2781,7 @@ async function stopScreenShare() {
         }
         const activeCamTrack = cameraStream && cameraStream.getVideoTracks()[0];
         for (const peer of peers.values()) {
-            const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
+            const sender = findSenderByKind(peer.pc, 'video');
             if (sender && activeCamTrack) {
                 try { await sender.replaceTrack(activeCamTrack); } catch (e) { console.warn(e); }
             } else if (sender) {
@@ -2661,7 +2798,7 @@ async function stopScreenShare() {
     } else {
         // Camera was off — stop sending video, hide placeholder tile
         for (const peer of peers.values()) {
-            const sender = peer.pc.getSenders().find(s => s.track?.kind === 'video');
+            const sender = findSenderByKind(peer.pc, 'video');
             if (sender) try { sender.replaceTrack(null); } catch (e) { console.warn(e); }
         }
         localVideo.srcObject = null;
@@ -2677,6 +2814,7 @@ $('leaveBtn').onclick = leaveCall;
 
 function leaveCall() {
     intentionalClose = true;
+    stopWsHeartbeat();
     if (screenTrackCheck) { clearInterval(screenTrackCheck); screenTrackCheck = null; }
     if (wakeLock) try { wakeLock.release(); } catch {}
     try { sendWs({ type: 'leave' }); } catch {}
@@ -2691,6 +2829,7 @@ function leaveCall() {
 }
 
 window.addEventListener('beforeunload', () => {
+    stopWsHeartbeat();
     for (const url of objectURLs) URL.revokeObjectURL(url);
     objectURLs.clear();
     try { sendWs({ type: 'leave' }); } catch {}
@@ -2699,6 +2838,9 @@ window.addEventListener('beforeunload', () => {
 
 // Re-acquire wake lock when page becomes visible (browser may release it)
 document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible') {
+        checkWebSocketHealth();
+    }
     if (document.visibilityState === 'visible' && roomId && !wakeLock) {
         try {
             if ('wakeLock' in navigator) {
@@ -2708,6 +2850,9 @@ document.addEventListener('visibilitychange', async () => {
         } catch {}
     }
 });
+
+window.addEventListener('focus', checkWebSocketHealth);
+window.addEventListener('pageshow', checkWebSocketHealth);
 
 // ─── Chat panel toggle ────────────────────────────────────
 function toggleChat() {
