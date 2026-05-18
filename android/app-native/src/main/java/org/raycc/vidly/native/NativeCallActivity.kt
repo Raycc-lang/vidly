@@ -6,6 +6,8 @@ import android.app.AlertDialog
 import android.app.PictureInPictureParams
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
+import android.content.SharedPreferences
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -21,6 +23,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
+import android.provider.MediaStore
 import android.text.InputType
 import android.util.Rational
 import android.view.GestureDetector
@@ -148,7 +151,8 @@ class NativeCallActivity : Activity(),
         val fromPeerId: String,
         var fromUsername: String?,
         val chunks: MutableList<ByteArray> = mutableListOf(),
-        var received: Long = 0
+        var received: Long = 0,
+        var lastProgressSent: Long = 0
     )
     private val outgoingFiles = HashMap<String, OutgoingFile>()
     private val incomingFiles = HashMap<String, IncomingFile>()
@@ -339,11 +343,15 @@ class NativeCallActivity : Activity(),
             val transfer = incomingFiles[fileId] ?: return@runOnUiThread
             transfer.chunks.add(bytes)
             transfer.received += bytes.size
-            sendChatJsonTo(fromPeerId, JSONObject()
-                .put("type", "file-progress")
-                .put("id", fileId)
-                .put("received", transfer.received)
-            )
+            val now = System.currentTimeMillis()
+            if (now - transfer.lastProgressSent > 250 || transfer.received >= transfer.size) {
+                transfer.lastProgressSent = now
+                sendChatJsonTo(fromPeerId, JSONObject()
+                    .put("type", "file-progress")
+                    .put("id", fileId)
+                    .put("received", transfer.received)
+                )
+            }
             if (transfer.received >= transfer.size) {
                 completeIncomingFile(transfer)
             }
@@ -708,6 +716,13 @@ class NativeCallActivity : Activity(),
             setOnClickListener { joinRoom() }
         }
         joinPanel.addView(join, LinearLayout.LayoutParams(-1, dp(48)))
+
+        // Pre-fill saved username and room from SharedPreferences
+        val prefs = getSharedPreferences("vidly_prefs", MODE_PRIVATE)
+        val savedUsername = prefs.getString("username", "")
+        val savedRoom = prefs.getString("room", "")
+        if (!savedUsername.isNullOrBlank()) usernameInput.setText(savedUsername)
+        if (!savedRoom.isNullOrBlank()) roomInput.setText(savedRoom)
     }
 
     // ─── Actions ──────────────────────────────────────────────
@@ -722,6 +737,13 @@ class NativeCallActivity : Activity(),
 
         currentRoom = room
         currentUsername = username
+
+        // Save to SharedPreferences
+        getSharedPreferences("vidly_prefs", MODE_PRIVATE).edit().apply {
+            putString("username", username)
+            putString("room", room)
+            apply()
+        }
 
         joinPanel.visibility = View.GONE
         headerBar.visibility = View.VISIBLE
@@ -792,6 +814,7 @@ class NativeCallActivity : Activity(),
     private fun cancelPreview() {
         inPreview = false
         rtc?.cancelCameraPreview()
+        localRenderer.clearImage()
         cameraEnabled = false
         if (!micEnabledBeforePreview && micEnabled) {
             micEnabled = false
@@ -964,13 +987,17 @@ class NativeCallActivity : Activity(),
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_START
             background = null
+            setOnLongClickListener {
+                saveImageUrlToGallery(url, "vidly-${System.currentTimeMillis()}.${extensionForImage(url, kind)}")
+                true
+            }
         }
         item.addView(image, LinearLayout.LayoutParams(dp(220), -2).apply { topMargin = dp(4) })
         loadImageInto(image, url)
         addMessageItem(item, "$sender: 🖼️ $kind")
     }
 
-    private fun appendChatFileImage(sender: String, name: String, bitmap: Bitmap, incoming: Boolean) {
+    private fun appendChatFileImage(sender: String, name: String, bitmap: Bitmap, incoming: Boolean, bytes: ByteArray? = null, mimeType: String = "image/png") {
         val item = makeMessageContainer(sender, incoming)
         val nameView = TextView(this).apply {
             text = "📎 $name"
@@ -982,9 +1009,111 @@ class NativeCallActivity : Activity(),
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_START
             setImageBitmap(bitmap)
+            setOnLongClickListener {
+                val saved = bytes?.let { saveImageBytesToGallery(it, name, mimeType) }
+                    ?: saveBitmapToGallery(bitmap, name)
+                Toast.makeText(
+                    this@NativeCallActivity,
+                    if (saved) "Saved image to gallery" else "Could not save image",
+                    Toast.LENGTH_SHORT
+                ).show()
+                true
+            }
         }
         item.addView(image, LinearLayout.LayoutParams(dp(220), -2).apply { topMargin = dp(4) })
         addMessageItem(item, "$sender: 📎 $name (image)")
+    }
+
+    private fun saveImageUrlToGallery(url: String, name: String) {
+        if (url.isBlank()) return
+        Toast.makeText(this, "Saving image...", Toast.LENGTH_SHORT).show()
+        http.newCall(Request.Builder().url(url).build()).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                runOnUiThread { Toast.makeText(this@NativeCallActivity, "Could not save image", Toast.LENGTH_SHORT).show() }
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (!it.isSuccessful) {
+                        runOnUiThread { Toast.makeText(this@NativeCallActivity, "Could not save image", Toast.LENGTH_SHORT).show() }
+                        return@use
+                    }
+                    val bytes = it.body?.bytes() ?: return@use
+                    val mime = it.header("Content-Type")?.substringBefore(';')?.takeIf { value -> value.startsWith("image/") }
+                        ?: mimeTypeForName(name)
+                    val saved = saveImageBytesToGallery(bytes, name, mime)
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@NativeCallActivity,
+                            if (saved) "Saved image to gallery" else "Could not save image",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
+        })
+    }
+
+    private fun saveBitmapToGallery(bitmap: Bitmap, name: String): Boolean {
+        val bytes = java.io.ByteArrayOutputStream().use { out ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            out.toByteArray()
+        }
+        return saveImageBytesToGallery(bytes, name, "image/png")
+    }
+
+    private fun saveImageBytesToGallery(bytes: ByteArray, name: String, mimeType: String): Boolean {
+        val safeName = name.ifBlank { "vidly-${System.currentTimeMillis()}.png" }
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, safeName)
+                    put(MediaStore.Images.Media.MIME_TYPE, mimeType.takeIf { it.startsWith("image/") } ?: mimeTypeForName(safeName))
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/Vidly")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+                val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+                try {
+                    contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: return false
+                    values.clear()
+                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                    contentResolver.update(uri, values, null, null)
+                    true
+                } catch (e: IOException) {
+                    contentResolver.delete(uri, null, null)
+                    false
+                }
+            } else {
+                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Vidly")
+                if (!dir.exists()) dir.mkdirs()
+                val outFile = File(dir, safeName)
+                FileOutputStream(outFile).use { it.write(bytes) }
+                sendBroadcast(Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(outFile)))
+                true
+            }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun extensionForImage(url: String, kind: String): String {
+        val path = runCatching { Uri.parse(url).lastPathSegment.orEmpty() }.getOrDefault("")
+        val ext = path.substringAfterLast('.', "").lowercase(Locale.US)
+        return when {
+            ext in setOf("jpg", "jpeg", "png", "gif", "webp") -> ext
+            kind == "gif" -> "gif"
+            else -> "png"
+        }
+    }
+
+    private fun mimeTypeForName(name: String): String {
+        return when (name.substringAfterLast('.', "").lowercase(Locale.US)) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "gif" -> "image/gif"
+            "webp" -> "image/webp"
+            else -> "image/png"
+        }
     }
 
     private fun makeMessageContainer(sender: String, incoming: Boolean): LinearLayout {
@@ -1059,7 +1188,7 @@ class NativeCallActivity : Activity(),
         if (type.startsWith("image/")) {
             val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             if (bmp != null) {
-                appendChatFileImage(currentUsername.ifBlank { "You" }, name, bmp, incoming = false)
+                appendChatFileImage(currentUsername.ifBlank { "You" }, name, bmp, incoming = false, bytes = bytes, mimeType = type)
             } else {
                 appendChatText(currentUsername.ifBlank { "You" }, "📎 $name (${formatBytes(bytes.size.toLong())})", incoming = false)
             }
@@ -1093,20 +1222,15 @@ class NativeCallActivity : Activity(),
         val size = file.optLong("size", 0)
         val incoming = IncomingFile(id, name, type, size, fromPeerId, fromUsername)
         incomingFiles[id] = incoming
-        appendChatText(fromUsername ?: "Peer", "📎 Wants to send: $name (${formatBytes(size)})", incoming = true)
-        AlertDialog.Builder(this)
-            .setTitle("Incoming file")
-            .setMessage("$name (${formatBytes(size)}) from ${fromUsername ?: "peer"}")
-            .setPositiveButton("Accept") { _, _ ->
-                activeIncomingByPeer[fromPeerId] = id
-                sendChatJsonTo(fromPeerId, JSONObject().put("type", "file-accept").put("id", id))
-            }
-            .setNegativeButton("Reject") { _, _ ->
-                incomingFiles.remove(id)
-                sendChatJsonTo(fromPeerId, JSONObject().put("type", "file-reject").put("id", id))
-            }
-            .setCancelable(false)
-            .show()
+        if (activeIncomingByPeer.containsKey(fromPeerId)) {
+            incomingFiles.remove(id)
+            sendChatJsonTo(fromPeerId, JSONObject().put("type", "file-reject").put("id", id))
+            appendChatText("System", "Busy receiving another file; declined $name", incoming = true)
+            return
+        }
+        activeIncomingByPeer[fromPeerId] = id
+        appendChatText(fromUsername ?: "Peer", "📎 Receiving: $name (${formatBytes(size)})", incoming = true)
+        sendChatJsonTo(fromPeerId, JSONObject().put("type", "file-accept").put("id", id))
     }
 
     private fun handleFileAccept(fromPeerId: String, id: String) {
@@ -1193,7 +1317,7 @@ class NativeCallActivity : Activity(),
         if (transfer.type.startsWith("image/")) {
             val bmp = BitmapFactory.decodeByteArray(all, 0, all.size)
             if (bmp != null) {
-                appendChatFileImage(transfer.fromUsername ?: "Peer", transfer.name, bmp, incoming = true)
+                appendChatFileImage(transfer.fromUsername ?: "Peer", transfer.name, bmp, incoming = true, bytes = all, mimeType = transfer.type)
             } else {
                 appendChatText(transfer.fromUsername ?: "Peer",
                     "📎 Received ${transfer.name} → ${saved ?: "(failed to save)"}", incoming = true)
@@ -1436,8 +1560,8 @@ class NativeCallActivity : Activity(),
         private const val FILE_PICK_REQUEST = 5102
         private const val STATE_ROOM = "stateRoom"
         private const val STATE_USERNAME = "stateUsername"
-        private const val FILE_CHUNK_SIZE = 64 * 1024
-        private const val FILE_BUFFER_HIGH = 512L * 1024L
+        private const val FILE_CHUNK_SIZE = 16 * 1024
+        private const val FILE_BUFFER_HIGH = 256L * 1024L
         private const val GIPHY_API_KEY = "z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn"
         private const val GIPHY_LIMIT = 20
         private val REACTIONS = listOf("❤️", "😂", "🎉", "😮", "👏", "🤗")

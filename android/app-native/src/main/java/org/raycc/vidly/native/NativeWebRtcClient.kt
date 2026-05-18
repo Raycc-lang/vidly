@@ -256,9 +256,9 @@ class NativeWebRtcClient(
     /** Broadcast JSON message on the 'chat' channel to all peers. */
     fun sendChatJson(payload: JSONObject) {
         val data = payload.toString().toByteArray(Charsets.UTF_8)
-        peers.values.forEach { peer ->
-            val dc = peer.chatChannel ?: continue@forEach
-            if (dc.state() != DataChannel.State.OPEN) continue@forEach
+        for (peer in peers.values) {
+            val dc = peer.chatChannel ?: continue
+            if (dc.state() != DataChannel.State.OPEN) continue
             runCatching { dc.send(DataChannel.Buffer(ByteBuffer.wrap(data), false)) }
         }
     }

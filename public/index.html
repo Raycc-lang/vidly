@@ -831,9 +831,9 @@ const GIPHY_API_KEY = 'z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn';
 const GIPHY_LIMIT = 20;
 const MEDIA_URL_RE = /^https?:\/\/\S+\.(jpe?g|png|gif|webp)(\?\S*)?$/i;
 const GIF_SERVICE_RE = /^https?:\/\/\S*(giphy\.com|tenor\.com)\/\S+$/i;
-const FILE_CHUNK_SIZE = 64 * 1024;
-const FILE_BUFFER_HIGH = 512 * 1024;
-const FILE_BUFFER_LOW = 128 * 1024;
+const FILE_CHUNK_SIZE = 16 * 1024;
+const FILE_BUFFER_HIGH = 256 * 1024;
+const FILE_BUFFER_LOW = 64 * 1024;
 const outgoingFiles = new Map(); // fileId -> { file, peers:Set, accepted:Set, completed:Set, rejected:Set, card }
 const objectURLs = new Set();   // revoke on beforeunload to prevent memory leaks
 const incomingFiles = new Map(); // fileId -> { peer, meta, chunks, received, card, lastProgressSent }
@@ -939,6 +939,7 @@ $('createBtn').onclick = () => {
     myUsername = name;
     localStorage.setItem('vidly-username', name);
     const id = randomRoomId();
+    localStorage.setItem('vidly-room', id);
     history.pushState({}, '', '/room/' + id);
     roomId = id;
     showCall();
@@ -950,6 +951,7 @@ $('joinBtn').onclick = () => {
     localStorage.setItem('vidly-username', name);
     const v = $('joinCode').value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
     if (!v) { toast('Enter a room code', 'warn'); return; }
+    localStorage.setItem('vidly-room', v);
     history.pushState({}, '', '/room/' + v);
     roomId = v;
     showCall();
@@ -2136,20 +2138,11 @@ function handleFileControl(peer, msg) {
 
 function receiveFileOffer(peer, meta) {
     if (incomingFiles.has(meta.id)) return;
-    const acceptBtn = document.createElement('button');
-    acceptBtn.className = 'btn primary';
-    acceptBtn.type = 'button';
-    acceptBtn.textContent = 'Accept';
-    const rejectBtn = document.createElement('button');
-    rejectBtn.className = 'btn ghost';
-    rejectBtn.type = 'button';
-    rejectBtn.textContent = 'Reject';
     const card = createFileCard('other', meta, {
         senderName: meta.username || peer.username,
         ts: meta.ts,
-        status: 'Incoming file',
-        hideProgress: true,
-        actions: [rejectBtn, acceptBtn]
+        status: 'Receiving...',
+        hideProgress: false
     });
     messagesEl.appendChild(card.el);
     messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -2157,23 +2150,16 @@ function receiveFileOffer(peer, meta) {
 
     const transfer = { peer, meta, chunks: [], received: 0, card, lastProgressSent: 0 };
     incomingFiles.set(meta.id, transfer);
-    acceptBtn.onclick = () => {
-        if (peer.activeIncomingFileId) {
-            toast('Finish the current file from this peer first', 'warn');
-            return;
-        }
-        card.actions.style.display = 'none';
-        card.status.textContent = 'Receiving...';
-        card.bar.parentElement.style.display = '';
-        peer.activeIncomingFileId = meta.id;
-        sendPeerDataMessage(peer, { type: 'file-accept', id: meta.id });
-    };
-    rejectBtn.onclick = () => {
+
+    if (peer.activeIncomingFileId) {
         incomingFiles.delete(meta.id);
-        card.actions.style.display = 'none';
-        card.status.textContent = 'Declined';
+        card.status.textContent = 'Busy receiving another file';
         sendPeerDataMessage(peer, { type: 'file-reject', id: meta.id });
-    };
+        return;
+    }
+
+    peer.activeIncomingFileId = meta.id;
+    sendPeerDataMessage(peer, { type: 'file-accept', id: meta.id });
 }
 
 async function sendFileToPeer(peer, transfer) {
@@ -2196,10 +2182,15 @@ async function sendFileToPeer(peer, transfer) {
 function waitForFileBuffer(dc) {
     if (dc.bufferedAmount <= FILE_BUFFER_HIGH) return Promise.resolve();
     return new Promise((resolve) => {
+        let poll = null;
         const done = () => {
             dc.removeEventListener('bufferedamountlow', done);
+            if (poll) clearInterval(poll);
             resolve();
         };
+        poll = setInterval(() => {
+            if (dc.bufferedAmount <= FILE_BUFFER_LOW || dc.readyState !== 'open') done();
+        }, 25);
         dc.addEventListener('bufferedamountlow', done);
     });
 }
@@ -3066,10 +3057,12 @@ $('copyLink').onclick = async () => {
 };
 
 // ─── Start ────────────────────────────────────────────────
-// Pre-fill username from localStorage
+// Pre-fill username and room from localStorage
 (function() {
     const saved = localStorage.getItem('vidly-username');
+    const savedRoom = localStorage.getItem('vidly-room');
     if (saved) $('usernameInput').value = saved;
+    if (savedRoom) $('joinCode').value = savedRoom;
 })();
 route();
 </script>
