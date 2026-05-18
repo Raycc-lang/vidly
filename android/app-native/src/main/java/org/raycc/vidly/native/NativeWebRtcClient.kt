@@ -191,8 +191,10 @@ class NativeWebRtcClient(
 
     /** Cancel preview: stop the local video capture. Sender stays detached. */
     fun cancelCameraPreview() {
-        if (cameraLive) return
+        if (!cameraLive) return
         stopVideo()
+        cameraLive = false
+        broadcastMediaState()
         status("Camera off")
     }
 
@@ -255,8 +257,8 @@ class NativeWebRtcClient(
     fun sendChatJson(payload: JSONObject) {
         val data = payload.toString().toByteArray(Charsets.UTF_8)
         peers.values.forEach { peer ->
-            val dc = peer.chatChannel ?: return@forEach
-            if (dc.state() != DataChannel.State.OPEN) return@forEach
+            val dc = peer.chatChannel ?: continue@forEach
+            if (dc.state() != DataChannel.State.OPEN) continue@forEach
             runCatching { dc.send(DataChannel.Buffer(ByteBuffer.wrap(data), false)) }
         }
     }

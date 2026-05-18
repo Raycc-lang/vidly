@@ -900,12 +900,12 @@ class NativeCallActivity : Activity(),
     private fun refreshParticipants() {
         val parts = mutableListOf<String>()
         val selfMic = if (micEnabled) "🎙️" else "🔇"
-        val selfCam = if (cameraEnabled) "📷" else "🚫"
+        val selfCam = if (cameraEnabled) "📷" else "📵"
         parts.add((currentUsername.ifBlank { "You" }) + " (you) " + selfMic + selfCam)
         for ((peerId, name) in participants) {
             val state = peerMediaStates[peerId]
             val mic = if (state?.mic == true) "🎙️" else "🔇"
-            val cam = if (state?.cam == true) "📷" else "🚫"
+            val cam = if (state?.cam == true) "📷" else "📵"
             parts.add("$name $mic$cam")
         }
         participantsLabel.text = "Participants (${parts.size}): " + parts.joinToString(" · ")

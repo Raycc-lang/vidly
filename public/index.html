@@ -984,7 +984,7 @@ async function initLocalMedia() {
     $('micBtn').classList.add('muted');
     $('micBtn').textContent = '🔇';
     $('camBtn').classList.add('muted');
-    $('camBtn').textContent = '🚫';
+    $('camBtn').textContent = '📵';
     showLocalPlaceholder();
     localTile.style.display = 'none';
 }
@@ -2296,15 +2296,15 @@ function addReactionMessage(kind, emoji, ts, senderName, fromPeerId) {
 function updatePeerStatusIndicator(peerId, mic, cam) {
     const peer = peers.get(peerId);
     if (!peer || !peer.tileEl) return;
-    const label = peer.tileEl.querySelector('.tile-label');
+    const label = peer.tileEl.querySelector(".tile-label");
     if (!label) return;
-    let status = label.querySelector('.peer-status');
+    let status = label.querySelector(".peer-status");
     if (!status) {
-        status = document.createElement('span');
-        status.className = 'peer-status';
+        status = document.createElement("span");
+        status.className = "peer-status";
         label.appendChild(status);
     }
-    status.textContent = (mic ? '🎙️' : '🔇') + (cam ? '📷' : '🚫');
+    status.textContent = (mic ? "🎙️" : "🔇") + (cam ? "📷" : "📵");
 }
 
 // Broadcast our current mic/cam state to all peers (so they can update indicators).
@@ -2699,7 +2699,7 @@ $('camBtn').onclick = () => {
         showLocalPlaceholder();
         localTile.style.display = 'none';
         $('camBtn').classList.add('muted');
-        $('camBtn').textContent = '🚫';
+        $('camBtn').textContent = '📵';
         broadcastLocalMediaState();
     }
 };
