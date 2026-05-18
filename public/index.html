@@ -405,23 +405,31 @@
   .msg.other { align-self: flex-start; background: #262a36; border-bottom-left-radius: 4px; }
   .msg.system { align-self: center; background: transparent; color: var(--muted); font-size: 12px; font-style: italic; }
   .msg.file.system { align-self: stretch; max-width: 100%; font-style: normal; }
-  /* Reactions float on the user tile rather than appearing in chat. */
-  .tile-reaction {
-    position: absolute;
-    left: 50%;
-    bottom: 24px;
-    transform: translateX(-50%);
-    font-size: 56px;
-    pointer-events: none;
-    text-shadow: 0 2px 8px rgba(0,0,0,.7);
-    animation: reactionFloat 1.8s ease-out forwards;
-    z-index: 20;
+  .msg.reaction {
+    align-self: center;
+    max-width: min(280px, 88%);
+    padding: 6px 12px;
+    background: rgba(255,255,255,.06);
+    border: 1px solid rgba(255,255,255,.07);
+    color: var(--muted);
+    font-size: 12px;
+    text-align: center;
+    border-radius: 999px;
   }
-  @keyframes reactionFloat {
-    0%   { opacity: 0; transform: translate(-50%, 20px) scale(.6); }
-    20%  { opacity: 1; transform: translate(-50%, 0) scale(1.15); }
-    60%  { opacity: 1; transform: translate(-50%, -60px) scale(1); }
-    100% { opacity: 0; transform: translate(-50%, -160px) scale(.9); }
+  .msg.reaction .reaction-emoji {
+    color: var(--text);
+    font-size: 18px;
+    line-height: 1;
+    margin-left: 5px;
+    vertical-align: -2px;
+  }
+  /* Peer mic/cam status indicators inside tile-label */
+  .tile-label .peer-status {
+    display: inline-flex;
+    gap: 4px;
+    margin-left: 4px;
+    font-size: 12px;
+    opacity: .92;
   }
   .msg.media { width: min(260px, 80%); padding: 8px; }
   .msg.file { width: min(300px, 86%); padding: 10px; }
@@ -1069,6 +1077,7 @@ function confirmCamera() {
     }
 
     toast('Camera and mic are now on', 'success');
+    broadcastLocalMediaState();
 }
 
 async function cancelCamera() {
@@ -1105,6 +1114,7 @@ async function cancelCamera() {
             toast('Microphone was released and could not be restored', 'warn');
         }
     }
+    broadcastLocalMediaState();
 }
 // ─── Camera switch (front/back) ───────────────────────────
 $('switchCamBtn').onclick = async () => {
@@ -1761,7 +1771,15 @@ function updateEmptyState() {
 // ─── DataChannel chat ─────────────────────────────────────
 function attachDataChannel(peer, dc) {
     peer.dc = dc;
-    dc.onopen = () => {};
+    dc.onopen = () => {
+        // Send our current mic/cam state to this peer so they can render indicators.
+        sendPeerDataMessage(peer, {
+            type: 'media-state',
+            mic: !!micEnabled,
+            cam: !!camEnabled,
+            username: myUsername
+        });
+    };
     dc.onmessage = (e) => {
         let msg; try { msg = JSON.parse(e.data); } catch { return; }
         if (msg.username) peer.username = msg.username;
@@ -1771,6 +1789,9 @@ function attachDataChannel(peer, dc) {
             addMediaMessage('other', msg.url, msg.kind, msg.ts, msg.username);
         } else if (msg.type === 'reaction') {
             addReactionMessage('other', msg.emoji, msg.ts, msg.username || peer.username || 'Peer', peer.id);
+        } else if (msg.type === 'media-state') {
+            peer.mediaState = { mic: !!msg.mic, cam: !!msg.cam };
+            updatePeerStatusIndicator(peer.id, peer.mediaState.mic, peer.mediaState.cam);
         } else if (msg.type && msg.type.startsWith('file-')) {
             handleFileControl(peer, msg);
         }
@@ -2157,7 +2178,7 @@ function loadChatHistory() {
         for (const m of arr) {
             if (m.type === 'chat') addMessage(m.kind, m.body, m.ts, m.senderName);
             else if (m.type === 'media') addMediaMessage(m.kind, m.url, m.mediaKind, m.ts, m.senderName);
-            // Reactions are ephemeral floating overlays; skip during history replay.
+            else if (m.type === 'reaction') addReactionMessage(m.kind, m.emoji, m.ts, m.senderName);
         }
     } catch {}
     loadingHistory = false;
@@ -2253,37 +2274,47 @@ function addMediaMessage(kind, url, mediaKind, ts, senderName) {
     saveChatMsg({ type: 'media', kind, url, mediaKind, ts, senderName });
 }
 
-// Reactions are now displayed as a floating emoji on the relevant user's
-// video tile (own tile for sender, peer tile for receiver). They are not
-// persisted to chat history.
 function addReactionMessage(kind, emoji, ts, senderName, fromPeerId) {
     if (!emoji) return;
-    let target = null;
-    if (kind === 'own') {
-        target = localTile;
-    } else if (fromPeerId) {
-        const peer = peers.get(fromPeerId);
-        target = peer?.tileEl || null;
-    }
-    if (!target) {
-        // Fallback: pick a peer tile by sender name
-        if (senderName) {
-            for (const peer of peers.values()) {
-                if (peer.username === senderName && peer.tileEl) { target = peer.tileEl; break; }
-            }
-        }
-    }
-    if (!target) target = localTile; // ultimate fallback
-    showReactionOnTile(target, emoji);
+    const el = document.createElement('div');
+    el.className = 'msg reaction';
+    const nameEl = document.createElement('span');
+    nameEl.textContent = kind === 'own' ? 'You' : (senderName || 'Peer');
+    const emojiEl = document.createElement('span');
+    emojiEl.className = 'reaction-emoji';
+    emojiEl.textContent = emoji;
+    el.appendChild(nameEl);
+    el.appendChild(emojiEl);
+    if (ts) el.title = new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    messagesEl.appendChild(el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    updateChatCompact();
+    saveChatMsg({ type: 'reaction', kind, emoji, ts, senderName });
 }
 
-function showReactionOnTile(targetEl, emoji) {
-    if (!targetEl) return;
-    const span = document.createElement('span');
-    span.className = 'tile-reaction';
-    span.textContent = emoji;
-    targetEl.appendChild(span);
-    setTimeout(() => { try { span.remove(); } catch {} }, 1900);
+// Update the mic/cam indicator inside a peer's tile-label.
+function updatePeerStatusIndicator(peerId, mic, cam) {
+    const peer = peers.get(peerId);
+    if (!peer || !peer.tileEl) return;
+    const label = peer.tileEl.querySelector('.tile-label');
+    if (!label) return;
+    let status = label.querySelector('.peer-status');
+    if (!status) {
+        status = document.createElement('span');
+        status.className = 'peer-status';
+        label.appendChild(status);
+    }
+    status.textContent = (mic ? '🎙️' : '🔇') + (cam ? '📷' : '🚫');
+}
+
+// Broadcast our current mic/cam state to all peers (so they can update indicators).
+function broadcastLocalMediaState() {
+    sendDataMessage({
+        type: 'media-state',
+        mic: !!micEnabled,
+        cam: !!camEnabled,
+        username: myUsername
+    });
 }
 
 function updateChatCompact() {
@@ -2642,6 +2673,7 @@ $('micBtn').onclick = async () => {
         $('micBtn').classList.remove('muted');
         $('micBtn').textContent = '🎙️';
     }
+    broadcastLocalMediaState();
 };
 $('camBtn').onclick = () => {
     if (!camEnabled) {
@@ -2668,6 +2700,7 @@ $('camBtn').onclick = () => {
         localTile.style.display = 'none';
         $('camBtn').classList.add('muted');
         $('camBtn').textContent = '🚫';
+        broadcastLocalMediaState();
     }
 };
 

@@ -1,4 +1,4 @@
-package org.raycc.vidly
+package org.raycc.vidly.webview
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -8,6 +8,7 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import org.raycc.vidly.R
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener

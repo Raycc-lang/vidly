@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "VidlyAndroidShell"
-include(":app")
+rootProject.name = "Vidly"
+include(":app-webview", ":app-native")

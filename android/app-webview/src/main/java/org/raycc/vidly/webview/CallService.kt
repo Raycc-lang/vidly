@@ -1,4 +1,4 @@
-package org.raycc.vidly
+package org.raycc.vidly.webview
 
 import android.app.Notification
 import android.app.NotificationChannel
