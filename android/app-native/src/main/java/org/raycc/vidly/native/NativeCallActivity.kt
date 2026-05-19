@@ -9,6 +9,7 @@ import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.SharedPreferences
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -18,13 +19,18 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.text.InputType
+import android.text.TextUtils
 import android.util.Rational
 import android.view.GestureDetector
 import android.view.Gravity
@@ -70,17 +76,22 @@ class NativeCallActivity : Activity(),
 
     // Root layout
     private lateinit var root: FrameLayout
+    private lateinit var callStack: LinearLayout
+    private lateinit var videoContainer: FrameLayout
+    private lateinit var bottomSpacer: View
     private lateinit var joinPanel: LinearLayout
     private lateinit var roomInput: EditText
     private lateinit var usernameInput: EditText
-    private lateinit var statusText: TextView
+    private lateinit var localPreviewContainer: LinearLayout
     private lateinit var localRenderer: SurfaceViewRenderer
     private lateinit var remoteRenderer: SurfaceViewRenderer
 
     // Header
     private lateinit var headerBar: LinearLayout
     private lateinit var roomLabel: TextView
-    private lateinit var participantsLabel: TextView
+    private lateinit var headerStatusLabel: TextView
+    private lateinit var participantsScroll: HorizontalScrollView
+    private lateinit var participantsRow: LinearLayout
 
     // Bottom container (controls + chat)
     private lateinit var bottomContainer: LinearLayout
@@ -105,6 +116,7 @@ class NativeCallActivity : Activity(),
     // Bottom buttons
     private var micButton: Button? = null
     private var cameraButton: Button? = null
+    private var speakerButton: Button? = null
 
     // PiP / proximity
     private var proximityWakeLock: PowerManager.WakeLock? = null
@@ -124,6 +136,28 @@ class NativeCallActivity : Activity(),
     private var callActive = false
     private var currentRoom = ""
     private var currentUsername = ""
+    private var hasRemoteVideo = false
+    private var headerStatus = "Native Vidly"
+    private var videoStalled = false
+    private val connectedPeerIds = HashSet<String>()
+    private val frameHealthHandler = Handler(Looper.getMainLooper())
+    private val frameHealthRunnable = object : Runnable {
+        override fun run() {
+            checkFrameHealth()
+            if (callActive) frameHealthHandler.postDelayed(this, FRAME_HEALTH_CHECK_MS)
+        }
+    }
+    private var normalVideoHeight = 0
+    private var previewDragStartRawX = 0f
+    private var previewDragStartRawY = 0f
+    private var previewDragStartX = 0f
+    private var previewDragStartY = 0f
+    private var previewDragging = false
+    private var localRendererAttached = false
+    private var speakerphoneEnabled = true
+    private var audioRoutingConfigured = false
+    private var previousAudioMode = AudioManager.MODE_NORMAL
+    private var previousSpeakerphoneOn = false
 
     // Participants: peerId -> username
     private val participants = LinkedHashMap<String, String>()
@@ -215,6 +249,7 @@ class NativeCallActivity : Activity(),
         signaling.dispose()
         rtc?.dispose()
         rtc = null
+        resetCallAudioRouting()
         if (callActive) {
             NativeCallService.stop(this)
             callActive = false
@@ -242,11 +277,10 @@ class NativeCallActivity : Activity(),
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         inPip = isInPictureInPictureMode
-        val visibility = if (isInPictureInPictureMode) View.GONE else View.VISIBLE
+        val visibility = if (isInPictureInPictureMode || fullscreen) View.GONE else View.VISIBLE
         headerBar.visibility = visibility
         bottomContainer.visibility = visibility
-        statusText.visibility = visibility
-        localRenderer.visibility = visibility
+        localPreviewContainer.visibility = if (isInPictureInPictureMode) View.GONE else localPreviewVisibility()
         if (isInPictureInPictureMode) {
             previewControls.visibility = View.GONE
             reactionPicker.visibility = View.GONE
@@ -256,7 +290,7 @@ class NativeCallActivity : Activity(),
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == PERMISSIONS_REQUEST && !hasMediaPermissions()) {
-            statusText.text = "Camera and microphone permissions are required."
+            updateHeaderStatus("Camera and microphone permissions are required.")
             micEnabled = false
             cameraEnabled = false
             updateMediaButtons()
@@ -283,8 +317,10 @@ class NativeCallActivity : Activity(),
         rtc?.onPeerLeft(peerId)
         participants.remove(peerId)
         peerMediaStates.remove(peerId)
+        connectedPeerIds.remove(peerId)
+        if (participants.isEmpty()) hasRemoteVideo = false
         refreshParticipants()
-        statusText.text = "${username ?: "Peer"} left"
+        updateHeaderStatus("${username ?: "Peer"} left")
     }
 
     override fun onSignal(from: String, payload: JSONObject) {
@@ -292,17 +328,17 @@ class NativeCallActivity : Activity(),
     }
 
     override fun onRoomFull() {
-        statusText.text = "Room is full."
+        updateHeaderStatus("Room is full.")
         showJoinPanel()
     }
 
     override fun onUsernameTaken(username: String) {
-        statusText.text = "Name \"$username\" is already taken."
+        updateHeaderStatus("Name \"$username\" is already taken.")
         showJoinPanel()
     }
 
     override fun onStatus(message: String) {
-        statusText.text = message
+        updateHeaderStatus(message)
     }
 
     // ─── DataChannel callbacks ────────────────────────────────
@@ -322,6 +358,9 @@ class NativeCallActivity : Activity(),
                     val mic = msg.optBoolean("mic", false)
                     val cam = msg.optBoolean("cam", false)
                     peerMediaStates[fromPeerId] = PeerMediaState(mic, cam)
+                    if (msg.has("video") && !msg.optBoolean("video", false)) {
+                        rtc?.onPeerVideoInactive(fromPeerId)
+                    }
                     refreshParticipants()
                 }
                 "file-offer" -> {
@@ -358,7 +397,12 @@ class NativeCallActivity : Activity(),
         }
     }
 
-    override fun onPeerConnectionStateChanged(peerId: String, connected: Boolean) {}
+    override fun onPeerConnectionStateChanged(peerId: String, connected: Boolean) {
+        runOnUiThread {
+            if (connected) connectedPeerIds.add(peerId) else connectedPeerIds.remove(peerId)
+            checkFrameHealth()
+        }
+    }
 
     // ─── UI construction ──────────────────────────────────────
 
@@ -366,9 +410,23 @@ class NativeCallActivity : Activity(),
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         setContentView(root)
 
-        // Remote video — fills vertically by default (ASPECT_FILL); double-tap to toggle fullscreen.
+        callStack = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.BLACK)
+        }
+        root.addView(callStack, FrameLayout.LayoutParams(-1, -1))
+
+        buildHeaderBar()
+
+        normalVideoHeight = resources.displayMetrics.widthPixels * 9 / 16
+        videoContainer = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+        }
+        callStack.addView(videoContainer, LinearLayout.LayoutParams(-1, normalVideoHeight))
+
+        // Remote video stays inside the dedicated video area and always shows the full frame.
         remoteRenderer = SurfaceViewRenderer(this).apply {
-            setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+            setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
             val detector = GestureDetector(this@NativeCallActivity, object : GestureDetector.SimpleOnGestureListener() {
                 override fun onDoubleTap(e: MotionEvent): Boolean {
                     toggleFullscreen()
@@ -380,30 +438,28 @@ class NativeCallActivity : Activity(),
                 true
             }
         }
-        root.addView(remoteRenderer, FrameLayout.LayoutParams(-1, -1))
+        videoContainer.addView(remoteRenderer, FrameLayout.LayoutParams(-1, -1))
 
-        buildHeaderBar()
-
-        statusText = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            text = "Native Vidly"
-            textSize = 12f
-            setBackgroundColor(Color.argb(120, 0, 0, 0))
-            setPadding(dp(10), dp(4), dp(10), dp(4))
+        // Local preview floats above the whole call UI so its confirmation controls are not
+        // clipped by the fixed 16:9 video area.
+        localPreviewContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setOnTouchListener { _, ev -> handleLocalPreviewDrag(ev) }
         }
-        root.addView(statusText, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
-            topMargin = dp(94)
+        root.addView(localPreviewContainer, FrameLayout.LayoutParams(dp(112), -2, Gravity.TOP or Gravity.END).apply {
+            topMargin = dp(14)
+            marginEnd = dp(14)
         })
 
-        // Local renderer (top-right floating)
+        // Local renderer (top-right floating preview tile)
         localRenderer = SurfaceViewRenderer(this).apply {
             setZOrderMediaOverlay(true)
             setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+            visibility = View.GONE
+            setOnTouchListener { _, ev -> handleLocalPreviewDrag(ev) }
         }
-        root.addView(localRenderer, FrameLayout.LayoutParams(dp(112), dp(160), Gravity.TOP or Gravity.END).apply {
-            topMargin = dp(124)
-            marginEnd = dp(14)
-        })
+        attachLocalRenderer()
 
         // Preview controls (below local renderer, only visible during preview)
         previewControls = LinearLayout(this).apply {
@@ -412,11 +468,13 @@ class NativeCallActivity : Activity(),
             setBackgroundColor(Color.rgb(15, 17, 23))
             setPadding(dp(8), dp(8), dp(8), dp(8))
         }
-        root.addView(previewControls, FrameLayout.LayoutParams(dp(170), -2, Gravity.TOP or Gravity.END).apply {
-            topMargin = dp(124 + 160 + 6)
-            marginEnd = dp(14)
+        localPreviewContainer.addView(previewControls, LinearLayout.LayoutParams(dp(112), -2).apply {
+            topMargin = dp(6)
         })
         buildPreviewControls()
+
+        bottomSpacer = View(this).apply { setBackgroundColor(Color.BLACK) }
+        callStack.addView(bottomSpacer, LinearLayout.LayoutParams(-1, 0, 1f))
 
         buildBottomContainer()
         buildReactionPicker()
@@ -430,7 +488,7 @@ class NativeCallActivity : Activity(),
             setPadding(dp(14), dp(12), dp(14), dp(8))
             visibility = View.GONE
         }
-        root.addView(headerBar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+        callStack.addView(headerBar, LinearLayout.LayoutParams(-1, -2))
 
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -442,37 +500,54 @@ class NativeCallActivity : Activity(),
             setTextColor(Color.WHITE)
             textSize = 14f
             maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
+            ellipsize = TextUtils.TruncateAt.END
             text = "Room: —"
+            isClickable = true
+            isLongClickable = true
+            val detector = GestureDetector(this@NativeCallActivity, object : GestureDetector.SimpleOnGestureListener() {
+                override fun onDoubleTap(e: MotionEvent): Boolean {
+                    shareRoomLink()
+                    Toast.makeText(this@NativeCallActivity, "Sharing room link", Toast.LENGTH_SHORT).show()
+                    return true
+                }
+            })
+            setOnTouchListener { _, ev ->
+                detector.onTouchEvent(ev)
+                false
+            }
+            setOnLongClickListener {
+                copyRoomLink()
+                true
+            }
         }
         row.addView(roomLabel, LinearLayout.LayoutParams(0, -2, 1f))
 
-        val copyBtn = TextView(this).apply {
-            text = "Copy"
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.rgb(40, 42, 52))
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            setOnClickListener { copyRoomLink() }
+        val separator = TextView(this).apply {
+            text = " | "
+            textSize = 14f
+            setTextColor(Color.rgb(145, 152, 166))
         }
-        row.addView(copyBtn, LinearLayout.LayoutParams(-2, dp(34)))
+        row.addView(separator, LinearLayout.LayoutParams(-2, -2))
 
-        val shareBtn = TextView(this).apply {
-            text = "Share"
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.rgb(40, 42, 52))
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            setOnClickListener { shareRoomLink() }
+        headerStatusLabel = TextView(this).apply {
+            setTextColor(Color.rgb(205, 211, 224))
+            textSize = 13f
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            text = headerStatus
         }
-        row.addView(shareBtn, LinearLayout.LayoutParams(-2, dp(34)).apply { marginStart = dp(4) })
+        row.addView(headerStatusLabel, LinearLayout.LayoutParams(0, -2, 1f))
 
-        participantsLabel = TextView(this).apply {
-            setTextColor(Color.rgb(180, 186, 200))
-            textSize = 12f
-            text = "—"
+        participantsScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
         }
-        headerBar.addView(participantsLabel, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        participantsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        participantsScroll.addView(participantsRow, ViewGroup.LayoutParams(-2, -2))
+        headerBar.addView(participantsScroll, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
     }
 
     private fun buildPreviewControls() {
@@ -525,7 +600,7 @@ class NativeCallActivity : Activity(),
             setBackgroundColor(Color.rgb(12, 14, 20))
             visibility = View.GONE
         }
-        root.addView(bottomContainer, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        callStack.addView(bottomContainer, LinearLayout.LayoutParams(-1, -2))
 
         // 1) Chat messages area (collapsible — toggle bar at top to expand/collapse)
         chatMessagesContainer = LinearLayout(this).apply {
@@ -585,6 +660,7 @@ class NativeCallActivity : Activity(),
                 } else {
                     cameraEnabled = false
                     rtc?.setCameraEnabled(false)
+                    hideLocalRenderer()
                     updateMediaButtons()
                     refreshParticipants()
                 }
@@ -592,6 +668,21 @@ class NativeCallActivity : Activity(),
         }
         cameraButton = cam
         controlsRow.addView(cam, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
+
+        val speaker = Button(this).apply {
+            text = "Speaker"
+            setOnClickListener {
+                if (!canToggleAudioRoute()) {
+                    Toast.makeText(this@NativeCallActivity, "Only one audio route available", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                speakerphoneEnabled = !speakerphoneEnabled
+                applyAudioRoute()
+                updateAudioRouteButton()
+            }
+        }
+        speakerButton = speaker
+        controlsRow.addView(speaker, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
 
         val hangup = Button(this).apply {
             text = "Hang up"
@@ -731,7 +822,7 @@ class NativeCallActivity : Activity(),
         val username = usernameInput.text.toString().trim().take(32)
         val room = roomInput.text.toString().trim().lowercase().replace(Regex("[^a-z0-9_-]"), "")
         if (username.isBlank() || room.isBlank()) {
-            statusText.text = "Enter a name and room code."
+            updateHeaderStatus("Enter a name and room code.")
             return
         }
 
@@ -748,16 +839,25 @@ class NativeCallActivity : Activity(),
         joinPanel.visibility = View.GONE
         headerBar.visibility = View.VISIBLE
         bottomContainer.visibility = View.VISIBLE
+        bottomSpacer.visibility = View.VISIBLE
         chatMessagesContainer.visibility = View.VISIBLE
         roomLabel.text = "Room: $room"
+        updateHeaderStatus("Connecting...")
         participants.clear()
         peerMediaStates.clear()
+        connectedPeerIds.clear()
+        hasRemoteVideo = false
+        videoStalled = false
         micEnabled = false
         cameraEnabled = false
         inPreview = false
         fullscreen = false
-        remoteRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        updateVideoContainerLayout()
+        remoteRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
         previewControls.visibility = View.GONE
+        hideLocalRenderer()
+        resetLocalPreviewPosition()
         refreshParticipants()
         chatList.removeAllViews()
         outgoingFiles.clear()
@@ -768,12 +868,18 @@ class NativeCallActivity : Activity(),
         chatInputRow.visibility = View.GONE
         chatToggleBar.text = "+  Chat  +"
         (chatMessagesContainer.layoutParams as LinearLayout.LayoutParams).height = dp(130)
+        configureCallAudioRouting(defaultSpeakerphone = true)
         updateMediaButtons()
 
         rtc?.dispose()
-        rtc = NativeWebRtcClient(this, localRenderer, remoteRenderer, signaling) { msg ->
-            runOnUiThread { statusText.text = msg }
-        }.also {
+        rtc = NativeWebRtcClient(
+            this,
+            localRenderer,
+            remoteRenderer,
+            signaling,
+            { msg -> runOnUiThread { updateHeaderStatus(msg) } },
+            { active -> runOnUiThread { setRemoteVideoActive(active) } }
+        ).also {
             it.dataListener = this
             it.start()
             loadTurnConfig(it)
@@ -782,8 +888,12 @@ class NativeCallActivity : Activity(),
     }
 
     private fun leaveCall() {
+        stopFrameHealthMonitor()
         signaling.leave()
         rtc?.close()
+        resetCallAudioRouting()
+        hasRemoteVideo = false
+        connectedPeerIds.clear()
         showJoinPanel()
         setCallActive(false)
     }
@@ -796,6 +906,7 @@ class NativeCallActivity : Activity(),
             rtc?.setMicEnabled(true)
         }
         rtc?.startCameraPreview()
+        showLocalPreview()
         previewControls.visibility = View.VISIBLE
         cameraButton?.text = "Preview..."
         updateMediaButtons()
@@ -805,6 +916,7 @@ class NativeCallActivity : Activity(),
         inPreview = false
         rtc?.confirmCameraPreview()
         cameraEnabled = true
+        showLocalPreview()
         previewControls.visibility = View.GONE
         updateMediaButtons()
         refreshParticipants()
@@ -814,7 +926,7 @@ class NativeCallActivity : Activity(),
     private fun cancelPreview() {
         inPreview = false
         rtc?.cancelCameraPreview()
-        localRenderer.clearImage()
+        hideLocalRenderer()
         cameraEnabled = false
         if (!micEnabledBeforePreview && micEnabled) {
             micEnabled = false
@@ -829,7 +941,7 @@ class NativeCallActivity : Activity(),
         chatExpanded = !chatExpanded
         val params = chatMessagesContainer.layoutParams as LinearLayout.LayoutParams
         if (chatExpanded) {
-            params.height = dp(400)
+            params.height = expandedChatHeight()
             chatInputRow.visibility = View.VISIBLE
             chatToggleBar.text = "—  Chat  —"
         } else {
@@ -848,20 +960,23 @@ class NativeCallActivity : Activity(),
     }
 
     private fun toggleFullscreen() {
+        if (!fullscreen && !hasRemoteVideo) return
         fullscreen = !fullscreen
         val visibility = if (fullscreen) View.GONE else View.VISIBLE
         headerBar.visibility = visibility
         bottomContainer.visibility = visibility
-        statusText.visibility = visibility
+        bottomSpacer.visibility = visibility
         // Always GONE in fullscreen; otherwise only visible while previewing.
         previewControls.visibility = if (!fullscreen && inPreview) View.VISIBLE else View.GONE
+        localPreviewContainer.visibility = if (fullscreen) View.GONE else localPreviewVisibility()
         reactionPicker.visibility = View.GONE
-        // Use ASPECT_FIT in fullscreen (show entire frame letterboxed),
-        // ASPECT_FILL otherwise (fill screen, may crop edges).
-        remoteRenderer.setScalingType(
-            if (fullscreen) RendererCommon.ScalingType.SCALE_ASPECT_FIT
-            else RendererCommon.ScalingType.SCALE_ASPECT_FILL
-        )
+        remoteRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+        updateVideoContainerLayout()
+        requestedOrientation = if (fullscreen) {
+            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
     }
 
     private fun applyWindowInsets() {
@@ -876,28 +991,200 @@ class NativeCallActivity : Activity(),
             if (top != topInset) {
                 topInset = top
                 // Push header below the cutout / status bar.
-                (headerBar.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                    lp.topMargin = topInset
-                    headerBar.layoutParams = lp
-                }
-                // Status text under the (variable-height) header.
-                (statusText.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                    lp.topMargin = topInset + dp(70)
-                    statusText.layoutParams = lp
-                }
-                // Local renderer below the cutout too.
-                (localRenderer.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                    lp.topMargin = topInset + dp(80)
-                    localRenderer.layoutParams = lp
-                }
-                (previewControls.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                    lp.topMargin = topInset + dp(80 + 160 + 6)
-                    previewControls.layoutParams = lp
-                }
+                headerBar.setPadding(dp(14), topInset + dp(12), dp(14), dp(8))
             }
             insets
         }
         root.requestApplyInsets()
+    }
+
+    private fun updateHeaderStatus(message: String) {
+        headerStatus = message
+        if (::headerStatusLabel.isInitialized) {
+            renderHeaderStatus()
+        }
+    }
+
+    private fun setRemoteVideoActive(active: Boolean) {
+        hasRemoteVideo = active
+        if (!active) setVideoStalled(false)
+        if (!active && fullscreen) {
+            toggleFullscreen()
+        }
+        checkFrameHealth()
+    }
+
+    private fun renderHeaderStatus() {
+        headerStatusLabel.text = if (videoStalled) "Paused - poor network" else headerStatus
+    }
+
+    private fun setVideoStalled(stalled: Boolean) {
+        if (videoStalled == stalled) return
+        videoStalled = stalled
+        if (::headerStatusLabel.isInitialized) renderHeaderStatus()
+    }
+
+    private fun startFrameHealthMonitor() {
+        stopFrameHealthMonitor()
+        frameHealthHandler.post(frameHealthRunnable)
+    }
+
+    private fun stopFrameHealthMonitor() {
+        frameHealthHandler.removeCallbacks(frameHealthRunnable)
+        setVideoStalled(false)
+    }
+
+    private fun checkFrameHealth() {
+        if (!callActive) {
+            setVideoStalled(false)
+            return
+        }
+        val remoteConnectionAlive = connectedPeerIds.isNotEmpty()
+        val frameAgeMs = rtc?.getRemoteVideoFrameAgeMs() ?: Long.MAX_VALUE
+        setVideoStalled(hasRemoteVideo && remoteConnectionAlive && frameAgeMs > FRAME_STALL_MS)
+    }
+
+    private fun localPreviewVisibility(): Int =
+        if ((cameraEnabled || inPreview) && !inPip && !fullscreen) View.VISIBLE else View.GONE
+
+    private fun showLocalPreview() {
+        attachLocalRenderer()
+        localRenderer.visibility = View.VISIBLE
+        localPreviewContainer.visibility = localPreviewVisibility()
+        keepLocalPreviewInBounds()
+    }
+
+    private fun hideLocalRenderer() {
+        localRenderer.clearImage()
+        localRenderer.visibility = View.GONE
+        localPreviewContainer.visibility = View.GONE
+        detachLocalRenderer()
+        previewDragging = false
+    }
+
+    private fun attachLocalRenderer() {
+        if (localRendererAttached) return
+        localPreviewContainer.addView(localRenderer, 0, LinearLayout.LayoutParams(dp(112), dp(160)))
+        localRendererAttached = true
+    }
+
+    private fun detachLocalRenderer() {
+        if (!localRendererAttached) return
+        localPreviewContainer.removeView(localRenderer)
+        localRendererAttached = false
+    }
+
+    private fun resetLocalPreviewPosition() {
+        if (!::localPreviewContainer.isInitialized) return
+        localPreviewContainer.post {
+            val params = localPreviewContainer.layoutParams as FrameLayout.LayoutParams
+            params.gravity = Gravity.TOP or Gravity.END
+            params.topMargin = videoContainer.top + dp(14)
+            params.marginEnd = dp(14)
+            params.leftMargin = 0
+            localPreviewContainer.layoutParams = params
+            localPreviewContainer.translationX = 0f
+            localPreviewContainer.translationY = 0f
+        }
+    }
+
+    private fun handleLocalPreviewDrag(ev: MotionEvent): Boolean {
+        if (!::localPreviewContainer.isInitialized) return false
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                previewDragging = true
+                previewDragStartRawX = ev.rawX
+                previewDragStartRawY = ev.rawY
+                // Anchor to the current VISUAL position (layout + any existing translation).
+                previewDragStartX = localPreviewContainer.x
+                previewDragStartY = localPreviewContainer.y
+                localPreviewContainer.parent?.requestDisallowInterceptTouchEvent(true)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!previewDragging) return false
+                val parentWidth = root.width
+                val parentHeight = root.height
+                if (parentWidth <= 0 || parentHeight <= 0) return false
+
+                val minVisible = dp(60).toFloat()
+                val targetX = previewDragStartX + ev.rawX - previewDragStartRawX
+                val targetY = previewDragStartY + ev.rawY - previewDragStartRawY
+
+                // Clamp so at least minVisible pixels stay on screen.
+                val clampedX = targetX.coerceIn(
+                    minVisible - localPreviewContainer.width.toFloat(),
+                    parentWidth - minVisible
+                )
+                val clampedY = targetY.coerceIn(
+                    minVisible - localPreviewContainer.height.toFloat(),
+                    parentHeight - minVisible
+                )
+
+                // translation = desired visual position - layout position (left/top).
+                // This works regardless of current gravity or existing translation.
+                localPreviewContainer.translationX = clampedX - localPreviewContainer.left
+                localPreviewContainer.translationY = clampedY - localPreviewContainer.top
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (!previewDragging) return false
+                previewDragging = false
+                localPreviewContainer.parent?.requestDisallowInterceptTouchEvent(false)
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun keepLocalPreviewInBounds() {
+        if (!::localPreviewContainer.isInitialized) return
+        localPreviewContainer.post {
+            if (localPreviewContainer.visibility != View.VISIBLE) return@post
+            val parentWidth = root.width
+            val parentHeight = root.height
+            if (parentWidth <= 0 || parentHeight <= 0) return@post
+
+            val minVisible = dp(60).toFloat()
+            val currentX = localPreviewContainer.x
+            val currentY = localPreviewContainer.y
+
+            val clampedX = currentX.coerceIn(
+                minVisible - localPreviewContainer.width.toFloat(),
+                parentWidth - minVisible
+            )
+            val clampedY = currentY.coerceIn(
+                minVisible - localPreviewContainer.height.toFloat(),
+                parentHeight - minVisible
+            )
+
+            if (clampedX != currentX || clampedY != currentY) {
+                localPreviewContainer.translationX = clampedX - localPreviewContainer.left
+                localPreviewContainer.translationY = clampedY - localPreviewContainer.top
+            }
+        }
+    }
+
+    private fun updateVideoContainerLayout() {
+        if (!::videoContainer.isInitialized) return
+        val params = videoContainer.layoutParams as LinearLayout.LayoutParams
+        if (fullscreen) {
+            params.height = 0
+            params.weight = 1f
+        } else {
+            params.height = normalVideoHeight
+            params.weight = 0f
+        }
+        videoContainer.layoutParams = params
+    }
+
+    private fun expandedChatHeight(): Int {
+        val desired = dp(400)
+        val rootHeight = root.height
+        if (rootHeight <= 0) return desired
+        val reserved = headerBar.height + normalVideoHeight + controlsRow.height
+        val available = rootHeight - reserved
+        return available.coerceAtLeast(dp(130)).coerceAtMost(desired)
     }
 
     private fun copyRoomLink() {
@@ -921,17 +1208,34 @@ class NativeCallActivity : Activity(),
     }
 
     private fun refreshParticipants() {
-        val parts = mutableListOf<String>()
-        val selfMic = if (micEnabled) "🎙️" else "🔇"
-        val selfCam = if (cameraEnabled) "📷" else "📵"
-        parts.add((currentUsername.ifBlank { "You" }) + " (you) " + selfMic + selfCam)
+        participantsRow.removeAllViews()
+        if (participants.isEmpty()) {
+            val waiting = TextView(this).apply {
+                text = "waiting for others..."
+                setTextColor(Color.rgb(120, 126, 140))
+                textSize = 12f
+                setTypeface(typeface, android.graphics.Typeface.ITALIC)
+                maxLines = 1
+            }
+            participantsRow.addView(waiting, LinearLayout.LayoutParams(-2, -2))
+            return
+        }
+
+        val blockWidth = (resources.displayMetrics.widthPixels - dp(28)) / 3
         for ((peerId, name) in participants) {
             val state = peerMediaStates[peerId]
             val mic = if (state?.mic == true) "🎙️" else "🔇"
             val cam = if (state?.cam == true) "📷" else "📵"
-            parts.add("$name $mic$cam")
+            val block = TextView(this).apply {
+                text = "$name $mic$cam"
+                setTextColor(Color.rgb(180, 186, 200))
+                textSize = 12f
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(0, 0, dp(8), 0)
+            }
+            participantsRow.addView(block, LinearLayout.LayoutParams(blockWidth, -2))
         }
-        participantsLabel.text = "Participants (${parts.size}): " + parts.joinToString(" · ")
     }
 
     private fun sendChatFromInput() {
@@ -1440,7 +1744,9 @@ class NativeCallActivity : Activity(),
             NativeCallService.start(this)
             NativeIncomingCallListener.configure(this, currentRoom, currentUsername)
             registerProximity()
+            startFrameHealthMonitor()
         } else {
+            stopFrameHealthMonitor()
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             NativeCallService.stop(this)
             unregisterProximity()
@@ -1470,8 +1776,16 @@ class NativeCallActivity : Activity(),
     }
 
     private fun showJoinPanel() {
+        stopFrameHealthMonitor()
+        connectedPeerIds.clear()
+        hasRemoteVideo = false
+        fullscreen = false
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        updateVideoContainerLayout()
+        bottomSpacer.visibility = View.VISIBLE
         headerBar.visibility = View.GONE
         bottomContainer.visibility = View.GONE
+        hideLocalRenderer()
         previewControls.visibility = View.GONE
         reactionPicker.visibility = View.GONE
         chatExpanded = false
@@ -1485,6 +1799,86 @@ class NativeCallActivity : Activity(),
             inPreview -> "Preview..."
             cameraEnabled -> "Cam"
             else -> "Cam off"
+        }
+        updateAudioRouteButton()
+    }
+
+    private fun configureCallAudioRouting(defaultSpeakerphone: Boolean) {
+        val audioManager = getSystemService(AudioManager::class.java) ?: return
+        if (!audioRoutingConfigured) {
+            previousAudioMode = audioManager.mode
+            previousSpeakerphoneOn = audioManager.isSpeakerphoneOn
+            audioRoutingConfigured = true
+        }
+        volumeControlStream = AudioManager.STREAM_VOICE_CALL
+        speakerphoneEnabled = defaultSpeakerphone || !hasEarpieceRoute(audioManager)
+        try {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        } catch (_: Throwable) {}
+        applyAudioRoute()
+        updateAudioRouteButton()
+    }
+
+    private fun applyAudioRoute() {
+        val audioManager = getSystemService(AudioManager::class.java) ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val targetType = if (speakerphoneEnabled) {
+                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            } else {
+                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            }
+            val target = audioManager.availableCommunicationDevices.firstOrNull { it.type == targetType }
+            if (target != null) {
+                try { audioManager.setCommunicationDevice(target) } catch (_: Throwable) {}
+            } else if (speakerphoneEnabled) {
+                try { audioManager.clearCommunicationDevice() } catch (_: Throwable) {}
+            }
+        }
+        try { audioManager.isSpeakerphoneOn = speakerphoneEnabled } catch (_: Throwable) {}
+    }
+
+    private fun resetCallAudioRouting() {
+        if (!audioRoutingConfigured) return
+        val audioManager = getSystemService(AudioManager::class.java)
+        if (audioManager != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try { audioManager.clearCommunicationDevice() } catch (_: Throwable) {}
+            }
+            try { audioManager.isSpeakerphoneOn = previousSpeakerphoneOn } catch (_: Throwable) {}
+            try { audioManager.mode = previousAudioMode } catch (_: Throwable) {}
+        }
+        volumeControlStream = AudioManager.USE_DEFAULT_STREAM_TYPE
+        audioRoutingConfigured = false
+        speakerphoneEnabled = true
+        updateAudioRouteButton()
+    }
+
+    private fun updateAudioRouteButton() {
+        speakerButton?.apply {
+            text = if (speakerphoneEnabled) "Speaker" else "Earpiece"
+            isSelected = speakerphoneEnabled
+            isEnabled = canToggleAudioRoute()
+        }
+    }
+
+    private fun canToggleAudioRoute(): Boolean {
+        val audioManager = getSystemService(AudioManager::class.java) ?: return true
+        return hasSpeakerRoute(audioManager) && hasEarpieceRoute(audioManager)
+    }
+
+    private fun hasSpeakerRoute(audioManager: AudioManager): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.availableCommunicationDevices.any { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+        } else {
+            true
+        }
+    }
+
+    private fun hasEarpieceRoute(audioManager: AudioManager): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.availableCommunicationDevices.any { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
+        } else {
+            packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY)
         }
     }
 
@@ -1562,6 +1956,8 @@ class NativeCallActivity : Activity(),
         private const val STATE_USERNAME = "stateUsername"
         private const val FILE_CHUNK_SIZE = 16 * 1024
         private const val FILE_BUFFER_HIGH = 256L * 1024L
+        private const val FRAME_STALL_MS = 5000L
+        private const val FRAME_HEALTH_CHECK_MS = 3000L
         private const val GIPHY_API_KEY = "z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn"
         private const val GIPHY_LIMIT = 20
         private val REACTIONS = listOf("❤️", "😂", "🎉", "😮", "👏", "🤗")

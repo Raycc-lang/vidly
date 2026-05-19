@@ -1,6 +1,7 @@
 package org.raycc.vidly.native
 
 import android.content.Context
+import android.os.SystemClock
 import org.json.JSONObject
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
@@ -22,6 +23,7 @@ import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoCapturer
+import org.webrtc.VideoSink
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import org.webrtc.audio.JavaAudioDeviceModule
@@ -32,7 +34,8 @@ class NativeWebRtcClient(
     private val localRenderer: SurfaceViewRenderer,
     private val remoteRenderer: SurfaceViewRenderer,
     private val signaling: NativeSignalingClient,
-    private val status: (String) -> Unit
+    private val status: (String) -> Unit,
+    private val onRemoteVideo: (Boolean) -> Unit = {}
 ) {
     interface DataListener {
         fun onChatMessage(fromPeerId: String, fromUsername: String?, msg: JSONObject)
@@ -59,6 +62,12 @@ class NativeWebRtcClient(
     private var audioSource: AudioSource? = null
     private var localVideoTrack: VideoTrack? = null
     private var localAudioTrack: AudioTrack? = null
+    private var remoteVideoPeerId: String? = null
+    private var remoteVideoTrack: VideoTrack? = null
+    @Volatile private var remoteVideoFrameTimestampMs: Long = 0L
+    private val remoteVideoFrameSink = VideoSink {
+        remoteVideoFrameTimestampMs = SystemClock.elapsedRealtime()
+    }
     private var started = false
 
     // Logical state — does the local user want camera/mic to be sending?
@@ -123,7 +132,23 @@ class NativeWebRtcClient(
 
     fun onPeerLeft(peerId: String) {
         peers.remove(peerId)?.close()
-        if (peers.isEmpty()) remoteRenderer.clearImage()
+        if (remoteVideoPeerId == peerId) {
+            clearRemoteVideo()
+        } else if (peers.isEmpty()) {
+            remoteRenderer.clearImage()
+            onRemoteVideo(false)
+        }
+    }
+
+    fun onPeerVideoInactive(peerId: String) {
+        if (remoteVideoPeerId == peerId) clearRemoteVideo()
+    }
+
+    fun getRemoteVideoFrameAgeMs(): Long {
+        if (remoteVideoTrack == null) return Long.MAX_VALUE
+        val lastFrameAt = remoteVideoFrameTimestampMs
+        if (lastFrameAt == 0L) return Long.MAX_VALUE
+        return SystemClock.elapsedRealtime() - lastFrameAt
     }
 
     fun onSignal(from: String, payload: JSONObject) {
@@ -191,7 +216,6 @@ class NativeWebRtcClient(
 
     /** Cancel preview: stop the local video capture. Sender stays detached. */
     fun cancelCameraPreview() {
-        if (!cameraLive) return
         stopVideo()
         cameraLive = false
         broadcastMediaState()
@@ -239,7 +263,7 @@ class NativeWebRtcClient(
         stopAudio()
         cameraLive = false
         micLive = false
-        remoteRenderer.clearImage()
+        clearRemoteVideo()
     }
 
     fun dispose() {
@@ -281,6 +305,7 @@ class NativeWebRtcClient(
             .put("type", "media-state")
             .put("mic", micLive)
             .put("cam", cameraLive)
+            .put("video", cameraLive)
         sendChatJson(payload)
     }
 
@@ -346,6 +371,16 @@ class NativeWebRtcClient(
         surfaceHelper?.dispose()
         surfaceHelper = null
         localRenderer.clearImage()
+    }
+
+    private fun clearRemoteVideo() {
+        remoteVideoTrack?.removeSink(remoteVideoFrameSink)
+        remoteVideoTrack?.removeSink(remoteRenderer)
+        remoteVideoTrack = null
+        remoteVideoPeerId = null
+        remoteVideoFrameTimestampMs = 0L
+        remoteRenderer.clearImage()
+        onRemoteVideo(false)
     }
 
     private fun stopAudio() {
@@ -467,6 +502,7 @@ class NativeWebRtcClient(
                         .put("type", "media-state")
                         .put("mic", micLive)
                         .put("cam", cameraLive)
+                        .put("video", cameraLive)
                     runCatching {
                         val data = payload.toString().toByteArray(Charsets.UTF_8)
                         dc.send(DataChannel.Buffer(ByteBuffer.wrap(data), false))
@@ -519,8 +555,25 @@ class NativeWebRtcClient(
         override fun onTrack(transceiver: org.webrtc.RtpTransceiver?) {
             val track = transceiver?.receiver?.track()
             if (track is VideoTrack) {
+                val activePeerId = remoteVideoPeerId
+                if (activePeerId != null && activePeerId != peer.id) return
+                if (remoteVideoTrack === track) return
+                remoteVideoTrack?.removeSink(remoteVideoFrameSink)
+                remoteVideoTrack?.removeSink(remoteRenderer)
+                remoteVideoFrameTimestampMs = 0L
+                remoteVideoTrack = track
+                remoteVideoPeerId = peer.id
+                track.addSink(remoteVideoFrameSink)
                 track.addSink(remoteRenderer)
+                onRemoteVideo(true)
                 status("Remote video connected")
+            }
+        }
+
+        override fun onRemoveTrack(receiver: org.webrtc.RtpReceiver?) {
+            val track = receiver?.track()
+            if (track is VideoTrack && remoteVideoPeerId == peer.id && remoteVideoTrack === track) {
+                clearRemoteVideo()
             }
         }
 
