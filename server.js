@@ -205,6 +205,12 @@ wss.on('connection', (ws) => {
             // Store username from join message as well (backup for set-username)
             if (username) ws.username = username;
 
+            if (resumed) {
+                for (const { peerId } of existingPeers) {
+                    const peerWs = room.get(peerId);
+                    if (peerWs) send(peerWs, { type: 'peer-resumed', peerId: ws.peerId, username: ws.username || null });
+                }
+            }
             send(ws, { type: 'joined', roomId, peerId: ws.peerId, peers: existingPeers, resumed });
             if (!resumed) {
                 for (const { peerId } of existingPeers) {

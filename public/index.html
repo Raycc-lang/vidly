@@ -1096,6 +1096,10 @@ function isPeerConnectionAlive(peer) {
 function markVideoStalled(peer, stalled) {
     if (!peer?.videoEl || !peer.tileEl) return;
     if (stalled) {
+        if (peer.videoEl.dataset.stalled !== 'true') {
+            const name = peer.username || 'Peer';
+            toast(`${name}'s video feed seems to have cut out`, 'warn');
+        }
         peer.videoEl.dataset.stalled = 'true';
         peer.tileEl.classList.remove('placeholder');
         showStallOverlay(peer.tileEl);
@@ -1584,6 +1588,12 @@ function handleSignaling(msg) {
             }
             ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false, msg.username);
             toast((msg.username || 'Someone') + ' joined the call', 'success');
+            updateEmptyState();
+            break;
+
+        case 'peer-resumed':
+            removePeer(msg.peerId);
+            ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false, msg.username);
             updateEmptyState();
             break;
 
@@ -2082,6 +2092,7 @@ function attachDataChannel(peer, dc) {
             mic: !!micEnabled,
             cam: !!camEnabled,
             video: !!(camEnabled || isSharing),
+            screen: !!isSharing,
             username: myUsername
         });
     };
@@ -2098,9 +2109,10 @@ function attachDataChannel(peer, dc) {
             peer.mediaState = {
                 mic: !!msg.mic,
                 cam: !!msg.cam,
-                video: Object.prototype.hasOwnProperty.call(msg, 'video') ? !!msg.video : !!msg.cam
+                video: Object.prototype.hasOwnProperty.call(msg, 'video') ? !!msg.video : !!msg.cam,
+                screen: !!msg.screen
             };
-            updatePeerStatusIndicator(peer.id, peer.mediaState.mic, peer.mediaState.cam);
+            updatePeerStatusIndicator(peer.id, peer.mediaState.mic, peer.mediaState.cam, peer.mediaState.screen);
             if (!peer.mediaState.video && activeRemoteVideoPeerId === peer.id) {
                 clearActiveRemoteVideo(peer.id, activeRemoteVideoTrack, peer.videoEl, peer.tileEl, peer.remoteStream);
             }
@@ -2594,7 +2606,7 @@ function addReactionMessage(kind, emoji, ts, senderName, fromPeerId) {
 }
 
 // Update the mic/cam indicator inside a peer's tile-label.
-function updatePeerStatusIndicator(peerId, mic, cam) {
+function updatePeerStatusIndicator(peerId, mic, cam, screen) {
     const peer = peers.get(peerId);
     if (!peer || !peer.tileEl) return;
     const label = peer.tileEl.querySelector(".tile-label");
@@ -2605,7 +2617,7 @@ function updatePeerStatusIndicator(peerId, mic, cam) {
         status.className = "peer-status";
         label.appendChild(status);
     }
-    status.textContent = (mic ? "🎙️" : "🔇") + (cam ? "📷" : "📵");
+    status.textContent = (mic ? "🎙️" : "🔇") + (cam ? "📷" : "📵") + (screen ? "🖥️" : "");
 }
 
 // Broadcast our current mic/cam state to all peers (so they can update indicators).
@@ -2615,6 +2627,7 @@ function broadcastLocalMediaState() {
         mic: !!micEnabled,
         cam: !!camEnabled,
         video: !!(camEnabled || isSharing),
+        screen: !!isSharing,
         username: myUsername
     });
 }
