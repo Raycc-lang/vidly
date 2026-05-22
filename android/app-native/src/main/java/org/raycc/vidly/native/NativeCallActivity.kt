@@ -19,6 +19,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.Uri
@@ -123,6 +124,7 @@ class NativeCallActivity : Activity(),
     private var sensorManager: SensorManager? = null
     private var proximitySensor: Sensor? = null
     private var inPip = false
+    private var isProximityRegistered = false
     private var fullscreen = false
 
     // State
@@ -158,12 +160,22 @@ class NativeCallActivity : Activity(),
     private var audioRoutingConfigured = false
     private var previousAudioMode = AudioManager.MODE_NORMAL
     private var previousSpeakerphoneOn = false
+    private var preferSpeakerphoneWhenNoExternal = true
+    private val audioDeviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+            runOnUiThread { refreshCallAudioRouteForDevices() }
+        }
+
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+            runOnUiThread { refreshCallAudioRouteForDevices() }
+        }
+    }
 
     // Participants: peerId -> username
     private val participants = LinkedHashMap<String, String>()
 
     // Peer mic/cam status, keyed by peerId.
-    private data class PeerMediaState(val mic: Boolean, val cam: Boolean)
+    private data class PeerMediaState(val mic: Boolean, val cam: Boolean, val screen: Boolean = false)
     private val peerMediaStates = HashMap<String, PeerMediaState>()
 
     // File transfer state
@@ -254,7 +266,7 @@ class NativeCallActivity : Activity(),
             NativeCallService.stop(this)
             callActive = false
         }
-        unregisterProximity()
+        updateProximitySensorState()
         http.dispatcher.executorService.shutdown()
         super.onDestroy()
     }
@@ -320,6 +332,7 @@ class NativeCallActivity : Activity(),
         connectedPeerIds.remove(peerId)
         if (participants.isEmpty()) hasRemoteVideo = false
         refreshParticipants()
+        updateProximitySensorState()
         updateHeaderStatus("${username ?: "Peer"} left")
     }
 
@@ -357,11 +370,13 @@ class NativeCallActivity : Activity(),
                 "media-state" -> {
                     val mic = msg.optBoolean("mic", false)
                     val cam = msg.optBoolean("cam", false)
-                    peerMediaStates[fromPeerId] = PeerMediaState(mic, cam)
+                    val screen = msg.optBoolean("screen", false)
+                    peerMediaStates[fromPeerId] = PeerMediaState(mic, cam, screen)
                     if (msg.has("video") && !msg.optBoolean("video", false)) {
                         rtc?.onPeerVideoInactive(fromPeerId)
                     }
                     refreshParticipants()
+                    updateProximitySensorState()
                 }
                 "file-offer" -> {
                     val file = msg.optJSONObject("file") ?: return@runOnUiThread
@@ -677,6 +692,7 @@ class NativeCallActivity : Activity(),
                     return@setOnClickListener
                 }
                 speakerphoneEnabled = !speakerphoneEnabled
+                preferSpeakerphoneWhenNoExternal = speakerphoneEnabled
                 applyAudioRoute()
                 updateAudioRouteButton()
             }
@@ -1226,8 +1242,9 @@ class NativeCallActivity : Activity(),
             val state = peerMediaStates[peerId]
             val mic = if (state?.mic == true) "🎙️" else "🔇"
             val cam = if (state?.cam == true) "📷" else "📵"
+            val screen = if (state?.screen == true) " 🖥️" else ""
             val block = TextView(this).apply {
-                text = "$name $mic$cam"
+                text = "$name $mic$cam$screen"
                 setTextColor(Color.rgb(180, 186, 200))
                 textSize = 12f
                 maxLines = 1
@@ -1743,13 +1760,13 @@ class NativeCallActivity : Activity(),
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             NativeCallService.start(this)
             NativeIncomingCallListener.configure(this, currentRoom, currentUsername)
-            registerProximity()
+            updateProximitySensorState()
             startFrameHealthMonitor()
         } else {
             stopFrameHealthMonitor()
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             NativeCallService.stop(this)
-            unregisterProximity()
+            updateProximitySensorState()
         }
     }
 
@@ -1809,9 +1826,13 @@ class NativeCallActivity : Activity(),
             previousAudioMode = audioManager.mode
             previousSpeakerphoneOn = audioManager.isSpeakerphoneOn
             audioRoutingConfigured = true
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                try { audioManager.registerAudioDeviceCallback(audioDeviceCallback, Handler(Looper.getMainLooper())) } catch (_: Throwable) {}
+            }
         }
         volumeControlStream = AudioManager.STREAM_VOICE_CALL
-        speakerphoneEnabled = defaultSpeakerphone || !hasEarpieceRoute(audioManager)
+        preferSpeakerphoneWhenNoExternal = defaultSpeakerphone
+        speakerphoneEnabled = shouldUseSpeakerphone(audioManager)
         try {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         } catch (_: Throwable) {}
@@ -1821,26 +1842,31 @@ class NativeCallActivity : Activity(),
 
     private fun applyAudioRoute() {
         val audioManager = getSystemService(AudioManager::class.java) ?: return
+        val externalRoute = preferredExternalAudioRoute(audioManager)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val targetType = if (speakerphoneEnabled) {
-                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-            } else {
-                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            val target = externalRoute ?: audioManager.availableCommunicationDevices.firstOrNull {
+                it.type == if (speakerphoneEnabled) {
+                    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                } else {
+                    AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                }
             }
-            val target = audioManager.availableCommunicationDevices.firstOrNull { it.type == targetType }
             if (target != null) {
                 try { audioManager.setCommunicationDevice(target) } catch (_: Throwable) {}
             } else if (speakerphoneEnabled) {
                 try { audioManager.clearCommunicationDevice() } catch (_: Throwable) {}
             }
         }
-        try { audioManager.isSpeakerphoneOn = speakerphoneEnabled } catch (_: Throwable) {}
+        try { audioManager.isSpeakerphoneOn = externalRoute == null && speakerphoneEnabled } catch (_: Throwable) {}
     }
 
     private fun resetCallAudioRouting() {
         if (!audioRoutingConfigured) return
         val audioManager = getSystemService(AudioManager::class.java)
         if (audioManager != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                try { audioManager.unregisterAudioDeviceCallback(audioDeviceCallback) } catch (_: Throwable) {}
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 try { audioManager.clearCommunicationDevice() } catch (_: Throwable) {}
             }
@@ -1850,20 +1876,40 @@ class NativeCallActivity : Activity(),
         volumeControlStream = AudioManager.USE_DEFAULT_STREAM_TYPE
         audioRoutingConfigured = false
         speakerphoneEnabled = true
+        preferSpeakerphoneWhenNoExternal = true
         updateAudioRouteButton()
     }
 
     private fun updateAudioRouteButton() {
         speakerButton?.apply {
-            text = if (speakerphoneEnabled) "Speaker" else "Earpiece"
-            isSelected = speakerphoneEnabled
-            isEnabled = canToggleAudioRoute()
+            val audioManager = getSystemService(AudioManager::class.java)
+            val usingExternalAudio = audioManager != null && hasExternalAudioRoute(audioManager)
+            text = when {
+                usingExternalAudio -> "Headset"
+                speakerphoneEnabled -> "Speaker"
+                else -> "Earpiece"
+            }
+            isSelected = speakerphoneEnabled && !usingExternalAudio
+            isEnabled = !usingExternalAudio && canToggleAudioRoute()
         }
+    }
+
+    private fun refreshCallAudioRouteForDevices() {
+        if (!audioRoutingConfigured) return
+        val audioManager = getSystemService(AudioManager::class.java) ?: return
+        speakerphoneEnabled = shouldUseSpeakerphone(audioManager)
+        applyAudioRoute()
+        updateAudioRouteButton()
+    }
+
+    private fun shouldUseSpeakerphone(audioManager: AudioManager): Boolean {
+        if (hasExternalAudioRoute(audioManager)) return false
+        return preferSpeakerphoneWhenNoExternal || !hasEarpieceRoute(audioManager)
     }
 
     private fun canToggleAudioRoute(): Boolean {
         val audioManager = getSystemService(AudioManager::class.java) ?: return true
-        return hasSpeakerRoute(audioManager) && hasEarpieceRoute(audioManager)
+        return !hasExternalAudioRoute(audioManager) && hasSpeakerRoute(audioManager) && hasEarpieceRoute(audioManager)
     }
 
     private fun hasSpeakerRoute(audioManager: AudioManager): Boolean {
@@ -1880,6 +1926,30 @@ class NativeCallActivity : Activity(),
         } else {
             packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY)
         }
+    }
+
+    private fun hasExternalAudioRoute(audioManager: AudioManager): Boolean {
+        return preferredExternalAudioRoute(audioManager) != null
+    }
+
+    private fun preferredExternalAudioRoute(audioManager: AudioManager): AudioDeviceInfo? {
+        val devices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.availableCommunicationDevices
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+        } else {
+            emptyList()
+        }
+        return devices.firstOrNull { isExternalAudioRoute(it.type) }
+    }
+
+    private fun isExternalAudioRoute(type: Int): Boolean {
+        return type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+            type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+            type == AudioDeviceInfo.TYPE_USB_DEVICE
     }
 
     private fun loadTurnConfig(client: NativeWebRtcClient) {
@@ -1925,13 +1995,30 @@ class NativeCallActivity : Activity(),
     }
 
     private fun registerProximity() {
+        if (isProximityRegistered) return
         val sensor = proximitySensor ?: return
         sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+        isProximityRegistered = true
     }
 
     private fun unregisterProximity() {
+        if (!isProximityRegistered) return
         sensorManager?.unregisterListener(this)
         proximityWakeLock?.takeIf { it.isHeld }?.release()
+        isProximityRegistered = false
+    }
+
+    private fun updateProximitySensorState() {
+        if (!callActive) {
+            unregisterProximity()
+            return
+        }
+        val isAnyRemoteSharingScreen = peerMediaStates.values.any { it.screen }
+        if (isAnyRemoteSharingScreen) {
+            unregisterProximity()
+        } else {
+            registerProximity()
+        }
     }
 
     override fun onSensorChanged(event: SensorEvent) {
