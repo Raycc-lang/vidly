@@ -5,3 +5,4 @@ android/app/build/
 android/local.properties
 android/app-native/build/
 android/app-webview/build/
+prompts

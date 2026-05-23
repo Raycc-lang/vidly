@@ -63,7 +63,9 @@ class NativeWebRtcClient(
     private var localVideoTrack: VideoTrack? = null
     private var localAudioTrack: AudioTrack? = null
     private var remoteVideoPeerId: String? = null
-    private var remoteVideoTrack: VideoTrack? = null
+    private var remoteCameraTrack: VideoTrack? = null
+    private var remoteScreenTrack: VideoTrack? = null
+    private var renderedRemoteVideoTrack: VideoTrack? = null
     @Volatile private var remoteVideoFrameTimestampMs: Long = 0L
     private val remoteVideoFrameSink = VideoSink {
         remoteVideoFrameTimestampMs = SystemClock.elapsedRealtime()
@@ -145,10 +147,14 @@ class NativeWebRtcClient(
     }
 
     fun getRemoteVideoFrameAgeMs(): Long {
-        if (remoteVideoTrack == null) return Long.MAX_VALUE
+        if (renderedRemoteVideoTrack == null) return Long.MAX_VALUE
         val lastFrameAt = remoteVideoFrameTimestampMs
         if (lastFrameAt == 0L) return Long.MAX_VALUE
         return SystemClock.elapsedRealtime() - lastFrameAt
+    }
+
+    fun restartIce() {
+        peers.values.forEach { restartIce(it) }
     }
 
     fun onSignal(from: String, payload: JSONObject) {
@@ -374,13 +380,66 @@ class NativeWebRtcClient(
     }
 
     private fun clearRemoteVideo() {
-        remoteVideoTrack?.removeSink(remoteVideoFrameSink)
-        remoteVideoTrack?.removeSink(remoteRenderer)
-        remoteVideoTrack = null
+        detachRenderedRemoteVideo()
+        remoteCameraTrack?.removeSink(remoteVideoFrameSink)
+        remoteCameraTrack?.removeSink(remoteRenderer)
+        remoteScreenTrack?.removeSink(remoteVideoFrameSink)
+        remoteScreenTrack?.removeSink(remoteRenderer)
+        remoteCameraTrack = null
+        remoteScreenTrack = null
         remoteVideoPeerId = null
         remoteVideoFrameTimestampMs = 0L
         remoteRenderer.clearImage()
         onRemoteVideo(false)
+    }
+
+    private fun detachRenderedRemoteVideo() {
+        renderedRemoteVideoTrack?.removeSink(remoteVideoFrameSink)
+        renderedRemoteVideoTrack?.removeSink(remoteRenderer)
+        renderedRemoteVideoTrack = null
+    }
+
+    private fun updateRenderedRemoteVideo() {
+        val track = remoteScreenTrack ?: remoteCameraTrack
+        if (renderedRemoteVideoTrack === track) return
+        detachRenderedRemoteVideo()
+        remoteVideoFrameTimestampMs = 0L
+        renderedRemoteVideoTrack = track
+        if (track == null) {
+            remoteRenderer.clearImage()
+            onRemoteVideo(false)
+            if (remoteCameraTrack == null && remoteScreenTrack == null) remoteVideoPeerId = null
+            return
+        }
+        track.addSink(remoteVideoFrameSink)
+        track.addSink(remoteRenderer)
+        onRemoteVideo(true)
+        status(if (track === remoteScreenTrack) "Remote screen connected" else "Remote video connected")
+    }
+
+    private fun removeRemoteVideoTrack(track: VideoTrack) {
+        var changed = false
+        if (remoteCameraTrack === track) {
+            remoteCameraTrack = null
+            changed = true
+        }
+        if (remoteScreenTrack === track) {
+            remoteScreenTrack = null
+            changed = true
+        }
+        if (changed) updateRenderedRemoteVideo()
+    }
+
+    private fun assignRemoteVideoTrack(peer: Peer, track: VideoTrack) {
+        if (remoteCameraTrack === track || remoteScreenTrack === track) return
+        if (peer.remoteScreenLive && !peer.remoteCameraLive) {
+            if (remoteScreenTrack == null) remoteScreenTrack = track else remoteCameraTrack = track
+        } else if (peer.remoteScreenLive && peer.remoteCameraLive) {
+            if (remoteCameraTrack == null) remoteCameraTrack = track else remoteScreenTrack = track
+        } else {
+            if (remoteCameraTrack == null) remoteCameraTrack = track else remoteScreenTrack = track
+        }
+        updateRenderedRemoteVideo()
     }
 
     private fun stopAudio() {
@@ -438,6 +497,11 @@ class NativeWebRtcClient(
                 status("Offer failed: $error")
             }
         }, MediaConstraints())
+    }
+
+    private fun restartIce(peer: Peer) {
+        try { peer.pc.restartIce() } catch (_: Throwable) {}
+        makeOffer(peer)
     }
 
     private fun makeAnswer(peer: Peer) {
@@ -517,6 +581,20 @@ class NativeWebRtcClient(
                 val json = runCatching { JSONObject(text) }.getOrNull() ?: return
                 val sender = json.optString("username").takeIf { it.isNotBlank() }
                 if (sender != null) peer.username = sender
+                if (json.optString("type") == "media-state") {
+                    peer.remoteCameraLive = json.optBoolean("cam", false)
+                    peer.remoteScreenLive = json.optBoolean("screen", false)
+                    val remoteVideoLive = if (json.has("video")) {
+                        json.optBoolean("video", false)
+                    } else {
+                        peer.remoteCameraLive || peer.remoteScreenLive
+                    }
+                    if (!remoteVideoLive && remoteVideoPeerId == peer.id) {
+                        clearRemoteVideo()
+                    } else if (!peer.remoteScreenLive && remoteScreenTrack != null && remoteVideoPeerId == peer.id) {
+                        removeRemoteVideoTrack(remoteScreenTrack!!)
+                    }
+                }
                 dataListener?.onChatMessage(peer.id, sender ?: peer.username, json)
             }
         })
@@ -557,23 +635,15 @@ class NativeWebRtcClient(
             if (track is VideoTrack) {
                 val activePeerId = remoteVideoPeerId
                 if (activePeerId != null && activePeerId != peer.id) return
-                if (remoteVideoTrack === track) return
-                remoteVideoTrack?.removeSink(remoteVideoFrameSink)
-                remoteVideoTrack?.removeSink(remoteRenderer)
-                remoteVideoFrameTimestampMs = 0L
-                remoteVideoTrack = track
                 remoteVideoPeerId = peer.id
-                track.addSink(remoteVideoFrameSink)
-                track.addSink(remoteRenderer)
-                onRemoteVideo(true)
-                status("Remote video connected")
+                assignRemoteVideoTrack(peer, track)
             }
         }
 
         override fun onRemoveTrack(receiver: org.webrtc.RtpReceiver?) {
             val track = receiver?.track()
-            if (track is VideoTrack && remoteVideoPeerId == peer.id && remoteVideoTrack === track) {
-                clearRemoteVideo()
+            if (track is VideoTrack && remoteVideoPeerId == peer.id) {
+                removeRemoteVideoTrack(track)
             }
         }
 
@@ -586,14 +656,12 @@ class NativeWebRtcClient(
                 }
                 PeerConnection.IceConnectionState.DISCONNECTED -> {
                     status("Reconnecting...")
-                    try { peer.pc.restartIce() } catch (_: Throwable) {}
-                    if (!peer.polite) makeOffer(peer)
+                    restartIce(peer)
                     dataListener?.onPeerConnectionStateChanged(peer.id, false)
                 }
                 PeerConnection.IceConnectionState.FAILED -> {
                     status("ICE failed")
-                    try { peer.pc.restartIce() } catch (_: Throwable) {}
-                    if (!peer.polite) makeOffer(peer)
+                    restartIce(peer)
                     dataListener?.onPeerConnectionStateChanged(peer.id, false)
                 }
                 else -> Unit
@@ -639,6 +707,8 @@ class NativeWebRtcClient(
         var ignoreOffer = false
         var audioSender: RtpSender? = null
         var videoSender: RtpSender? = null
+        var remoteCameraLive = false
+        var remoteScreenLive = false
         var chatChannel: DataChannel? = null
         var fileChannel: DataChannel? = null
 

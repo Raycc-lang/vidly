@@ -177,7 +177,7 @@
   }
   .tile video {
     position: absolute; inset: 0; width: 100%; height: 100%;
-    object-fit: cover; background: #000;
+    object-fit: contain; background: #000;
   }
   .tile.placeholder::after {
     content: "Waiting for video…";
@@ -239,7 +239,7 @@
   #localTile.dragging { cursor: grabbing; transition: none !important; }
   #localTile:not(.dragging) { transition: right .2s ease, bottom .2s ease; }
   #localTile video {
-    width: 100%; height: 100%; object-fit: cover;
+    width: 100%; height: 100%; object-fit: contain;
     transform: scaleX(-1); /* mirror */
   }
   #localTile.screensharing video { transform: none; }
@@ -1046,6 +1046,10 @@ function clearActiveRemoteVideo(peerId, track, videoEl, tileEl, remoteStream) {
     if (peerId && activeRemoteVideoPeerId && activeRemoteVideoPeerId !== peerId) return;
     if (track && remoteStream) {
         try { remoteStream.removeTrack(track); } catch {}
+    } else if (remoteStream) {
+        for (const videoTrack of remoteStream.getVideoTracks()) {
+            try { remoteStream.removeTrack(videoTrack); } catch {}
+        }
     }
     activeRemoteVideoTrack = null;
     activeRemoteVideoPeerId = null;
@@ -1067,7 +1071,55 @@ function clearActiveRemoteVideo(peerId, track, videoEl, tileEl, remoteStream) {
             peer.lastVideoFrameTime = null;
             peer.videoTrackStartedAt = null;
             peer.videoFrameTrack = null;
+            if (!track || peer.remoteCameraTrack === track) peer.remoteCameraTrack = null;
+            if (!track || peer.remoteScreenTrack === track) peer.remoteScreenTrack = null;
         }
+    }
+}
+
+function classifyRemoteVideoTrack(peer, track) {
+    if (peer.remoteCameraTrack === track) return 'camera';
+    if (peer.remoteScreenTrack === track) return 'screen';
+    if (peer.mediaState?.screen && (!peer.mediaState.cam || peer.remoteCameraTrack)) return 'screen';
+    return peer.remoteCameraTrack ? 'screen' : 'camera';
+}
+
+function selectRemoteVideoTrack(peer) {
+    return peer.remoteScreenTrack || peer.remoteCameraTrack || null;
+}
+
+function renderRemoteVideoTrack(peer) {
+    const track = selectRemoteVideoTrack(peer);
+    if (!track) {
+        clearActiveRemoteVideo(peer.id, null, peer.videoEl, peer.tileEl, peer.remoteStream);
+        return;
+    }
+    for (const oldTrack of peer.remoteStream.getVideoTracks()) {
+        if (oldTrack !== track) {
+            try { peer.remoteStream.removeTrack(oldTrack); } catch {}
+        }
+    }
+    if (!peer.remoteStream.getTracks().includes(track)) {
+        peer.remoteStream.addTrack(track);
+    }
+    activeRemoteVideoPeerId = peer.id;
+    activeRemoteVideoTrack = track;
+    startRemoteFrameTracking(peer, track);
+    peer.videoEl.srcObject = peer.remoteStream;
+    peer.videoEl.style.display = '';
+    peer.tileEl.classList.remove('placeholder');
+    markVideoStalled(peer, false);
+    peer.videoEl.play().catch(() => {});
+}
+
+function removeRemoteVideoTrack(peer, track) {
+    if (peer.remoteCameraTrack === track) peer.remoteCameraTrack = null;
+    if (peer.remoteScreenTrack === track) peer.remoteScreenTrack = null;
+    try { peer.remoteStream.removeTrack(track); } catch {}
+    if (activeRemoteVideoTrack === track) {
+        activeRemoteVideoTrack = null;
+        activeRemoteVideoPeerId = null;
+        renderRemoteVideoTrack(peer);
     }
 }
 
@@ -1224,13 +1276,12 @@ function confirmCamera() {
         setMixerMicTrack(newAudioTrack);
     }
     for (const peer of peers.values()) {
-        const videoSender = findSenderByKind(peer.pc, 'video');
         const audioSender = findSenderByKind(peer.pc, 'audio');
 
-        if (videoSender && newVideoTrack) {
-            try { videoSender.replaceTrack(newVideoTrack); } catch {}
-        } else if (!videoSender && newVideoTrack) {
-            try { peer.pc.addTrack(newVideoTrack, localStream); } catch {}
+        if (peer.cameraSender && newVideoTrack) {
+            try { peer.cameraSender.replaceTrack(newVideoTrack); } catch {}
+        } else if (!peer.cameraSender && newVideoTrack) {
+            try { peer.cameraSender = peer.pc.addTrack(newVideoTrack, localStream); } catch {}
         }
         if (!audioMixer) {
             if (audioSender && newAudioTrack) {
@@ -1633,12 +1684,15 @@ function ensurePeer(peerId, polite, createDC, username) {
         id: peerId,
         pc, dc: null, fileDc: null, polite,
         makingOffer: false, ignoreOffer: false,
+        cameraSender: null, screenSender: null,
         iceRestartTimer: null,
         videoEl, tileEl, remoteStream, dot,
         username: username || null,
         lastVideoFrameTime: null,
         videoTrackStartedAt: null,
         videoFrameTrack: null,
+        remoteCameraTrack: null,
+        remoteScreenTrack: null,
         mediaState: null
     };
     peers.set(peerId, peer);
@@ -1650,15 +1704,24 @@ function ensurePeer(peerId, polite, createDC, username) {
     });
 
     // Add our local tracks to the connection.
+    const activeCameraTrack = getActiveCameraTrack();
+    if (activeCameraTrack) {
+        peer.cameraSender = pc.addTrack(activeCameraTrack, localStream || cameraStream || new MediaStream([activeCameraTrack]));
+    }
     if (localStream) {
-        for (const track of localStream.getTracks()) {
-            pc.addTrack(track, localStream);
-        }
+        const audioTrack = localStream.getAudioTracks()[0];
+        if (audioTrack) pc.addTrack(audioTrack, localStream);
     }
     // Also add mic-only stream if camera is off but mic is on.
     if (micStream) {
         for (const track of micStream.getTracks()) {
             pc.addTrack(track, micStream);
+        }
+    }
+    if (isSharing && screenStream) {
+        const screenTrack = screenStream.getVideoTracks()[0];
+        if (screenTrack && screenTrack.readyState !== 'ended') {
+            try { peer.screenSender = pc.addTrack(screenTrack, screenStream); } catch (e) { console.warn(e); }
         }
     }
     // Keep an audio sender available even when mic/camera are off. Screen audio
@@ -1690,29 +1753,21 @@ function ensurePeer(peerId, polite, createDC, username) {
                 console.log('[WebRTC] ignoring additional remote video from', peerId);
                 return;
             }
-            // Remove old video track if peer re-enabled camera
-            const existing = remoteStream.getVideoTracks()[0];
-            if (existing) {
-                try { remoteStream.removeTrack(existing); } catch {}
-            }
-            activeRemoteVideoPeerId = peerId;
-            activeRemoteVideoTrack = track;
-            startRemoteFrameTracking(peer, track);
+            const role = classifyRemoteVideoTrack(peer, track);
+            if (role === 'screen') peer.remoteScreenTrack = track;
+            else peer.remoteCameraTrack = track;
+            renderRemoteVideoTrack(peer);
+        } else {
+            remoteStream.addTrack(track);
+
+            // Always update srcObject — both for video and audio tracks.
+            // If only audio arrives first, this bootstraps the video element
+            // so it's ready when video arrives later (Chrome autoplay fix).
+            videoEl.srcObject = remoteStream;
+            videoEl.style.display = '';
+            videoEl.play().catch(() => {});
+            tileEl.classList.remove('placeholder');
         }
-
-        remoteStream.addTrack(track);
-
-        // Always update srcObject — both for video and audio tracks.
-        // If only audio arrives first, this bootstraps the video element
-        // so it's ready when video arrives later (Chrome autoplay fix).
-        videoEl.srcObject = remoteStream;
-        videoEl.style.display = '';
-
-        // Explicit play() — required by Firefox for dynamically assigned streams,
-        // and helps Chrome in edge cases.
-        videoEl.play().catch(() => {});
-
-        tileEl.classList.remove('placeholder');
 
         if (track.kind === 'video') {
             // Track mute can mean either intentional camera-off or a bandwidth stall.
@@ -1724,20 +1779,12 @@ function ensurePeer(peerId, polite, createDC, username) {
                     return;
                 }
                 peer.lastVideoFrameTime = null;
-                markVideoStalled(peer, true);
+                if (activeRemoteVideoTrack === track) markVideoStalled(peer, true);
             };
             track.onunmute = () => {
                 console.log('[WebRTC] video track un-muted');
                 if (activeRemoteVideoPeerId && activeRemoteVideoPeerId !== peerId) return;
-                activeRemoteVideoPeerId = peerId;
-                activeRemoteVideoTrack = track;
-                startRemoteFrameTracking(peer, track);
-                if (!remoteStream.getTracks().includes(track)) remoteStream.addTrack(track);
-                videoEl.srcObject = remoteStream;
-                videoEl.style.display = '';
-                markVideoStalled(peer, false);
-                tileEl.classList.remove('placeholder');
-                videoEl.play().catch(() => {});
+                renderRemoteVideoTrack(peer);
             };
 
             if (track.muted) {
@@ -1750,9 +1797,7 @@ function ensurePeer(peerId, polite, createDC, username) {
         track.onended = () => {
             console.log('[WebRTC] track ended:', track.kind);
             try { remoteStream.removeTrack(track); } catch {}
-            if (track.kind === 'video' && activeRemoteVideoTrack === track) {
-                clearActiveRemoteVideo(peerId, track, videoEl, tileEl, remoteStream);
-            }
+            if (track.kind === 'video') removeRemoteVideoTrack(peer, track);
         };
     };
 
@@ -1873,6 +1918,15 @@ function getActiveAudioTrack() {
     if (micTrack && micTrack.readyState !== 'ended') return micTrack;
     const localAudioTrack = localStream && localStream.getAudioTracks()[0];
     if (localAudioTrack && localAudioTrack.readyState !== 'ended') return localAudioTrack;
+    return null;
+}
+
+function getActiveCameraTrack() {
+    if (!camEnabled) return null;
+    const cameraTrack = cameraStream && cameraStream.getVideoTracks()[0];
+    if (cameraTrack && cameraTrack.readyState !== 'ended') return cameraTrack;
+    const localVideoTrack = localStream && localStream.getVideoTracks()[0];
+    if (localVideoTrack && localVideoTrack.readyState !== 'ended') return localVideoTrack;
     return null;
 }
 
@@ -2114,7 +2168,9 @@ function attachDataChannel(peer, dc) {
             };
             updatePeerStatusIndicator(peer.id, peer.mediaState.mic, peer.mediaState.cam, peer.mediaState.screen);
             if (!peer.mediaState.video && activeRemoteVideoPeerId === peer.id) {
-                clearActiveRemoteVideo(peer.id, activeRemoteVideoTrack, peer.videoEl, peer.tileEl, peer.remoteStream);
+                clearActiveRemoteVideo(peer.id, null, peer.videoEl, peer.tileEl, peer.remoteStream);
+            } else if (!peer.mediaState.screen && peer.remoteScreenTrack) {
+                removeRemoteVideoTrack(peer, peer.remoteScreenTrack);
             }
         } else if (msg.type && msg.type.startsWith('file-')) {
             handleFileControl(peer, msg);
@@ -3019,8 +3075,7 @@ $('camBtn').onclick = () => {
         if (localStream) localStream.getVideoTracks().forEach(t => t.stop());
         // Stop sending video without renegotiating.
         for (const peer of peers.values()) {
-            const sender = findSenderByKind(peer.pc, 'video');
-            if (sender) try { sender.replaceTrack(null); } catch {}
+            if (peer.cameraSender) try { peer.cameraSender.replaceTrack(null); } catch {}
         }
         // Keep audio if mic is on
         if (micEnabled && micStream) {
@@ -3060,13 +3115,13 @@ async function startScreenShare() {
     try { screenTrack.contentHint = 'detail'; } catch {}
     try { await screenTrack.applyConstraints({ frameRate: { max: 30 } }); } catch {}
 
-    // Replace the outgoing video track for every peer.
+    // Publish screen share as a separate video sender. Keeping camera on its own
+    // sender forces renegotiation and lets receivers initialize a distinct decoder.
     for (const peer of peers.values()) {
-        const sender = findSenderByKind(peer.pc, 'video');
-        if (sender) {
-            try { await sender.replaceTrack(screenTrack); } catch (e) { console.warn(e); }
+        if (peer.screenSender) {
+            try { await peer.screenSender.replaceTrack(screenTrack); } catch (e) { console.warn(e); }
         } else {
-            try { peer.pc.addTrack(screenTrack, screenStream); } catch (e) { console.warn(e); }
+            try { peer.screenSender = peer.pc.addTrack(screenTrack, screenStream); } catch (e) { console.warn(e); }
         }
     }
 
@@ -3150,7 +3205,13 @@ async function stopScreenShare() {
         screenAudioTrack = null;
         await destroyAudioMixer();
     }
+    for (const peer of peers.values()) {
+        if (!peer.screenSender) continue;
+        try { peer.pc.removeTrack(peer.screenSender); } catch (e) { console.warn(e); }
+        peer.screenSender = null;
+    }
     if (screenStream) {
+        screenStream.getVideoTracks().forEach(t => { t.onended = null; });
         screenStream.getTracks().forEach(t => t.stop());
         screenStream = null;
     }
@@ -3162,15 +3223,7 @@ async function stopScreenShare() {
             camEnabled = false;
             cameraStream = null;
         }
-        const activeCamTrack = cameraStream && cameraStream.getVideoTracks()[0];
-        for (const peer of peers.values()) {
-            const sender = findSenderByKind(peer.pc, 'video');
-            if (sender && activeCamTrack) {
-                try { await sender.replaceTrack(activeCamTrack); } catch (e) { console.warn(e); }
-            } else if (sender) {
-                try { sender.replaceTrack(null); } catch (e) { console.warn(e); }
-            }
-        }
+        const activeCamTrack = getActiveCameraTrack();
         if (activeCamTrack) {
             localVideo.srcObject = cameraStream;
             localTile.style.display = '';
@@ -3180,11 +3233,7 @@ async function stopScreenShare() {
             hideLocalVideoTile();
         }
     } else {
-        // Camera was off — stop sending video, hide placeholder tile
-        for (const peer of peers.values()) {
-            const sender = findSenderByKind(peer.pc, 'video');
-            if (sender) try { sender.replaceTrack(null); } catch (e) { console.warn(e); }
-        }
+        // Camera was off — removing the screen sender leaves us with no outgoing video.
         hideLocalVideoTile();
     }
     localTile.classList.remove('screensharing');

@@ -29,6 +29,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.text.InputType
 import android.text.TextUtils
@@ -141,6 +142,7 @@ class NativeCallActivity : Activity(),
     private var hasRemoteVideo = false
     private var headerStatus = "Native Vidly"
     private var videoStalled = false
+    private var lastIceRestartAtMs = 0L
     private val connectedPeerIds = HashSet<String>()
     private val frameHealthHandler = Handler(Looper.getMainLooper())
     private val frameHealthRunnable = object : Runnable {
@@ -864,6 +866,7 @@ class NativeCallActivity : Activity(),
         connectedPeerIds.clear()
         hasRemoteVideo = false
         videoStalled = false
+        lastIceRestartAtMs = 0L
         micEnabled = false
         cameraEnabled = false
         inPreview = false
@@ -1057,7 +1060,15 @@ class NativeCallActivity : Activity(),
         }
         val remoteConnectionAlive = connectedPeerIds.isNotEmpty()
         val frameAgeMs = rtc?.getRemoteVideoFrameAgeMs() ?: Long.MAX_VALUE
-        setVideoStalled(hasRemoteVideo && remoteConnectionAlive && frameAgeMs > FRAME_STALL_MS)
+        val stalled = hasRemoteVideo && remoteConnectionAlive && frameAgeMs > FRAME_STALL_MS
+        if (stalled && !videoStalled) {
+            val now = SystemClock.elapsedRealtime()
+            if (lastIceRestartAtMs == 0L || now - lastIceRestartAtMs >= ICE_RESTART_COOLDOWN_MS) {
+                lastIceRestartAtMs = now
+                rtc?.restartIce()
+            }
+        }
+        setVideoStalled(stalled)
     }
 
     private fun localPreviewVisibility(): Int =
@@ -2045,6 +2056,7 @@ class NativeCallActivity : Activity(),
         private const val FILE_BUFFER_HIGH = 256L * 1024L
         private const val FRAME_STALL_MS = 5000L
         private const val FRAME_HEALTH_CHECK_MS = 3000L
+        private const val ICE_RESTART_COOLDOWN_MS = 30_000L
         private const val GIPHY_API_KEY = "z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn"
         private const val GIPHY_LIMIT = 20
         private val REACTIONS = listOf("❤️", "😂", "🎉", "😮", "👏", "🤗")
