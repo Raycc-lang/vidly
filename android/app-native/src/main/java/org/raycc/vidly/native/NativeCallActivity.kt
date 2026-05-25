@@ -229,7 +229,6 @@ class NativeCallActivity : Activity(),
     // Top inset (status bar + display cutout) applied to header bar.
     private var topInset = 0
     private var keyboardVisible = false
-    private var rootFullHeight = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1089,27 +1088,24 @@ class NativeCallActivity : Activity(),
                 // Push header below the cutout / status bar.
                 headerBar.setPadding(dp(14), topInset + dp(12), dp(14), dp(8))
             }
-            insets
-        }
-        root.requestApplyInsets()
-
-        // Keyboard detection via GlobalLayoutListener — more reliable than inset callbacks.
-        // With adjustResize, the root view shrinks when the keyboard appears.
-        root.viewTreeObserver.addOnGlobalLayoutListener {
-            val height = root.height
-            // Capture the "full" height once (first layout, before any keyboard).
-            if (rootFullHeight == 0 && height > 0) rootFullHeight = height
-            if (rootFullHeight <= 0) return@addOnGlobalLayoutListener
-            val imeVisible = height < rootFullHeight - dp(100)
+            val imeVisible = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                insets.isVisible(WindowInsets.Type.ime())
+            } else {
+                val visibleHeight = root.height
+                val fullHeight = root.rootView.height
+                fullHeight - visibleHeight > dp(120)
+            }
             if (imeVisible != keyboardVisible) {
                 keyboardVisible = imeVisible
-                if (!keyboardVisible) rootFullHeight = height  // re-baseline when keyboard hides
+                updateVideoContainerLayout()
             }
             if (chatExpanded) {
                 updateChatContainerHeight()
                 if (keyboardVisible) chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
             }
+            insets
         }
+        root.requestApplyInsets()
     }
 
     private fun updateHeaderStatus(message: String) {
@@ -1337,11 +1333,26 @@ class NativeCallActivity : Activity(),
         if (fullscreen) {
             params.height = 0
             params.weight = 1f
+        } else if (chatExpanded && keyboardVisible) {
+            params.height = 0
+            params.weight = 1f
         } else {
             params.height = normalVideoHeight
             params.weight = 0f
         }
         videoContainer.layoutParams = params
+
+        if (::bottomSpacer.isInitialized) {
+            val spacerParams = bottomSpacer.layoutParams as LinearLayout.LayoutParams
+            if (chatExpanded && keyboardVisible) {
+                spacerParams.height = 0
+                spacerParams.weight = 0f
+            } else {
+                spacerParams.height = 0
+                spacerParams.weight = 1f
+            }
+            bottomSpacer.layoutParams = spacerParams
+        }
     }
 
     private fun updateChatContainerHeight() {
@@ -1354,11 +1365,11 @@ class NativeCallActivity : Activity(),
     private fun expandedChatHeight(): Int {
         val rootHeight = root.height
         if (rootHeight <= 0) return dp(400)
-        // With adjustResize, root.height already accounts for keyboard.
-        // Reserve space for header + video + controls; chat fills the rest.
-        val reserved = headerBar.height + normalVideoHeight + controlsRow.height
+        val desired = if (keyboardVisible) rootHeight else dp(400)
+        val minVideoHeight = if (keyboardVisible) dp(96) else normalVideoHeight
+        val reserved = headerBar.height + minVideoHeight + controlsRow.height
         val available = rootHeight - reserved
-        return available.coerceAtLeast(dp(130)).coerceAtMost(dp(600))
+        return available.coerceAtLeast(dp(130)).coerceAtMost(desired)
     }
 
     private fun hideKeyboard() {
