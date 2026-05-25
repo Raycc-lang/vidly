@@ -18,6 +18,7 @@ import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Rect
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -229,6 +230,7 @@ class NativeCallActivity : Activity(),
     // Top inset (status bar + display cutout) applied to header bar.
     private var topInset = 0
     private var keyboardVisible = false
+    private var keyboardInsetBottom = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -959,6 +961,7 @@ class NativeCallActivity : Activity(),
         chatExpanded = false
         chatInputRow.visibility = View.GONE
         chatToggleBar.text = "+  Chat  +"
+        chatMessagesContainer.translationY = 0f
         updateChatContainerHeight()
         configureCallAudioRouting(defaultSpeakerphone = true)
         updateMediaButtons()
@@ -1043,8 +1046,7 @@ class NativeCallActivity : Activity(),
             chatInput.clearFocus()
             hideKeyboard()
         }
-        updateChatContainerHeight()
-        updateVideoContainerLayout()
+        applyKeyboardAwareChatLayout()
         if (chatExpanded) {
             chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
         }
@@ -1088,24 +1090,30 @@ class NativeCallActivity : Activity(),
                 // Push header below the cutout / status bar.
                 headerBar.setPadding(dp(14), topInset + dp(12), dp(14), dp(8))
             }
-            val imeVisible = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                insets.isVisible(WindowInsets.Type.ime())
+            val imeBottom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                insets.getInsets(WindowInsets.Type.ime()).bottom
             } else {
-                val visibleHeight = root.height
-                val fullHeight = root.rootView.height
-                fullHeight - visibleHeight > dp(120)
+                legacyKeyboardInsetBottom()
             }
-            if (imeVisible != keyboardVisible) {
+            val imeVisible = imeBottom > dp(120)
+            if (imeVisible != keyboardVisible || imeBottom != keyboardInsetBottom) {
                 keyboardVisible = imeVisible
-                updateVideoContainerLayout()
+                keyboardInsetBottom = if (imeVisible) imeBottom else 0
+                if (chatExpanded) applyKeyboardAwareChatLayout()
             }
             if (chatExpanded) {
-                updateChatContainerHeight()
                 if (keyboardVisible) chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
             }
             insets
         }
         root.requestApplyInsets()
+    }
+
+    private fun legacyKeyboardInsetBottom(): Int {
+        val visible = Rect()
+        root.getWindowVisibleDisplayFrame(visible)
+        val fullHeight = root.rootView.height.takeIf { it > 0 } ?: return 0
+        return (fullHeight - visible.bottom).coerceAtLeast(0)
     }
 
     private fun updateHeaderStatus(message: String) {
@@ -1362,14 +1370,37 @@ class NativeCallActivity : Activity(),
         chatMessagesContainer.layoutParams = params
     }
 
+    private fun applyKeyboardAwareChatLayout() {
+        if (!::chatMessagesContainer.isInitialized) return
+        updateChatContainerHeight()
+        updateVideoContainerLayout()
+
+        chatMessagesContainer.translationY = if (chatExpanded && keyboardVisible) {
+            -keyboardChatLift().toFloat()
+        } else {
+            0f
+        }
+
+        if (chatExpanded && keyboardVisible) {
+            chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    private fun keyboardChatLift(): Int {
+        val controlsHeight = controlsRow.height.takeIf { it > 0 } ?: dp(52)
+        return (keyboardInsetBottom - controlsHeight + dp(4)).coerceAtLeast(0)
+    }
+
     private fun expandedChatHeight(): Int {
         val rootHeight = root.height
         if (rootHeight <= 0) return dp(400)
-        val desired = if (keyboardVisible) rootHeight else dp(400)
+        val desired = if (keyboardVisible) rootHeight - keyboardInsetBottom else dp(400)
         val minVideoHeight = if (keyboardVisible) dp(96) else normalVideoHeight
-        val reserved = headerBar.height + minVideoHeight + controlsRow.height
+        val reserved = headerBar.height + minVideoHeight + if (keyboardVisible) 0 else controlsRow.height
         val available = rootHeight - reserved
-        return available.coerceAtLeast(dp(130)).coerceAtMost(desired)
+        val keyboardAvailable = rootHeight - keyboardInsetBottom - reserved
+        val height = if (keyboardVisible) keyboardAvailable else available
+        return height.coerceAtLeast(dp(130)).coerceAtMost(desired.coerceAtLeast(dp(130)))
     }
 
     private fun hideKeyboard() {
@@ -2154,6 +2185,7 @@ class NativeCallActivity : Activity(),
         previewControls.visibility = View.GONE
         reactionPicker.visibility = View.GONE
         chatExpanded = false
+        chatMessagesContainer.translationY = 0f
         chatMessagesContainer.visibility = View.GONE
         joinPanel.visibility = View.VISIBLE
     }

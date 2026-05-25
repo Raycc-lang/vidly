@@ -33,7 +33,7 @@
             android:launchMode="singleTask"
             android:screenOrientation="portrait"
             android:supportsPictureInPicture="true"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustNothing">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
