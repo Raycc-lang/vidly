@@ -1103,7 +1103,6 @@ class NativeCallActivity : Activity(),
             val imeVisible = height < rootFullHeight - dp(100)
             if (imeVisible != keyboardVisible) {
                 keyboardVisible = imeVisible
-                updateVideoContainerLayout()
                 if (!keyboardVisible) rootFullHeight = height  // re-baseline when keyboard hides
             }
             if (chatExpanded) {
@@ -1338,23 +1337,11 @@ class NativeCallActivity : Activity(),
         if (fullscreen) {
             params.height = 0
             params.weight = 1f
-        } else if (chatExpanded && keyboardVisible) {
-            // Shrink video to a small fixed height; chat fills the middle.
-            params.height = dp(80)
-            params.weight = 0f
         } else {
             params.height = normalVideoHeight
             params.weight = 0f
         }
         videoContainer.layoutParams = params
-
-        // bottomSpacer stays weight=1 so bottomContainer (controls) stays pinned to screen bottom.
-        if (::bottomSpacer.isInitialized) {
-            val spacerParams = bottomSpacer.layoutParams as LinearLayout.LayoutParams
-            spacerParams.height = 0
-            spacerParams.weight = 1f
-            bottomSpacer.layoutParams = spacerParams
-        }
     }
 
     private fun updateChatContainerHeight() {
@@ -1367,11 +1354,11 @@ class NativeCallActivity : Activity(),
     private fun expandedChatHeight(): Int {
         val rootHeight = root.height
         if (rootHeight <= 0) return dp(400)
-        val desired = if (keyboardVisible) rootHeight else dp(400)
-        val minVideoHeight = if (keyboardVisible) dp(80) else normalVideoHeight
-        val reserved = headerBar.height + minVideoHeight + controlsRow.height
+        // With adjustResize, root.height already accounts for keyboard.
+        // Reserve space for header + video + controls; chat fills the rest.
+        val reserved = headerBar.height + normalVideoHeight + controlsRow.height
         val available = rootHeight - reserved
-        return available.coerceAtLeast(dp(130)).coerceAtMost(desired)
+        return available.coerceAtLeast(dp(130)).coerceAtMost(dp(600))
     }
 
     private fun hideKeyboard() {
