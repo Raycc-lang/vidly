@@ -229,6 +229,7 @@ class NativeCallActivity : Activity(),
     // Top inset (status bar + display cutout) applied to header bar.
     private var topInset = 0
     private var keyboardVisible = false
+    private var rootFullHeight = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1088,24 +1089,28 @@ class NativeCallActivity : Activity(),
                 // Push header below the cutout / status bar.
                 headerBar.setPadding(dp(14), topInset + dp(12), dp(14), dp(8))
             }
-            val imeVisible = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                insets.isVisible(WindowInsets.Type.ime())
-            } else {
-                val visibleHeight = root.height
-                val fullHeight = root.rootView.height
-                fullHeight - visibleHeight > dp(120)
-            }
+            insets
+        }
+        root.requestApplyInsets()
+
+        // Keyboard detection via GlobalLayoutListener — more reliable than inset callbacks.
+        // With adjustResize, the root view shrinks when the keyboard appears.
+        root.viewTreeObserver.addOnGlobalLayoutListener {
+            val height = root.height
+            // Capture the "full" height once (first layout, before any keyboard).
+            if (rootFullHeight == 0 && height > 0) rootFullHeight = height
+            if (rootFullHeight <= 0) return@addOnGlobalLayoutListener
+            val imeVisible = height < rootFullHeight - dp(100)
             if (imeVisible != keyboardVisible) {
                 keyboardVisible = imeVisible
                 updateVideoContainerLayout()
+                if (!keyboardVisible) rootFullHeight = height  // re-baseline when keyboard hides
             }
             if (chatExpanded) {
                 updateChatContainerHeight()
                 if (keyboardVisible) chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
             }
-            insets
         }
-        root.requestApplyInsets()
     }
 
     private fun updateHeaderStatus(message: String) {
