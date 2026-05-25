@@ -7,6 +7,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
@@ -135,5 +136,15 @@ class NativeSignalingClient(
 
     companion object {
         const val SIGNALING_URL = "wss://voice.raycc.org"
+
+        fun httpUrlFor(path: String, signalingUrl: String = SIGNALING_URL): String {
+            val base = signalingUrl
+                .replaceFirst("wss://", "https://")
+                .replaceFirst("ws://", "http://")
+                .trimEnd('/')
+            val root = runCatching { base.toHttpUrl().newBuilder().encodedPath("/").build().toString().trimEnd('/') }
+                .getOrDefault(base)
+            return "$root/${path.trimStart('/')}"
+        }
     }
 }

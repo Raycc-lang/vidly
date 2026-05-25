@@ -9,6 +9,9 @@ const { WebSocketServer } = require('ws');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const TURN_URL = process.env.TURN_URL || '';
+const ANDROID_VERSION_CODE = parseInt(process.env.ANDROID_VERSION_CODE || '1', 10);
+const ANDROID_VERSION_NAME = process.env.ANDROID_VERSION_NAME || '1.0';
+const ANDROID_APK_URL = process.env.ANDROID_APK_URL || 'https://voice.raycc.org/vidly-native.apk';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const WS_REJOIN_GRACE_MS = parseInt(process.env.WS_REJOIN_GRACE_MS || '180000', 10);
 const WS_PING_INTERVAL_MS = parseInt(process.env.WS_PING_INTERVAL_MS || '25000', 10);
@@ -55,6 +58,16 @@ const server = http.createServer((req, res) => {
     if (urlPath === '/config' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ turnUrl: TURN_URL }));
+        return;
+    }
+
+    if (urlPath === '/version' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
+        res.end(JSON.stringify({
+            versionCode: ANDROID_VERSION_CODE,
+            versionName: ANDROID_VERSION_NAME,
+            apkUrl: ANDROID_APK_URL,
+        }));
         return;
     }
 

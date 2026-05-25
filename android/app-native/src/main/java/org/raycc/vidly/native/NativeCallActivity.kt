@@ -3,7 +3,9 @@ package org.raycc.vidly.native
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.app.PictureInPictureParams
+import android.content.ContentProvider
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
@@ -12,6 +14,7 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -28,12 +31,16 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.text.SpannableString
+import android.text.Spanned
 import android.text.InputType
 import android.text.TextUtils
 import android.util.Rational
+import android.util.Patterns
 import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
@@ -43,6 +50,7 @@ import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.CompoundButton
 import android.widget.EditText
@@ -55,11 +63,13 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import android.text.style.URLSpan
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.raycc.vidly.BuildConfig
 import org.json.JSONArray
 import org.json.JSONObject
 import org.webrtc.RendererCommon
@@ -67,6 +77,7 @@ import org.webrtc.SurfaceViewRenderer
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.FileNotFoundException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -217,6 +228,7 @@ class NativeCallActivity : Activity(),
 
     // Top inset (status bar + display cutout) applied to header bar.
     private var topInset = 0
+    private var keyboardVisible = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -233,6 +245,7 @@ class NativeCallActivity : Activity(),
         NativeIncomingCallListener.ensureChannels(this)
         buildUi()
         applyWindowInsets()
+        checkForAppUpdate()
 
         savedInstanceState?.let {
             currentRoom = it.getString(STATE_ROOM, "")
@@ -803,7 +816,12 @@ class NativeCallActivity : Activity(),
             setBackgroundColor(Color.rgb(50, 53, 65))
             textSize = 14f
             inputType = InputType.TYPE_CLASS_TEXT
-            setOnFocusChangeListener { _, hasFocus -> if (hasFocus && !chatExpanded) toggleChatExpanded() }
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus && !chatExpanded) {
+                    clearFocus()
+                    hideKeyboard()
+                }
+            }
         }
         chatInputRow.addView(chatInput, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(4) })
 
@@ -941,7 +959,7 @@ class NativeCallActivity : Activity(),
         chatExpanded = false
         chatInputRow.visibility = View.GONE
         chatToggleBar.text = "+  Chat  +"
-        (chatMessagesContainer.layoutParams as LinearLayout.LayoutParams).height = dp(130)
+        updateChatContainerHeight()
         configureCallAudioRouting(defaultSpeakerphone = true)
         updateMediaButtons()
 
@@ -1016,17 +1034,17 @@ class NativeCallActivity : Activity(),
 
     private fun toggleChatExpanded() {
         chatExpanded = !chatExpanded
-        val params = chatMessagesContainer.layoutParams as LinearLayout.LayoutParams
         if (chatExpanded) {
-            params.height = expandedChatHeight()
             chatInputRow.visibility = View.VISIBLE
             chatToggleBar.text = "—  Chat  —"
         } else {
-            params.height = dp(130)
             chatInputRow.visibility = View.GONE
             chatToggleBar.text = "+  Chat  +"
+            chatInput.clearFocus()
+            hideKeyboard()
         }
-        chatMessagesContainer.layoutParams = params
+        updateChatContainerHeight()
+        updateVideoContainerLayout()
         if (chatExpanded) {
             chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
         }
@@ -1069,6 +1087,21 @@ class NativeCallActivity : Activity(),
                 topInset = top
                 // Push header below the cutout / status bar.
                 headerBar.setPadding(dp(14), topInset + dp(12), dp(14), dp(8))
+            }
+            val imeVisible = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                insets.isVisible(WindowInsets.Type.ime())
+            } else {
+                val visibleHeight = root.height
+                val fullHeight = root.rootView.height
+                fullHeight - visibleHeight > dp(120)
+            }
+            if (imeVisible != keyboardVisible) {
+                keyboardVisible = imeVisible
+                updateVideoContainerLayout()
+            }
+            if (chatExpanded) {
+                updateChatContainerHeight()
+                if (keyboardVisible) chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
             }
             insets
         }
@@ -1300,20 +1333,48 @@ class NativeCallActivity : Activity(),
         if (fullscreen) {
             params.height = 0
             params.weight = 1f
+        } else if (chatExpanded && keyboardVisible) {
+            params.height = 0
+            params.weight = 1f
         } else {
             params.height = normalVideoHeight
             params.weight = 0f
         }
         videoContainer.layoutParams = params
+
+        if (::bottomSpacer.isInitialized) {
+            val spacerParams = bottomSpacer.layoutParams as LinearLayout.LayoutParams
+            if (chatExpanded && keyboardVisible) {
+                spacerParams.height = 0
+                spacerParams.weight = 0f
+            } else {
+                spacerParams.height = 0
+                spacerParams.weight = 1f
+            }
+            bottomSpacer.layoutParams = spacerParams
+        }
+    }
+
+    private fun updateChatContainerHeight() {
+        if (!::chatMessagesContainer.isInitialized) return
+        val params = chatMessagesContainer.layoutParams as LinearLayout.LayoutParams
+        params.height = if (chatExpanded) expandedChatHeight() else dp(130)
+        chatMessagesContainer.layoutParams = params
     }
 
     private fun expandedChatHeight(): Int {
-        val desired = dp(400)
         val rootHeight = root.height
-        if (rootHeight <= 0) return desired
-        val reserved = headerBar.height + normalVideoHeight + controlsRow.height
+        if (rootHeight <= 0) return dp(400)
+        val desired = if (keyboardVisible) rootHeight else dp(400)
+        val minVideoHeight = if (keyboardVisible) dp(96) else normalVideoHeight
+        val reserved = headerBar.height + minVideoHeight + controlsRow.height
         val available = rootHeight - reserved
         return available.coerceAtLeast(dp(130)).coerceAtMost(desired)
+    }
+
+    private fun hideKeyboard() {
+        val imm = getSystemService(InputMethodManager::class.java) ?: return
+        imm.hideSoftInputFromWindow(root.windowToken, 0)
     }
 
     private fun copyRoomLink() {
@@ -1407,12 +1468,85 @@ class NativeCallActivity : Activity(),
     private fun appendChatText(sender: String, body: String, incoming: Boolean) {
         val item = makeMessageContainer(sender, incoming)
         val text = TextView(this).apply {
-            text = body
             setTextColor(Color.WHITE)
             textSize = 14f
+            setChatMessageText(body)
         }
         item.addView(text)
         addMessageItem(item, "$sender: $body")
+    }
+
+    private fun TextView.setChatMessageText(body: String) {
+        val spannable = SpannableString(body)
+        val matcher = Patterns.WEB_URL.matcher(body)
+        var hasLinks = false
+        while (matcher.find()) {
+            val rawUrl = matcher.group().orEmpty()
+            if (rawUrl.isBlank()) continue
+            val openUrl = normalizeUrl(rawUrl)
+            spannable.setSpan(URLSpan(openUrl), matcher.start(), matcher.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            hasLinks = true
+        }
+        text = spannable
+        if (hasLinks) installUrlTouchHandler(this)
+    }
+
+    private fun normalizeUrl(url: String): String {
+        return if (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) {
+            url
+        } else {
+            "https://$url"
+        }
+    }
+
+    private fun installUrlTouchHandler(textView: TextView) {
+        var touchedUrl: URLSpan? = null
+        val detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                val url = touchedUrl?.url ?: return false
+                openUrl(url)
+                return true
+            }
+
+            override fun onLongPress(e: MotionEvent) {
+                val url = touchedUrl?.url ?: return
+                copyUrl(url)
+            }
+        })
+        textView.setOnTouchListener { view, event ->
+            val tv = view as TextView
+            if (event.action == MotionEvent.ACTION_DOWN) touchedUrl = tv.urlSpanAt(event)
+            val handled = touchedUrl != null && detector.onTouchEvent(event)
+            if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
+                tv.postDelayed({ touchedUrl = null }, 120)
+            }
+            handled
+        }
+    }
+
+    private fun TextView.urlSpanAt(event: MotionEvent): URLSpan? {
+        val spannable = text as? Spanned ?: return null
+        val layout = layout ?: return null
+        val x = event.x.toInt() - totalPaddingLeft + scrollX
+        val y = event.y.toInt() - totalPaddingTop + scrollY
+        if (x < 0 || y < 0 || y > height) return null
+        val line = layout.getLineForVertical(y)
+        val offset = layout.getOffsetForHorizontal(line, x.toFloat())
+        return spannable.getSpans(offset, offset, URLSpan::class.java).firstOrNull()
+    }
+
+    private fun openUrl(url: String) {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        runCatching { startActivity(intent) }
+            .onFailure { Toast.makeText(this, "Could not open link", Toast.LENGTH_SHORT).show() }
+    }
+
+    private fun copyUrl(url: String) {
+        getSystemService(ClipboardManager::class.java)
+            .setPrimaryClip(ClipData.newPlainText("Vidly link", url))
+        Toast.makeText(this, "Link copied", Toast.LENGTH_SHORT).show()
     }
 
     private fun appendChatMedia(sender: String, url: String, kind: String, incoming: Boolean) {
@@ -1421,6 +1555,7 @@ class NativeCallActivity : Activity(),
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_START
             background = null
+            setOnClickListener { showFullscreenImage(url) }
             setOnLongClickListener {
                 saveImageUrlToGallery(url, "vidly-${System.currentTimeMillis()}.${extensionForImage(url, kind)}")
                 true
@@ -1443,6 +1578,7 @@ class NativeCallActivity : Activity(),
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_START
             setImageBitmap(bitmap)
+            setOnClickListener { showFullscreenImage(bitmap) }
             setOnLongClickListener {
                 val saved = bytes?.let { saveImageBytesToGallery(it, name, mimeType) }
                     ?: saveBitmapToGallery(bitmap, name)
@@ -1456,6 +1592,29 @@ class NativeCallActivity : Activity(),
         }
         item.addView(image, LinearLayout.LayoutParams(dp(220), -2).apply { topMargin = dp(4) })
         addMessageItem(item, "$sender: 📎 $name (image)")
+    }
+
+    private fun showFullscreenImage(url: String) {
+        if (url.isBlank()) return
+        val image = showFullscreenImageDialog()
+        loadImageInto(image, url)
+    }
+
+    private fun showFullscreenImage(bitmap: Bitmap) {
+        val image = showFullscreenImageDialog()
+        image.setImageBitmap(bitmap)
+    }
+
+    private fun showFullscreenImageDialog(): ZoomableImageView {
+        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val image = ZoomableImageView(this).apply {
+            setBackgroundColor(Color.BLACK)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setOnSingleTapConfirmed { dialog.dismiss() }
+        }
+        dialog.setContentView(image, ViewGroup.LayoutParams(-1, -1))
+        dialog.show()
+        return image
     }
 
     private fun saveImageUrlToGallery(url: String, name: String) {
@@ -1864,6 +2023,80 @@ class NativeCallActivity : Activity(),
         })
     }
 
+    private fun checkForAppUpdate() {
+        val versionUrl = NativeSignalingClient.httpUrlFor("version")
+        http.newCall(Request.Builder().url(versionUrl).build()).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = Unit
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (!it.isSuccessful) return@use
+                    val json = runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull() ?: return@use
+                    val versionCode = json.optInt("versionCode", 0)
+                    val versionName = json.optString("versionName", versionCode.toString())
+                    val apkUrl = json.optString("apkUrl")
+                    if (versionCode > BuildConfig.VERSION_CODE && apkUrl.isNotBlank()) {
+                        runOnUiThread { promptAppUpdate(versionCode, versionName, apkUrl) }
+                    }
+                }
+            }
+        })
+    }
+
+    private fun promptAppUpdate(versionCode: Int, versionName: String, apkUrl: String) {
+        if (isFinishing || isDestroyed) return
+        AlertDialog.Builder(this)
+            .setTitle("Update available")
+            .setMessage("Update available (v$versionName). Download?")
+            .setPositiveButton("Download") { _, _ -> downloadAppUpdate(versionCode, apkUrl) }
+            .setNegativeButton("Later", null)
+            .show()
+    }
+
+    private fun downloadAppUpdate(versionCode: Int, apkUrl: String) {
+        Toast.makeText(this, "Downloading update...", Toast.LENGTH_SHORT).show()
+        http.newCall(Request.Builder().url(apkUrl).build()).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                runOnUiThread { Toast.makeText(this@NativeCallActivity, "Update download failed", Toast.LENGTH_SHORT).show() }
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (!it.isSuccessful) {
+                        runOnUiThread { Toast.makeText(this@NativeCallActivity, "Update download failed", Toast.LENGTH_SHORT).show() }
+                        return@use
+                    }
+                    val body = it.body ?: return@use
+                    val updateDir = File(cacheDir, APK_CACHE_DIR).apply { mkdirs() }
+                    val apkFile = File(updateDir, "vidly-update-$versionCode.apk")
+                    try {
+                        body.byteStream().use { input ->
+                            FileOutputStream(apkFile).use { output -> input.copyTo(output) }
+                        }
+                        runOnUiThread { launchApkInstaller(apkFile) }
+                    } catch (_: IOException) {
+                        runOnUiThread { Toast.makeText(this@NativeCallActivity, "Could not save update", Toast.LENGTH_SHORT).show() }
+                    }
+                }
+            }
+        })
+    }
+
+    private fun launchApkInstaller(apkFile: File) {
+        val uri = Uri.Builder()
+            .scheme("content")
+            .authority("${BuildConfig.APPLICATION_ID}.apkprovider")
+            .appendPath(APK_CACHE_DIR)
+            .appendPath(apkFile.name)
+            .build()
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching { startActivity(intent) }
+            .onFailure { Toast.makeText(this, "Could not open installer", Toast.LENGTH_SHORT).show() }
+    }
+
     // ─── Helpers ──────────────────────────────────────────────
 
     private fun setCallActive(active: Boolean) {
@@ -2068,7 +2301,7 @@ class NativeCallActivity : Activity(),
     }
 
     private fun loadTurnConfig(client: NativeWebRtcClient) {
-        http.newCall(Request.Builder().url("https://voice.raycc.org/config").build()).enqueue(object : Callback {
+        http.newCall(Request.Builder().url(NativeSignalingClient.httpUrlFor("config")).build()).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) = Unit
 
             override fun onResponse(call: Call, response: Response) {
@@ -2158,11 +2391,122 @@ class NativeCallActivity : Activity(),
         private const val STATE_USERNAME = "stateUsername"
         private const val FILE_CHUNK_SIZE = 16 * 1024
         private const val FILE_BUFFER_HIGH = 256L * 1024L
+        private const val APK_CACHE_DIR = "updates"
         private const val FRAME_STALL_MS = 5000L
         private const val FRAME_HEALTH_CHECK_MS = 3000L
         private const val ICE_RESTART_COOLDOWN_MS = 30_000L
         private const val GIPHY_API_KEY = "z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn"
         private const val GIPHY_LIMIT = 20
         private val REACTIONS = listOf("❤️", "😂", "🎉", "😮", "👏", "🤗")
+    }
+}
+
+class ZoomableImageView(context: android.content.Context) : ImageView(context) {
+    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            zoom = (zoom * detector.scaleFactor).coerceIn(1f, 5f)
+            applyTransform()
+            return true
+        }
+    })
+    private val tapDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+            onSingleTapConfirmed?.invoke()
+            return true
+        }
+    })
+    private var zoom = 1f
+    private var translateX = 0f
+    private var translateY = 0f
+    private var lastX = 0f
+    private var lastY = 0f
+    private var onSingleTapConfirmed: (() -> Unit)? = null
+
+    init {
+        scaleType = ScaleType.FIT_CENTER
+    }
+
+    fun setOnSingleTapConfirmed(listener: () -> Unit) {
+        onSingleTapConfirmed = listener
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(event)
+        tapDetector.onTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lastX = event.x
+                lastY = event.y
+            }
+            MotionEvent.ACTION_MOVE -> if (zoom > 1f && !scaleDetector.isInProgress) {
+                val dx = event.x - lastX
+                val dy = event.y - lastY
+                translateX += dx
+                translateY += dy
+                lastX = event.x
+                lastY = event.y
+                applyTransform()
+            }
+        }
+        return true
+    }
+
+    override fun setImageBitmap(bm: Bitmap?) {
+        super.setImageBitmap(bm)
+        resetTransform()
+    }
+
+    private fun resetTransform() {
+        zoom = 1f
+        translateX = 0f
+        translateY = 0f
+        applyTransform()
+    }
+
+    private fun applyTransform() {
+        scaleX = zoom
+        scaleY = zoom
+        translationX = translateX
+        translationY = translateY
+    }
+}
+
+class ApkCacheProvider : ContentProvider() {
+    override fun onCreate(): Boolean = true
+
+    override fun getType(uri: Uri): String = "application/vnd.android.package-archive"
+
+    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+        if (!mode.contains('r')) throw FileNotFoundException("Read only")
+        val file = fileForUri(uri)
+        if (!file.isFile) throw FileNotFoundException(uri.toString())
+        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+    }
+
+    override fun query(
+        uri: Uri,
+        projection: Array<out String>?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+        sortOrder: String?
+    ): Cursor? = null
+
+    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+
+    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+
+    private fun fileForUri(uri: Uri): File {
+        val ctx = context ?: throw FileNotFoundException("No context")
+        val segments = uri.pathSegments
+        if (segments.size != 2 || segments[0] != "updates" || !segments[1].endsWith(".apk")) {
+            throw FileNotFoundException(uri.toString())
+        }
+        val file = File(File(ctx.cacheDir, "updates"), segments[1])
+        val root = File(ctx.cacheDir, "updates").canonicalFile
+        val canonical = file.canonicalFile
+        if (!canonical.path.startsWith(root.path)) throw FileNotFoundException(uri.toString())
+        return canonical
     }
 }
