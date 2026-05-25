@@ -236,6 +236,7 @@ class NativeCallActivity : Activity(),
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestWindowFeature(Window.FEATURE_NO_TITLE)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // Allow content to extend into display cutout, then apply insets manually
         // so the header bar (and status text) clear notches/punch-holes.
@@ -1090,29 +1091,32 @@ class NativeCallActivity : Activity(),
                 topInset = top
                 headerBar.setPadding(dp(14), topInset + dp(12), dp(14), dp(8))
             }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                updateKeyboardState(insets.getInsets(WindowInsets.Type.ime()).bottom)
+            }
             insets
         }
         root.requestApplyInsets()
 
-        // Keyboard detection: with adjustNothing, inset callback may not fire for IME.
-        // Use getWindowVisibleDisplayFrame to detect keyboard height.
+        // Keyboard detection fallback: with adjustNothing, some devices do not dispatch
+        // IME insets consistently. Keep the window non-fullscreen and compare the
+        // visible display frame against the largest root height observed.
         root.viewTreeObserver.addOnGlobalLayoutListener {
             val rect = Rect()
             root.getWindowVisibleDisplayFrame(rect)
-            val visibleHeight = rect.bottom - rect.top
-            if (rootFullHeight == 0 && visibleHeight > 0) rootFullHeight = visibleHeight
-            if (rootFullHeight <= 0) return@addOnGlobalLayoutListener
-            val imeBottom = (rootFullHeight - visibleHeight).coerceAtLeast(0)
-            val imeVisible = imeBottom > dp(100)
-            if (imeVisible != keyboardVisible || (imeVisible && Math.abs(imeBottom - keyboardInsetBottom) > dp(10))) {
-                keyboardVisible = imeVisible
-                keyboardInsetBottom = if (imeVisible) imeBottom else 0
-                if (chatExpanded) applyKeyboardAwareChatLayout()
-            }
-            if (chatExpanded && keyboardVisible) {
-                chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
-            }
+            val visibleHeight = (rect.bottom - rect.top).coerceAtLeast(0)
+            rootFullHeight = maxOf(rootFullHeight, visibleHeight)
+            if (rootFullHeight > 0) updateKeyboardState((rootFullHeight - visibleHeight).coerceAtLeast(0))
         }
+    }
+
+    private fun updateKeyboardState(imeBottom: Int) {
+        val imeVisible = imeBottom > dp(100)
+        val insetBottom = if (imeVisible) imeBottom else 0
+        if (imeVisible == keyboardVisible && kotlin.math.abs(insetBottom - keyboardInsetBottom) <= dp(10)) return
+        keyboardVisible = imeVisible
+        keyboardInsetBottom = insetBottom
+        if (chatExpanded) applyKeyboardAwareChatLayout()
     }
 
     private fun updateHeaderStatus(message: String) {
