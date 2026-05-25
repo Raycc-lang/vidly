@@ -222,28 +222,36 @@
   }
   .empty-state .icon { font-size: 42px; margin-bottom: 10px; opacity: .6; }
 
-  /* Local PiP */
-  #localTile {
+  /* Floating preview/camera PiP dock */
+  #previewDock {
     position: fixed;
     right: 22px; bottom: 110px;
-    width: 350px; min-height: 100px; aspect-ratio: 16/9;
+    display: flex; align-items: flex-start; gap: 10px;
     border-radius: 12px; overflow: hidden;
-    background: #000; border: 1px solid var(--border);
-    box-shadow: 0 12px 32px rgba(0,0,0,.5);
     z-index: 6;
     cursor: grab;
     touch-action: none;
     user-select: none;
     -webkit-user-select: none;
   }
-  #localTile.dragging { cursor: grabbing; transition: none !important; }
-  #localTile:not(.dragging) { transition: right .2s ease, bottom .2s ease; }
-  #localTile video {
+  #previewDock.dragging { cursor: grabbing; transition: none !important; }
+  #previewDock:not(.dragging) { transition: right .2s ease, bottom .2s ease; }
+  .preview-tile {
+    position: relative;
+    width: 350px; min-height: 100px; aspect-ratio: 16/9;
+    border-radius: 12px; overflow: hidden;
+    background: #000; border: 1px solid var(--border);
+    box-shadow: 0 12px 32px rgba(0,0,0,.5);
+  }
+  .preview-tile video {
     width: 100%; height: 100%; object-fit: contain;
+  }
+  #localTile video {
     transform: scaleX(-1); /* mirror */
   }
   #localTile.screensharing video { transform: none; }
-  #localTile .tile-label { font-size: 11px; padding: 4px 8px; left: 8px; bottom: 8px; }
+  .preview-tile .tile-label { font-size: 11px; padding: 4px 8px; left: 8px; bottom: 8px; }
+  #remoteCameraTile { display: none; }
   /* Resize handles — invisible, positioned at corners */
   .resize-handle {
     position: absolute;
@@ -644,8 +652,14 @@
     .topbar { padding: 10px 12px; }
     .grid-wrap { padding: 10px; }
     .grid.n2, .grid.n3, .grid.n4 { grid-template-columns: 1fr; }
-    #localTile {
-      width: 170px; right: 12px; bottom: 92px;
+    #previewDock {
+      right: 12px; bottom: 92px;
+      gap: 8px;
+      max-width: calc(100vw - 24px);
+      overflow: visible;
+    }
+    .preview-tile {
+      width: 170px;
       aspect-ratio: 3/4;
       display: block;
     }
@@ -748,24 +762,34 @@
     </div>
   </aside>
 
-  <div id="localTile">
-    <video id="localVideo" autoplay playsinline muted style="display:none;"></video>
-    <div id="localPlaceholder">
-      <div id="localAvatar">Y</div>
-      <button class="cam-on-btn" id="camOnBtn">📷 Turn on camera</button>
-    </div>
-    <div id="previewBtns">
-      <div class="btn-row">
-        <button class="switch-cam-btn" id="switchCamBtn" title="Switch camera">🔄</button>
-        <button class="confirm-btn" id="confirmCamBtn">✓</button>
-        <button class="cancel-btn" id="cancelCamBtn">✕</button>
+  <div id="previewDock">
+    <div id="localTile" class="preview-tile">
+      <video id="localVideo" autoplay playsinline muted style="display:none;"></video>
+      <div id="localPlaceholder">
+        <div id="localAvatar">Y</div>
+        <button class="cam-on-btn" id="camOnBtn">📷 Turn on camera</button>
       </div>
+      <div id="previewBtns">
+        <div class="btn-row">
+          <button class="switch-cam-btn" id="switchCamBtn" title="Switch camera">🔄</button>
+          <button class="confirm-btn" id="confirmCamBtn">✓</button>
+          <button class="cancel-btn" id="cancelCamBtn">✕</button>
+        </div>
+      </div>
+      <div class="tile-label" id="localLabel">You</div>
+      <div class="resize-handle nw" data-corner="nw"></div>
+      <div class="resize-handle ne" data-corner="ne"></div>
+      <div class="resize-handle sw" data-corner="sw"></div>
+      <div class="resize-handle se" data-corner="se"></div>
     </div>
-    <div class="tile-label" id="localLabel">You</div>
-    <div class="resize-handle nw" data-corner="nw"></div>
-    <div class="resize-handle ne" data-corner="ne"></div>
-    <div class="resize-handle sw" data-corner="sw"></div>
-    <div class="resize-handle se" data-corner="se"></div>
+    <div id="remoteCameraTile" class="preview-tile">
+      <video id="remoteCameraVideo" autoplay playsinline muted></video>
+      <div class="tile-label" id="remoteCameraLabel">Peer camera</div>
+      <div class="resize-handle nw" data-corner="nw"></div>
+      <div class="resize-handle ne" data-corner="ne"></div>
+      <div class="resize-handle sw" data-corner="sw"></div>
+      <div class="resize-handle se" data-corner="se"></div>
+    </div>
   </div>
 
   <footer class="toolbar">
@@ -811,6 +835,7 @@ let micStream = null;        // audio-only stream when mic is on but camera is o
 let previewStream = null;    // preview stream during camera confirmation
 let activeRemoteVideoPeerId = null;
 let activeRemoteVideoTrack = null;
+let activeRemoteCameraPeerId = null;
 let stallCheckInterval = null;
 let myPeerId = null;
 let facingMode = 'user';     // 'user' = front camera, 'environment' = back camera
@@ -838,6 +863,8 @@ const $ = (id) => document.getElementById(id);
 const landing = $('landing'), call = $('call');
 const grid = $('grid'), emptyState = $('emptyState');
 const localVideo = $('localVideo'), localTile = $('localTile');
+const previewDock = $('previewDock'), remoteCameraTile = $('remoteCameraTile'), remoteCameraVideo = $('remoteCameraVideo');
+const remoteCameraLabel = $('remoteCameraLabel');
 const localPlaceholder = $('localPlaceholder');
 const localAvatar = $('localAvatar');
 const previewBtns = $('previewBtns');
@@ -1034,11 +1061,25 @@ function clearLocalVideoElement() {
     localVideo.style.display = 'none';
 }
 
+function updatePreviewDockVisibility() {
+    const localVisible = localTile.style.display !== 'none';
+    const cameraVisible = remoteCameraTile.style.display !== 'none' && !!remoteCameraVideo.srcObject;
+    previewDock.style.display = localVisible || cameraVisible ? 'flex' : 'none';
+}
+
+function syncRemoteCameraTileToLocal() {
+    const rect = localTile.getBoundingClientRect();
+    if (rect.width > 0) remoteCameraTile.style.width = rect.width + 'px';
+    if (rect.height > 0) remoteCameraTile.style.height = rect.height + 'px';
+    remoteCameraTile.style.aspectRatio = localTile.style.aspectRatio;
+}
+
 function hideLocalVideoTile() {
     clearLocalVideoElement();
     showLocalPlaceholder();
     localTile.style.display = 'none';
     localTile.classList.remove('screensharing');
+    updatePreviewDockVisibility();
 }
 
 function clearActiveRemoteVideo(peerId, track, videoEl, tileEl, remoteStream) {
@@ -1071,10 +1112,36 @@ function clearActiveRemoteVideo(peerId, track, videoEl, tileEl, remoteStream) {
             peer.lastVideoFrameTime = null;
             peer.videoTrackStartedAt = null;
             peer.videoFrameTrack = null;
-            if (!track || peer.remoteCameraTrack === track) peer.remoteCameraTrack = null;
             if (!track || peer.remoteScreenTrack === track) peer.remoteScreenTrack = null;
         }
     }
+}
+
+function clearRemoteCameraVideo(peer, track = null) {
+    if (!peer) return;
+    if (track && peer.remoteCameraTrack && peer.remoteCameraTrack !== track) return;
+    if (peer.remoteCameraStream) {
+        for (const videoTrack of peer.remoteCameraStream.getVideoTracks()) {
+            try { peer.remoteCameraStream.removeTrack(videoTrack); } catch {}
+        }
+    }
+    if (!track || peer.remoteCameraTrack === track) peer.remoteCameraTrack = null;
+    if (activeRemoteCameraPeerId === peer.id) {
+        activeRemoteCameraPeerId = null;
+        try { remoteCameraVideo.pause(); } catch {}
+        remoteCameraVideo.srcObject = null;
+        remoteCameraVideo.removeAttribute('src');
+        remoteCameraVideo.removeAttribute('poster');
+        try { remoteCameraVideo.load(); } catch {}
+        remoteCameraTile.style.display = 'none';
+        updatePreviewDockVisibility();
+    }
+}
+
+function clearAllRemoteVideo(peer) {
+    if (!peer) return;
+    clearActiveRemoteVideo(peer.id, null, peer.videoEl, peer.tileEl, peer.remoteStream);
+    clearRemoteCameraVideo(peer);
 }
 
 function classifyRemoteVideoTrack(peer, track) {
@@ -1085,7 +1152,35 @@ function classifyRemoteVideoTrack(peer, track) {
 }
 
 function selectRemoteVideoTrack(peer) {
-    return peer.remoteScreenTrack || peer.remoteCameraTrack || null;
+    return peer.remoteScreenTrack || null;
+}
+
+function renderRemoteCameraTrack(peer) {
+    const track = peer.remoteCameraTrack;
+    if (!track) {
+        clearRemoteCameraVideo(peer);
+        return;
+    }
+    if (activeRemoteCameraPeerId && activeRemoteCameraPeerId !== peer.id) {
+        const previousPeer = peers.get(activeRemoteCameraPeerId);
+        if (previousPeer) clearRemoteCameraVideo(previousPeer);
+    }
+    if (!peer.remoteCameraStream) peer.remoteCameraStream = new MediaStream();
+    for (const oldTrack of peer.remoteCameraStream.getVideoTracks()) {
+        if (oldTrack !== track) {
+            try { peer.remoteCameraStream.removeTrack(oldTrack); } catch {}
+        }
+    }
+    if (!peer.remoteCameraStream.getTracks().includes(track)) {
+        peer.remoteCameraStream.addTrack(track);
+    }
+    activeRemoteCameraPeerId = peer.id;
+    remoteCameraVideo.srcObject = peer.remoteCameraStream;
+    syncRemoteCameraTileToLocal();
+    remoteCameraTile.style.display = 'block';
+    remoteCameraLabel.textContent = (peer.username || 'Peer') + ' camera';
+    updatePreviewDockVisibility();
+    remoteCameraVideo.play().catch(() => {});
 }
 
 function renderRemoteVideoTrack(peer) {
@@ -1116,11 +1211,13 @@ function removeRemoteVideoTrack(peer, track) {
     if (peer.remoteCameraTrack === track) peer.remoteCameraTrack = null;
     if (peer.remoteScreenTrack === track) peer.remoteScreenTrack = null;
     try { peer.remoteStream.removeTrack(track); } catch {}
+    if (peer.remoteCameraStream) try { peer.remoteCameraStream.removeTrack(track); } catch {}
     if (activeRemoteVideoTrack === track) {
         activeRemoteVideoTrack = null;
         activeRemoteVideoPeerId = null;
         renderRemoteVideoTrack(peer);
     }
+    if (activeRemoteCameraPeerId === peer.id && !peer.remoteCameraTrack) clearRemoteCameraVideo(peer, track);
 }
 
 function showStallOverlay(tileEl) {
@@ -1231,6 +1328,7 @@ async function previewCamera() {
         // Show preview in local video
         localVideo.srcObject = previewStream;
         localTile.style.display = '';
+        updatePreviewDockVisibility();
         localVideo.style.display = '';
         localPlaceholder.classList.add('hidden');
         previewBtns.classList.add('active');
@@ -1266,6 +1364,7 @@ function confirmCamera() {
     $('micBtn').textContent = '🎙️';
 
     localTile.style.display = '';
+    updatePreviewDockVisibility();
 
     // Replace tracks on existing senders (no renegotiation needed)
     const newVideoTrack = localStream.getVideoTracks()[0];
@@ -1347,7 +1446,7 @@ $('switchCamBtn').onclick = async () => {
     await previewCamera();
 };
 
-// ─── Draggable local tile ─────────────────────────────────
+// ─── Draggable preview dock ────────────────────────────────
 (function initDraggable() {
     let isDragging = false;
     let startX, startY, startRight, startBottom;
@@ -1379,11 +1478,11 @@ $('switchCamBtn').onclick = async () => {
         const pos = e.touches ? e.touches[0] : e;
         startX = pos.clientX;
         startY = pos.clientY;
-        const rect = localTile.getBoundingClientRect();
+        const rect = previewDock.getBoundingClientRect();
         const vp = getViewportBounds();
         startRight = vp.w - rect.right;
         startBottom = vp.h - rect.bottom;
-        localTile.classList.add('dragging');
+        previewDock.classList.add('dragging');
         if (e.type === 'touchstart') e.preventDefault();
     }
 
@@ -1394,37 +1493,35 @@ $('switchCamBtn').onclick = async () => {
         const dy = pos.clientY - startY;
         if (Math.abs(dx) > 3 || Math.abs(dy) > 3) hasMoved = true;
         const vp = getViewportBounds();
-        const rect = localTile.getBoundingClientRect();
-        const tileW = rect.width || 200;
-        const tileH = rect.height || 112;
-        // Constrain to viewport — keep at least 60px of the tile visible
-        const minVisible = 60;
-        const newRight = clamp(startRight - dx, -(tileW - minVisible), vp.w - minVisible);
-        const newBottom = clamp(startBottom - dy, -(tileH - minVisible), vp.h - minVisible);
-        localTile.style.right = newRight + 'px';
-        localTile.style.bottom = newBottom + 'px';
-        localTile.style.left = 'auto';
-        localTile.style.top = 'auto';
+        const rect = previewDock.getBoundingClientRect();
+        const dockW = rect.width || 200;
+        const dockH = rect.height || 112;
+        const newRight = clamp(startRight - dx, 0, Math.max(0, vp.w - dockW));
+        const newBottom = clamp(startBottom - dy, 0, Math.max(0, vp.h - dockH));
+        previewDock.style.right = newRight + 'px';
+        previewDock.style.bottom = newBottom + 'px';
+        previewDock.style.left = 'auto';
+        previewDock.style.top = 'auto';
         if (e.type === 'touchmove') e.preventDefault();
     }
 
     function onPointerUp(e) {
         if (!isDragging) return;
         isDragging = false;
-        localTile.classList.remove('dragging');
+        previewDock.classList.remove('dragging');
         // Save position to sessionStorage
         if (hasMoved) {
-            sessionStorage.setItem('vidly-pip-right', localTile.style.right);
-            sessionStorage.setItem('vidly-pip-bottom', localTile.style.bottom);
+            sessionStorage.setItem('vidly-pip-right', previewDock.style.right);
+            sessionStorage.setItem('vidly-pip-bottom', previewDock.style.bottom);
         }
         // Ensure tile is visible after drag — snap back if off-screen
         const vp = getViewportBounds();
-        const rect = localTile.getBoundingClientRect();
-        if (rect.right < 20 || rect.bottom < 20 || rect.left > vp.w - 20 || rect.top > vp.h - 20) {
-            localTile.style.right = '22px';
-            localTile.style.bottom = '110px';
-            localTile.style.left = 'auto';
-            localTile.style.top = 'auto';
+        const rect = previewDock.getBoundingClientRect();
+        if (rect.left < 0 || rect.top < 0 || rect.right > vp.w || rect.bottom > vp.h) {
+            previewDock.style.right = '22px';
+            previewDock.style.bottom = '110px';
+            previewDock.style.left = 'auto';
+            previewDock.style.top = 'auto';
             sessionStorage.removeItem('vidly-pip-right');
             sessionStorage.removeItem('vidly-pip-bottom');
         }
@@ -1432,7 +1529,7 @@ $('switchCamBtn').onclick = async () => {
 
     // ─── Resize handles ──────────────────────────────
     const MIN_W = 120, MAX_W = 600;
-    const handles = localTile.querySelectorAll('.resize-handle');
+    const handles = previewDock.querySelectorAll('.resize-handle');
     let isResizing = false;
     let resizeCorner = '';
     let resizeStartX, resizeStartY, resizeStartW, resizeStartH, resizeStartRight;
@@ -1449,6 +1546,7 @@ $('switchCamBtn').onclick = async () => {
         resizeStartH = rect.height;
         resizeStartRight = getViewportBounds().w - rect.right;
         localTile.style.aspectRatio = '';
+        remoteCameraTile.style.aspectRatio = '';
         if (e.type === 'touchstart') e.preventDefault();
     }
 
@@ -1469,10 +1567,12 @@ $('switchCamBtn').onclick = async () => {
 
         localTile.style.width = newW + 'px';
         localTile.style.height = newH + 'px';
+        remoteCameraTile.style.width = newW + 'px';
+        remoteCameraTile.style.height = newH + 'px';
 
         // Reposition if resizing from left corners (nw/sw)
         if (resizeCorner === 'nw' || resizeCorner === 'sw') {
-            localTile.style.right = (resizeStartRight + (resizeStartW - newW)) + 'px';
+            previewDock.style.right = (resizeStartRight + (resizeStartW - newW)) + 'px';
         }
 
         if (e.type === 'touchmove') e.preventDefault();
@@ -1488,11 +1588,13 @@ $('switchCamBtn').onclick = async () => {
 
     // Mouse events
     localTile.addEventListener('mousedown', onPointerDown);
+    remoteCameraTile.addEventListener('mousedown', onPointerDown);
     document.addEventListener('mousemove', onPointerMove);
     document.addEventListener('mouseup', onPointerUp);
 
     // Touch events
     localTile.addEventListener('touchstart', onPointerDown, { passive: false });
+    remoteCameraTile.addEventListener('touchstart', onPointerDown, { passive: false });
     document.addEventListener('touchmove', onPointerMove, { passive: false });
     document.addEventListener('touchend', onPointerUp);
 
@@ -1509,8 +1611,8 @@ $('switchCamBtn').onclick = async () => {
     const savedRight = sessionStorage.getItem('vidly-pip-right');
     const savedBottom = sessionStorage.getItem('vidly-pip-bottom');
     if (savedRight && savedBottom) {
-        localTile.style.right = savedRight;
-        localTile.style.bottom = savedBottom;
+        previewDock.style.right = savedRight;
+        previewDock.style.bottom = savedBottom;
     }
 
     // Restore saved size
@@ -1520,6 +1622,9 @@ $('switchCamBtn').onclick = async () => {
         localTile.style.width = savedW;
         localTile.style.height = savedH;
         localTile.style.aspectRatio = '';
+        remoteCameraTile.style.width = savedW;
+        remoteCameraTile.style.height = savedH;
+        remoteCameraTile.style.aspectRatio = '';
     }
 })();
 
@@ -1686,7 +1791,7 @@ function ensurePeer(peerId, polite, createDC, username) {
         makingOffer: false, ignoreOffer: false,
         cameraSender: null, screenSender: null,
         iceRestartTimer: null,
-        videoEl, tileEl, remoteStream, dot,
+        videoEl, tileEl, remoteStream, remoteCameraStream: null, dot,
         username: username || null,
         lastVideoFrameTime: null,
         videoTrackStartedAt: null,
@@ -1756,7 +1861,8 @@ function ensurePeer(peerId, polite, createDC, username) {
             const role = classifyRemoteVideoTrack(peer, track);
             if (role === 'screen') peer.remoteScreenTrack = track;
             else peer.remoteCameraTrack = track;
-            renderRemoteVideoTrack(peer);
+            if (role === 'screen') renderRemoteVideoTrack(peer);
+            else renderRemoteCameraTrack(peer);
         } else {
             remoteStream.addTrack(track);
 
@@ -1775,6 +1881,14 @@ function ensurePeer(peerId, polite, createDC, username) {
             track.onmute = () => {
                 console.log('[WebRTC] video track muted');
                 if (!isPeerMediaVideoOn(peer)) {
+                    clearAllRemoteVideo(peer);
+                    return;
+                }
+                if (peer.remoteCameraTrack === track && peer.mediaState?.cam === false) {
+                    clearRemoteCameraVideo(peer, track);
+                    return;
+                }
+                if (peer.remoteScreenTrack === track && peer.mediaState?.screen === false) {
                     clearActiveRemoteVideo(peerId, track, videoEl, tileEl, remoteStream);
                     return;
                 }
@@ -1784,13 +1898,14 @@ function ensurePeer(peerId, polite, createDC, username) {
             track.onunmute = () => {
                 console.log('[WebRTC] video track un-muted');
                 if (activeRemoteVideoPeerId && activeRemoteVideoPeerId !== peerId) return;
-                renderRemoteVideoTrack(peer);
+                if (peer.remoteScreenTrack === track) renderRemoteVideoTrack(peer);
+                else if (peer.remoteCameraTrack === track) renderRemoteCameraTrack(peer);
             };
 
             if (track.muted) {
                 console.log('[WebRTC] video track arrived already muted');
-                if (isPeerMediaVideoOn(peer)) markVideoStalled(peer, true);
-                else clearActiveRemoteVideo(peerId, track, videoEl, tileEl, remoteStream);
+                if (!isPeerMediaVideoOn(peer)) clearAllRemoteVideo(peer);
+                else if (activeRemoteVideoTrack === track) markVideoStalled(peer, true);
             }
         }
 
@@ -2074,6 +2189,7 @@ function removePeer(peerId) {
         activeRemoteVideoPeerId = null;
         activeRemoteVideoTrack = null;
     }
+    if (activeRemoteCameraPeerId === peerId) clearRemoteCameraVideo(peer);
     hideStallOverlay(peer.tileEl);
     try { peer.pc.close(); } catch {}
     if (peer.tileEl && peer.tileEl.parentNode) peer.tileEl.parentNode.removeChild(peer.tileEl);
@@ -2167,10 +2283,15 @@ function attachDataChannel(peer, dc) {
                 screen: !!msg.screen
             };
             updatePeerStatusIndicator(peer.id, peer.mediaState.mic, peer.mediaState.cam, peer.mediaState.screen);
-            if (!peer.mediaState.video && activeRemoteVideoPeerId === peer.id) {
-                clearActiveRemoteVideo(peer.id, null, peer.videoEl, peer.tileEl, peer.remoteStream);
-            } else if (!peer.mediaState.screen && peer.remoteScreenTrack) {
-                removeRemoteVideoTrack(peer, peer.remoteScreenTrack);
+            if (!peer.mediaState.video) {
+                clearAllRemoteVideo(peer);
+            } else {
+                if (!peer.mediaState.cam && peer.remoteCameraTrack) {
+                    removeRemoteVideoTrack(peer, peer.remoteCameraTrack);
+                }
+                if (!peer.mediaState.screen && peer.remoteScreenTrack) {
+                    removeRemoteVideoTrack(peer, peer.remoteScreenTrack);
+                }
             }
         } else if (msg.type && msg.type.startsWith('file-')) {
             handleFileControl(peer, msg);
@@ -3161,6 +3282,7 @@ async function startScreenShare() {
     // Show local screen preview (un-mirrored).
     localVideo.srcObject = screenStream;
     localTile.style.display = '';
+    updatePreviewDockVisibility();
     localVideo.style.display = '';
     localPlaceholder.classList.add('hidden');
     localTile.classList.add('screensharing');
@@ -3227,6 +3349,7 @@ async function stopScreenShare() {
         if (activeCamTrack) {
             localVideo.srcObject = cameraStream;
             localTile.style.display = '';
+            updatePreviewDockVisibility();
             localVideo.style.display = '';
             localPlaceholder.classList.add('hidden');
         } else {

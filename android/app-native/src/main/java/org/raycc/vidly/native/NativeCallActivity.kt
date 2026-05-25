@@ -37,6 +37,7 @@ import android.util.Rational
 import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
@@ -84,9 +85,12 @@ class NativeCallActivity : Activity(),
     private lateinit var joinPanel: LinearLayout
     private lateinit var roomInput: EditText
     private lateinit var usernameInput: EditText
+    private lateinit var previewDock: LinearLayout
     private lateinit var localPreviewContainer: LinearLayout
+    private lateinit var remoteCameraContainer: FrameLayout
     private lateinit var localRenderer: SurfaceViewRenderer
     private lateinit var remoteRenderer: SurfaceViewRenderer
+    private lateinit var cameraRenderer: SurfaceViewRenderer
 
     // Header
     private lateinit var headerBar: LinearLayout
@@ -140,6 +144,7 @@ class NativeCallActivity : Activity(),
     private var currentRoom = ""
     private var currentUsername = ""
     private var hasRemoteVideo = false
+    private var hasRemoteCamera = false
     private var headerStatus = "Native Vidly"
     private var videoStalled = false
     private var lastIceRestartAtMs = 0L
@@ -158,6 +163,10 @@ class NativeCallActivity : Activity(),
     private var previewDragStartY = 0f
     private var previewDragging = false
     private var localRendererAttached = false
+    private lateinit var previewScaleDetector: ScaleGestureDetector
+    private var previewScaleStartWidth = 0
+    private var previewTileWidth = 0
+    private var previewTileHeight = 0
     private var speakerphoneEnabled = true
     private var audioRoutingConfigured = false
     private var previousAudioMode = AudioManager.MODE_NORMAL
@@ -294,7 +303,7 @@ class NativeCallActivity : Activity(),
         val visibility = if (isInPictureInPictureMode || fullscreen) View.GONE else View.VISIBLE
         headerBar.visibility = visibility
         bottomContainer.visibility = visibility
-        localPreviewContainer.visibility = if (isInPictureInPictureMode) View.GONE else localPreviewVisibility()
+        updatePreviewDockVisibility()
         if (isInPictureInPictureMode) {
             previewControls.visibility = View.GONE
             reactionPicker.visibility = View.GONE
@@ -332,7 +341,11 @@ class NativeCallActivity : Activity(),
         participants.remove(peerId)
         peerMediaStates.remove(peerId)
         connectedPeerIds.remove(peerId)
-        if (participants.isEmpty()) hasRemoteVideo = false
+        if (participants.isEmpty()) {
+            hasRemoteVideo = false
+            hasRemoteCamera = false
+            updatePreviewDockVisibility()
+        }
         refreshParticipants()
         updateProximitySensorState()
         updateHeaderStatus("${username ?: "Peer"} left")
@@ -457,17 +470,43 @@ class NativeCallActivity : Activity(),
         }
         videoContainer.addView(remoteRenderer, FrameLayout.LayoutParams(-1, -1))
 
-        // Local preview floats above the whole call UI so its confirmation controls are not
-        // clipped by the fixed 16:9 video area.
+        previewTileWidth = dp(112)
+        previewTileHeight = dp(160)
+        previewScaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                previewScaleStartWidth = previewTileWidth
+                previewDragging = false
+                return true
+            }
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                val newWidth = (previewScaleStartWidth * detector.scaleFactor).toInt()
+                    .coerceIn(dp(84), dp(224))
+                setPreviewTileSize(newWidth)
+                keepLocalPreviewInBounds()
+                return true
+            }
+        })
+
+        // Preview dock floats above the whole call UI so its confirmation controls are not
+        // clipped by the fixed 16:9 video area. It contains both camera tiles and moves/resizes
+        // them as one unit while preserving the original portrait camera-preview aspect ratio.
+        previewDock = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            visibility = View.GONE
+            setOnTouchListener { _, ev -> handleLocalPreviewDrag(ev) }
+        }
+        root.addView(previewDock, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
+            topMargin = dp(14)
+            marginEnd = dp(14)
+        })
+
         localPreviewContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
             setOnTouchListener { _, ev -> handleLocalPreviewDrag(ev) }
         }
-        root.addView(localPreviewContainer, FrameLayout.LayoutParams(dp(112), -2, Gravity.TOP or Gravity.END).apply {
-            topMargin = dp(14)
-            marginEnd = dp(14)
-        })
+        previewDock.addView(localPreviewContainer, LinearLayout.LayoutParams(previewTileWidth, -2))
 
         // Local renderer (top-right floating preview tile)
         localRenderer = SurfaceViewRenderer(this).apply {
@@ -478,6 +517,21 @@ class NativeCallActivity : Activity(),
         }
         attachLocalRenderer()
 
+        remoteCameraContainer = FrameLayout(this).apply {
+            visibility = View.GONE
+            setBackgroundColor(Color.BLACK)
+            setOnTouchListener { _, ev -> handleLocalPreviewDrag(ev) }
+        }
+        previewDock.addView(remoteCameraContainer, LinearLayout.LayoutParams(previewTileWidth, previewTileHeight).apply {
+            marginStart = dp(8)
+        })
+        cameraRenderer = SurfaceViewRenderer(this).apply {
+            setZOrderMediaOverlay(true)
+            setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+            setOnTouchListener { _, ev -> handleLocalPreviewDrag(ev) }
+        }
+        remoteCameraContainer.addView(cameraRenderer, FrameLayout.LayoutParams(-1, -1))
+
         // Preview controls (below local renderer, only visible during preview)
         previewControls = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -485,7 +539,7 @@ class NativeCallActivity : Activity(),
             setBackgroundColor(Color.rgb(15, 17, 23))
             setPadding(dp(8), dp(8), dp(8), dp(8))
         }
-        localPreviewContainer.addView(previewControls, LinearLayout.LayoutParams(dp(112), -2).apply {
+        localPreviewContainer.addView(previewControls, LinearLayout.LayoutParams(previewTileWidth, -2).apply {
             topMargin = dp(6)
         })
         buildPreviewControls()
@@ -865,6 +919,7 @@ class NativeCallActivity : Activity(),
         peerMediaStates.clear()
         connectedPeerIds.clear()
         hasRemoteVideo = false
+        hasRemoteCamera = false
         videoStalled = false
         lastIceRestartAtMs = 0L
         micEnabled = false
@@ -897,7 +952,9 @@ class NativeCallActivity : Activity(),
             remoteRenderer,
             signaling,
             { msg -> runOnUiThread { updateHeaderStatus(msg) } },
-            { active -> runOnUiThread { setRemoteVideoActive(active) } }
+            { active -> runOnUiThread { setRemoteVideoActive(active) } },
+            cameraRenderer,
+            { active -> runOnUiThread { setRemoteCameraActive(active) } }
         ).also {
             it.dataListener = this
             it.start()
@@ -912,6 +969,7 @@ class NativeCallActivity : Activity(),
         rtc?.close()
         resetCallAudioRouting()
         hasRemoteVideo = false
+        hasRemoteCamera = false
         connectedPeerIds.clear()
         showJoinPanel()
         setCallActive(false)
@@ -987,7 +1045,7 @@ class NativeCallActivity : Activity(),
         bottomSpacer.visibility = visibility
         // Always GONE in fullscreen; otherwise only visible while previewing.
         previewControls.visibility = if (!fullscreen && inPreview) View.VISIBLE else View.GONE
-        localPreviewContainer.visibility = if (fullscreen) View.GONE else localPreviewVisibility()
+        updatePreviewDockVisibility()
         reactionPicker.visibility = View.GONE
         remoteRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
         updateVideoContainerLayout()
@@ -1033,6 +1091,11 @@ class NativeCallActivity : Activity(),
         checkFrameHealth()
     }
 
+    private fun setRemoteCameraActive(active: Boolean) {
+        hasRemoteCamera = active
+        updatePreviewDockVisibility()
+    }
+
     private fun renderHeaderStatus() {
         headerStatusLabel.text = if (videoStalled) "Paused - poor network" else headerStatus
     }
@@ -1074,11 +1137,22 @@ class NativeCallActivity : Activity(),
     private fun localPreviewVisibility(): Int =
         if ((cameraEnabled || inPreview) && !inPip && !fullscreen) View.VISIBLE else View.GONE
 
+    private fun remoteCameraVisibility(): Int =
+        if (hasRemoteCamera && !inPip && !fullscreen) View.VISIBLE else View.GONE
+
+    private fun updatePreviewDockVisibility() {
+        if (!::previewDock.isInitialized) return
+        val showDock = localPreviewVisibility() == View.VISIBLE || remoteCameraVisibility() == View.VISIBLE
+        previewDock.visibility = if (showDock) View.VISIBLE else View.GONE
+        localPreviewContainer.visibility = localPreviewVisibility()
+        remoteCameraContainer.visibility = remoteCameraVisibility()
+        if (showDock) keepLocalPreviewInBounds()
+    }
+
     private fun showLocalPreview() {
         attachLocalRenderer()
         localRenderer.visibility = View.VISIBLE
-        localPreviewContainer.visibility = localPreviewVisibility()
-        keepLocalPreviewInBounds()
+        updatePreviewDockVisibility()
     }
 
     private fun hideLocalRenderer() {
@@ -1087,11 +1161,12 @@ class NativeCallActivity : Activity(),
         localPreviewContainer.visibility = View.GONE
         detachLocalRenderer()
         previewDragging = false
+        updatePreviewDockVisibility()
     }
 
     private fun attachLocalRenderer() {
         if (localRendererAttached) return
-        localPreviewContainer.addView(localRenderer, 0, LinearLayout.LayoutParams(dp(112), dp(160)))
+        localPreviewContainer.addView(localRenderer, 0, LinearLayout.LayoutParams(previewTileWidth, previewTileHeight))
         localRendererAttached = true
     }
 
@@ -1102,30 +1177,32 @@ class NativeCallActivity : Activity(),
     }
 
     private fun resetLocalPreviewPosition() {
-        if (!::localPreviewContainer.isInitialized) return
-        localPreviewContainer.post {
-            val params = localPreviewContainer.layoutParams as FrameLayout.LayoutParams
+        if (!::previewDock.isInitialized) return
+        previewDock.post {
+            val params = previewDock.layoutParams as FrameLayout.LayoutParams
             params.gravity = Gravity.TOP or Gravity.END
             params.topMargin = videoContainer.top + dp(14)
             params.marginEnd = dp(14)
             params.leftMargin = 0
-            localPreviewContainer.layoutParams = params
-            localPreviewContainer.translationX = 0f
-            localPreviewContainer.translationY = 0f
+            previewDock.layoutParams = params
+            previewDock.translationX = 0f
+            previewDock.translationY = 0f
         }
     }
 
     private fun handleLocalPreviewDrag(ev: MotionEvent): Boolean {
-        if (!::localPreviewContainer.isInitialized) return false
+        if (!::previewDock.isInitialized) return false
+        previewScaleDetector.onTouchEvent(ev)
+        if (ev.pointerCount > 1 || previewScaleDetector.isInProgress) return true
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 previewDragging = true
                 previewDragStartRawX = ev.rawX
                 previewDragStartRawY = ev.rawY
                 // Anchor to the current VISUAL position (layout + any existing translation).
-                previewDragStartX = localPreviewContainer.x
-                previewDragStartY = localPreviewContainer.y
-                localPreviewContainer.parent?.requestDisallowInterceptTouchEvent(true)
+                previewDragStartX = previewDock.x
+                previewDragStartY = previewDock.y
+                previewDock.parent?.requestDisallowInterceptTouchEvent(true)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
@@ -1134,30 +1211,29 @@ class NativeCallActivity : Activity(),
                 val parentHeight = root.height
                 if (parentWidth <= 0 || parentHeight <= 0) return false
 
-                val minVisible = dp(60).toFloat()
                 val targetX = previewDragStartX + ev.rawX - previewDragStartRawX
                 val targetY = previewDragStartY + ev.rawY - previewDragStartRawY
 
-                // Clamp so at least minVisible pixels stay on screen.
+                // Clamp the whole dock inside the screen bounds.
                 val clampedX = targetX.coerceIn(
-                    minVisible - localPreviewContainer.width.toFloat(),
-                    parentWidth - minVisible
+                    0f,
+                    (parentWidth - previewDock.width).coerceAtLeast(0).toFloat()
                 )
                 val clampedY = targetY.coerceIn(
-                    minVisible - localPreviewContainer.height.toFloat(),
-                    parentHeight - minVisible
+                    0f,
+                    (parentHeight - previewDock.height).coerceAtLeast(0).toFloat()
                 )
 
                 // translation = desired visual position - layout position (left/top).
                 // This works regardless of current gravity or existing translation.
-                localPreviewContainer.translationX = clampedX - localPreviewContainer.left
-                localPreviewContainer.translationY = clampedY - localPreviewContainer.top
+                previewDock.translationX = clampedX - previewDock.left
+                previewDock.translationY = clampedY - previewDock.top
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (!previewDragging) return false
                 previewDragging = false
-                localPreviewContainer.parent?.requestDisallowInterceptTouchEvent(false)
+                previewDock.parent?.requestDisallowInterceptTouchEvent(false)
                 return true
             }
         }
@@ -1165,29 +1241,55 @@ class NativeCallActivity : Activity(),
     }
 
     private fun keepLocalPreviewInBounds() {
-        if (!::localPreviewContainer.isInitialized) return
-        localPreviewContainer.post {
-            if (localPreviewContainer.visibility != View.VISIBLE) return@post
+        if (!::previewDock.isInitialized) return
+        previewDock.post {
+            if (previewDock.visibility != View.VISIBLE) return@post
             val parentWidth = root.width
             val parentHeight = root.height
             if (parentWidth <= 0 || parentHeight <= 0) return@post
 
-            val minVisible = dp(60).toFloat()
-            val currentX = localPreviewContainer.x
-            val currentY = localPreviewContainer.y
+            val currentX = previewDock.x
+            val currentY = previewDock.y
 
             val clampedX = currentX.coerceIn(
-                minVisible - localPreviewContainer.width.toFloat(),
-                parentWidth - minVisible
+                0f,
+                (parentWidth - previewDock.width).coerceAtLeast(0).toFloat()
             )
             val clampedY = currentY.coerceIn(
-                minVisible - localPreviewContainer.height.toFloat(),
-                parentHeight - minVisible
+                0f,
+                (parentHeight - previewDock.height).coerceAtLeast(0).toFloat()
             )
 
             if (clampedX != currentX || clampedY != currentY) {
-                localPreviewContainer.translationX = clampedX - localPreviewContainer.left
-                localPreviewContainer.translationY = clampedY - localPreviewContainer.top
+                previewDock.translationX = clampedX - previewDock.left
+                previewDock.translationY = clampedY - previewDock.top
+            }
+        }
+    }
+
+    private fun setPreviewTileSize(width: Int) {
+        previewTileWidth = width
+        previewTileHeight = (previewTileWidth * 160f / 112f).toInt()
+        if (::localPreviewContainer.isInitialized) {
+            localPreviewContainer.layoutParams = (localPreviewContainer.layoutParams as LinearLayout.LayoutParams).apply {
+                this.width = previewTileWidth
+            }
+        }
+        if (localRendererAttached) {
+            localRenderer.layoutParams = (localRenderer.layoutParams as LinearLayout.LayoutParams).apply {
+                this.width = previewTileWidth
+                this.height = previewTileHeight
+            }
+        }
+        if (::remoteCameraContainer.isInitialized) {
+            remoteCameraContainer.layoutParams = (remoteCameraContainer.layoutParams as LinearLayout.LayoutParams).apply {
+                this.width = previewTileWidth
+                this.height = previewTileHeight
+            }
+        }
+        if (::previewControls.isInitialized) {
+            previewControls.layoutParams = (previewControls.layoutParams as LinearLayout.LayoutParams).apply {
+                this.width = previewTileWidth
             }
         }
     }
@@ -1807,6 +1909,7 @@ class NativeCallActivity : Activity(),
         stopFrameHealthMonitor()
         connectedPeerIds.clear()
         hasRemoteVideo = false
+        hasRemoteCamera = false
         fullscreen = false
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         updateVideoContainerLayout()
@@ -1814,6 +1917,7 @@ class NativeCallActivity : Activity(),
         headerBar.visibility = View.GONE
         bottomContainer.visibility = View.GONE
         hideLocalRenderer()
+        updatePreviewDockVisibility()
         previewControls.visibility = View.GONE
         reactionPicker.visibility = View.GONE
         chatExpanded = false
