@@ -1339,23 +1339,20 @@ class NativeCallActivity : Activity(),
             params.height = 0
             params.weight = 1f
         } else if (chatExpanded && keyboardVisible) {
-            params.height = 0
-            params.weight = 1f
+            // Shrink video to a small fixed height; chat fills the middle.
+            params.height = dp(80)
+            params.weight = 0f
         } else {
             params.height = normalVideoHeight
             params.weight = 0f
         }
         videoContainer.layoutParams = params
 
+        // bottomSpacer stays weight=1 so bottomContainer (controls) stays pinned to screen bottom.
         if (::bottomSpacer.isInitialized) {
             val spacerParams = bottomSpacer.layoutParams as LinearLayout.LayoutParams
-            if (chatExpanded && keyboardVisible) {
-                spacerParams.height = 0
-                spacerParams.weight = 0f
-            } else {
-                spacerParams.height = 0
-                spacerParams.weight = 1f
-            }
+            spacerParams.height = 0
+            spacerParams.weight = 1f
             bottomSpacer.layoutParams = spacerParams
         }
     }
@@ -1371,7 +1368,7 @@ class NativeCallActivity : Activity(),
         val rootHeight = root.height
         if (rootHeight <= 0) return dp(400)
         val desired = if (keyboardVisible) rootHeight else dp(400)
-        val minVideoHeight = if (keyboardVisible) dp(96) else normalVideoHeight
+        val minVideoHeight = if (keyboardVisible) dp(80) else normalVideoHeight
         val reserved = headerBar.height + minVideoHeight + controlsRow.height
         val available = rootHeight - reserved
         return available.coerceAtLeast(dp(130)).coerceAtMost(desired)
