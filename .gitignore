@@ -7,3 +7,4 @@ android/app-native/build/
 android/app-webview/build/
 prompts
 android/.kotlin/
+public/vidly-native.apk
