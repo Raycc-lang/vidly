@@ -179,6 +179,13 @@
     position: absolute; inset: 0; width: 100%; height: 100%;
     object-fit: contain; background: #000;
   }
+  .tile audio.remote-audio {
+    position: absolute;
+    width: 0;
+    height: 0;
+    opacity: 0;
+    pointer-events: none;
+  }
   .tile.placeholder::after {
     content: "Waiting for video…";
     position: absolute; inset: 0;
@@ -814,7 +821,7 @@
    ────────────────────────────────────────────────────────── */
 
 // ─── State ────────────────────────────────────────────────
-const peers = new Map(); // peerId -> { pc, dc, polite, makingOffer, ignoreOffer, videoEl, tileEl, remoteStream, dot }
+const peers = new Map(); // peerId -> { pc, dc, polite, makingOffer, ignoreOffer, videoEl, audioEl, tileEl, remoteStream, remoteAudioStream, dot }
 let localStream = null;
 let cameraStream = null;       // saved when screen sharing
 let screenStream = null;
@@ -906,6 +913,11 @@ function getClientId() {
     }
     return clientId;
 }
+
+// Fresh for each page load, stable across WebSocket reconnects in this page.
+// The server uses this to distinguish a network reconnect from a hard refresh
+// that needs peers to rebuild their WebRTC connection to this client.
+const pageSessionId = createClientId();
 
 // ─── Toast helper ─────────────────────────────────────────
 function toast(message, type = '') {
@@ -1710,7 +1722,7 @@ function handleSignaling(msg) {
         case 'welcome':
             myPeerId = msg.peerId;
             sendWs({ type: 'set-username', username: myUsername });
-            sendWs({ type: 'join', roomId, username: myUsername, clientId: getClientId() });
+            sendWs({ type: 'join', roomId, username: myUsername, clientId: getClientId(), pageSessionId });
             break;
 
         case 'joined':
@@ -1726,7 +1738,8 @@ function handleSignaling(msg) {
                 if (!liveIds.has(id)) removePeer(id);
             }
             for (const p of msg.peers) {
-                ensurePeer(p.peerId, /*polite*/ false, /*createDC*/ true, p.username);
+                const peer = ensurePeer(p.peerId, /*polite*/ false, /*createDC*/ true, p.username);
+                negotiatePeer(peer, 'joined existing peer');
             }
             updateEmptyState();
             break;
@@ -1748,8 +1761,15 @@ function handleSignaling(msg) {
             break;
 
         case 'peer-resumed':
-            removePeer(msg.peerId);
-            ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false, msg.username);
+            // Same page-session reconnect: keep the existing WebRTC/DataChannel
+            // alive. Hard refreshes are announced as peer-left + peer-joined so
+            // both sides rebuild stale peer connections only when needed.
+            if (peers.has(msg.peerId)) {
+                const peer = peers.get(msg.peerId);
+                if (msg.username) peer.username = msg.username;
+            } else {
+                ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false, msg.username);
+            }
             updateEmptyState();
             break;
 
@@ -1782,8 +1802,10 @@ function ensurePeer(peerId, polite, createDC, username) {
 
     const pc = new RTCPeerConnection({ iceServers });
     const remoteStream = new MediaStream();
-    const { tileEl, videoEl, dot } = createTile(peerId, username);
+    const remoteAudioStream = new MediaStream();
+    const { tileEl, videoEl, audioEl, dot } = createTile(peerId, username);
     videoEl.srcObject = remoteStream;
+    audioEl.srcObject = remoteAudioStream;
 
     peer = {
         id: peerId,
@@ -1791,7 +1813,7 @@ function ensurePeer(peerId, polite, createDC, username) {
         makingOffer: false, ignoreOffer: false,
         cameraSender: null, screenSender: null,
         iceRestartTimer: null,
-        videoEl, tileEl, remoteStream, remoteCameraStream: null, dot,
+        videoEl, audioEl, tileEl, remoteStream, remoteAudioStream, remoteCameraStream: null, dot,
         username: username || null,
         lastVideoFrameTime: null,
         videoTrackStartedAt: null,
@@ -1848,7 +1870,9 @@ function ensurePeer(peerId, polite, createDC, username) {
         if (e.candidate) sendSignal(peerId, { candidate: e.candidate });
     };
 
-    // Remote tracks → attach to remote MediaStream feeding the <video>.
+    // Remote tracks → attach video to the visible <video> and audio to a
+    // dedicated hidden <audio>. Keeping audio separate prevents video cleanup
+    // from pausing or detaching the audio playback pipeline.
     pc.ontrack = (e) => {
         console.log('[WebRTC] ontrack:', e.track.kind, e.track.id, 'readyState:', e.track.readyState);
         const track = e.track;
@@ -1864,15 +1888,11 @@ function ensurePeer(peerId, polite, createDC, username) {
             if (role === 'screen') renderRemoteVideoTrack(peer);
             else renderRemoteCameraTrack(peer);
         } else {
-            remoteStream.addTrack(track);
-
-            // Always update srcObject — both for video and audio tracks.
-            // If only audio arrives first, this bootstraps the video element
-            // so it's ready when video arrives later (Chrome autoplay fix).
-            videoEl.srcObject = remoteStream;
-            videoEl.style.display = '';
-            videoEl.play().catch(() => {});
-            tileEl.classList.remove('placeholder');
+            if (!peer.remoteAudioStream.getTracks().includes(track)) {
+                peer.remoteAudioStream.addTrack(track);
+            }
+            audioEl.srcObject = peer.remoteAudioStream;
+            audioEl.play().catch(() => {});
         }
 
         if (track.kind === 'video') {
@@ -1911,8 +1931,12 @@ function ensurePeer(peerId, polite, createDC, username) {
 
         track.onended = () => {
             console.log('[WebRTC] track ended:', track.kind);
-            try { remoteStream.removeTrack(track); } catch {}
-            if (track.kind === 'video') removeRemoteVideoTrack(peer, track);
+            if (track.kind === 'video') {
+                try { remoteStream.removeTrack(track); } catch {}
+                removeRemoteVideoTrack(peer, track);
+            } else {
+                try { peer.remoteAudioStream.removeTrack(track); } catch {}
+            }
         };
     };
 
@@ -1949,16 +1973,7 @@ function ensurePeer(peerId, polite, createDC, username) {
      * the transceiver set.
      */
     pc.onnegotiationneeded = async () => {
-        if (peer.makingOffer || pc.signalingState !== 'stable') return;
-        try {
-            peer.makingOffer = true;
-            await pc.setLocalDescription();
-            sendSignal(peerId, { description: pc.localDescription });
-        } catch (err) {
-            console.error('negotiationneeded failed', err);
-        } finally {
-            peer.makingOffer = false;
-        }
+        negotiatePeer(peer, 'negotiationneeded');
     };
 
     // DataChannel — created by the offerer (joining peer), received by answerer.
@@ -2010,6 +2025,19 @@ async function onPeerSignal(fromId, payload) {
 
 function sendSignal(to, payload) {
     sendWs({ type: 'signal', to, payload });
+}
+
+async function negotiatePeer(peer, reason) {
+    if (!peer || peer.makingOffer || peer.pc.signalingState !== 'stable') return;
+    try {
+        peer.makingOffer = true;
+        await peer.pc.setLocalDescription();
+        sendSignal(peer.id, { description: peer.pc.localDescription });
+    } catch (err) {
+        console.error('negotiation failed:', reason, err);
+    } finally {
+        peer.makingOffer = false;
+    }
 }
 
 function findSenderByKind(pc, kind) {
@@ -2191,6 +2219,10 @@ function removePeer(peerId) {
     }
     if (activeRemoteCameraPeerId === peerId) clearRemoteCameraVideo(peer);
     hideStallOverlay(peer.tileEl);
+    if (peer.audioEl) {
+        try { peer.audioEl.pause(); } catch {}
+        peer.audioEl.srcObject = null;
+    }
     try { peer.pc.close(); } catch {}
     if (peer.tileEl && peer.tileEl.parentNode) peer.tileEl.parentNode.removeChild(peer.tileEl);
     peers.delete(peerId);
@@ -2227,6 +2259,12 @@ function createTile(peerId, username) {
     video.playsInline = true;
     tile.appendChild(video);
 
+    const audio = document.createElement('audio');
+    audio.className = 'remote-audio';
+    audio.autoplay = true;
+    audio.playsInline = true;
+    tile.appendChild(audio);
+
     const label = document.createElement('div');
     label.className = 'tile-label';
     const dot = document.createElement('span');
@@ -2239,7 +2277,7 @@ function createTile(peerId, username) {
 
     grid.appendChild(tile);
     layoutGrid();
-    return { tileEl: tile, videoEl: video, dot };
+    return { tileEl: tile, videoEl: video, audioEl: audio, dot };
 }
 
 function layoutGrid() {

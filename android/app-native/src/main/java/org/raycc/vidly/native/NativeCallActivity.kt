@@ -153,6 +153,7 @@ class NativeCallActivity : Activity(),
     private var inPreview = false
     private var micEnabledBeforePreview = false
     private var callActive = false
+    private var userRequestedLeave = false
     private var currentRoom = ""
     private var currentUsername = ""
     private var hasRemoteVideo = false
@@ -285,7 +286,9 @@ class NativeCallActivity : Activity(),
     }
 
     override fun onDestroy() {
-        signaling.leave()
+        if (userRequestedLeave || !callActive) {
+            signaling.leave()
+        }
         signaling.dispose()
         rtc?.dispose()
         rtc = null
@@ -928,6 +931,7 @@ class NativeCallActivity : Activity(),
 
         currentRoom = room
         currentUsername = username
+        userRequestedLeave = false
 
         // Save to SharedPreferences
         getSharedPreferences("vidly_prefs", MODE_PRIVATE).edit().apply {
@@ -994,6 +998,7 @@ class NativeCallActivity : Activity(),
 
     private fun leaveCall() {
         stopFrameHealthMonitor()
+        userRequestedLeave = true
         signaling.leave()
         rtc?.close()
         resetCallAudioRouting()

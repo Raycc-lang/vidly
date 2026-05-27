@@ -523,6 +523,11 @@ class NativeWebRtcClient(
         peer.makingOffer = true
         peer.pc.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription) {
+                if (!peer.makingOffer) return
+                if (peer.pc.signalingState() != PeerConnection.SignalingState.STABLE) {
+                    peer.makingOffer = false
+                    return
+                }
                 setLocalAndSend(peer, desc)
             }
 
@@ -572,6 +577,30 @@ class NativeWebRtcClient(
         peer.ignoreOffer = !peer.polite && offerCollision
         if (peer.ignoreOffer) return
 
+        if (type == SessionDescription.Type.OFFER && offerCollision) {
+            peer.makingOffer = false
+            if (peer.pc.signalingState() != PeerConnection.SignalingState.STABLE) {
+                peer.pc.setLocalDescription(object : SimpleSdpObserver() {
+                    override fun onSetSuccess() {
+                        setRemoteDescription(peer, desc, type)
+                    }
+
+                    override fun onSetFailure(error: String) {
+                        status("Rollback failed: $error")
+                    }
+                }, SessionDescription(SessionDescription.Type.ROLLBACK, ""))
+                return
+            }
+        }
+
+        setRemoteDescription(peer, desc, type)
+    }
+
+    private fun setRemoteDescription(
+        peer: Peer,
+        desc: SessionDescription,
+        type: SessionDescription.Type
+    ) {
         peer.pc.setRemoteDescription(object : SimpleSdpObserver() {
             override fun onSetSuccess() {
                 if (type == SessionDescription.Type.OFFER) makeAnswer(peer)

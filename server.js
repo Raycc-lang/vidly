@@ -113,10 +113,12 @@ function leaveRoom(ws) {
         if (room) {
             if (room.get(peerId) === ws) {
                 room.delete(peerId);
-                for (const peer of room.values()) send(peer, { type: 'peer-left', peerId, username: ws.username || null });
-                const roomWatchers = watchers.get(roomId);
-                if (roomWatchers) {
-                    for (const watcher of roomWatchers) send(watcher, { type: 'peer-left', peerId, username: ws.username || null });
+                if (!ws.leftAnnounced) {
+                    for (const peer of room.values()) send(peer, { type: 'peer-left', peerId, username: ws.username || null });
+                    const roomWatchers = watchers.get(roomId);
+                    if (roomWatchers) {
+                        for (const watcher of roomWatchers) send(watcher, { type: 'peer-left', peerId, username: ws.username || null });
+                    }
                 }
             }
             if (room.size === 0) rooms.delete(roomId);
@@ -126,11 +128,31 @@ function leaveRoom(ws) {
     unwatchRoom(ws);
 }
 
+// Announce the peer as gone immediately, but keep it in the room map during
+// the grace period so the join handler can still match by clientId.
+function announcePeerLeft(ws) {
+    const { roomId, peerId } = ws;
+    if (!roomId || ws.leftAnnounced) return;
+    const room = rooms.get(roomId);
+    if (room) {
+        for (const peer of room.values()) {
+            if (peer !== ws) send(peer, { type: 'peer-left', peerId, username: ws.username || null });
+        }
+        const roomWatchers = watchers.get(roomId);
+        if (roomWatchers) {
+            for (const watcher of roomWatchers) send(watcher, { type: 'peer-left', peerId, username: ws.username || null });
+        }
+    }
+    ws.leftAnnounced = true;
+    unwatchRoom(ws);
+}
+
 function scheduleLeaveRoom(ws) {
     if (!ws.roomId || !ws.clientId) {
         leaveRoom(ws);
         return;
     }
+    announcePeerLeft(ws);
     if (ws.leaveTimer) clearTimeout(ws.leaveTimer);
     ws.leaveTimer = setTimeout(() => leaveRoom(ws), WS_REJOIN_GRACE_MS);
 }
@@ -151,6 +173,8 @@ wss.on('connection', (ws) => {
     ws.roomId = null;
     ws.watchingRoom = null;
     ws.clientId = null;
+    ws.pageSessionId = null;
+    ws.leftAnnounced = false;
     ws.leaveTimer = null;
     ws.isAlive = true;
     send(ws, { type: 'welcome', peerId: ws.peerId });
@@ -173,13 +197,18 @@ wss.on('connection', (ws) => {
             const roomId = msg.roomId;
             const username = typeof msg.username === 'string' ? msg.username.trim().slice(0, 32) : '';
             const clientId = typeof msg.clientId === 'string' ? msg.clientId.trim().slice(0, 64) : '';
+            const pageSessionId = typeof msg.pageSessionId === 'string' ? msg.pageSessionId.trim().slice(0, 64) : '';
             let room = rooms.get(roomId);
             if (!room) { room = new Map(); rooms.set(roomId, room); }
 
             let resumed = false;
+            let hardRefresh = false;
+            let peerLeftAnnounced = false;
             if (clientId) {
                 for (const peerWs of room.values()) {
                     if (peerWs.clientId === clientId) {
+                        hardRefresh = !!(pageSessionId && peerWs.pageSessionId !== pageSessionId);
+                        peerLeftAnnounced = !!peerWs.leftAnnounced;
                         if (peerWs.leaveTimer) {
                             clearTimeout(peerWs.leaveTimer);
                             peerWs.leaveTimer = null;
@@ -215,16 +244,23 @@ wss.on('connection', (ws) => {
             if (!resumed) room.set(ws.peerId, ws);
             ws.roomId = roomId;
             ws.clientId = clientId || null;
+            ws.pageSessionId = pageSessionId || null;
             // Store username from join message as well (backup for set-username)
             if (username) ws.username = username;
 
             if (resumed) {
                 for (const { peerId } of existingPeers) {
                     const peerWs = room.get(peerId);
-                    if (peerWs) send(peerWs, { type: 'peer-resumed', peerId: ws.peerId, username: ws.username || null });
+                    if (!peerWs) continue;
+                    if (hardRefresh || peerLeftAnnounced) {
+                        if (!peerLeftAnnounced) send(peerWs, { type: 'peer-left', peerId: ws.peerId, username: ws.username || null });
+                        send(peerWs, { type: 'peer-joined', peerId: ws.peerId, username: ws.username || null });
+                    } else {
+                        send(peerWs, { type: 'peer-resumed', peerId: ws.peerId, username: ws.username || null });
+                    }
                 }
             }
-            send(ws, { type: 'joined', roomId, peerId: ws.peerId, peers: existingPeers, resumed });
+            send(ws, { type: 'joined', roomId, peerId: ws.peerId, peers: existingPeers, resumed, hardRefresh });
             if (!resumed) {
                 for (const { peerId } of existingPeers) {
                     const peerWs = room.get(peerId);
@@ -234,7 +270,7 @@ wss.on('connection', (ws) => {
             const roomWatchers = watchers.get(roomId);
             if (roomWatchers) {
                 for (const watcher of roomWatchers) send(watcher, {
-                    type: resumed ? 'peer-resumed' : 'peer-joined',
+                    type: resumed && !hardRefresh && !peerLeftAnnounced ? 'peer-resumed' : 'peer-joined',
                     peerId: ws.peerId,
                     username: ws.username || null
                 });
