@@ -304,7 +304,8 @@ class NativeCallActivity : Activity(),
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (callActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val hasVideo = cameraEnabled || hasRemoteVideo
+        if (callActive && hasVideo && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
                 val params = PictureInPictureParams.Builder()
                     .setAspectRatio(Rational(16, 9))
