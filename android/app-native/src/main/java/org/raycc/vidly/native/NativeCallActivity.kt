@@ -1380,9 +1380,6 @@ class NativeCallActivity : Activity(),
         if (fullscreen) {
             params.height = 0
             params.weight = 1f
-        } else if (chatExpanded && keyboardVisible) {
-            params.height = 0
-            params.weight = 1f
         } else {
             params.height = normalVideoHeight
             params.weight = 0f
@@ -1391,13 +1388,8 @@ class NativeCallActivity : Activity(),
 
         if (::bottomSpacer.isInitialized) {
             val spacerParams = bottomSpacer.layoutParams as LinearLayout.LayoutParams
-            if (chatExpanded && keyboardVisible) {
-                spacerParams.height = 0
-                spacerParams.weight = 0f
-            } else {
-                spacerParams.height = 0
-                spacerParams.weight = 1f
-            }
+            spacerParams.height = 0
+            spacerParams.weight = 1f
             bottomSpacer.layoutParams = spacerParams
         }
     }
@@ -1424,18 +1416,15 @@ class NativeCallActivity : Activity(),
 
     private fun chatBottomMargin(): Int {
         val controlsHeight = controlsRow.height.takeIf { it > 0 } ?: dp(52)
-        return if (chatExpanded && keyboardVisible) keyboardInsetBottom + dp(4) else controlsHeight
+        return if (chatExpanded && keyboardVisible) keyboardInsetBottom else controlsHeight
     }
 
     private fun expandedChatHeight(): Int {
         val rootHeight = root.height
         if (rootHeight <= 0) return dp(400)
         val bottomMargin = chatBottomMargin()
-        val desired = if (keyboardVisible) rootHeight - bottomMargin else dp(400)
-        val minVideoHeight = if (keyboardVisible) dp(96) else normalVideoHeight
-        val reserved = headerBar.height + minVideoHeight + bottomMargin
-        val height = rootHeight - reserved
-        return height.coerceAtLeast(dp(130)).coerceAtMost(desired.coerceAtLeast(dp(130)))
+        val maxHeight = rootHeight - headerBar.height - bottomMargin
+        return dp(400).coerceAtMost(maxHeight.coerceAtLeast(dp(130)))
     }
 
     private fun hideKeyboard() {
