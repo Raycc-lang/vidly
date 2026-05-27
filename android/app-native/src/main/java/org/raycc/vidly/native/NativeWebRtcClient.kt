@@ -52,9 +52,6 @@ class NativeWebRtcClient(
     private val peers = LinkedHashMap<String, Peer>()
     private val iceServers = mutableListOf(
         PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-        PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
-        PeerConnection.IceServer.builder("stun:stun.cloudflare.com:3478").createIceServer(),
-        PeerConnection.IceServer.builder("stun:global.stun.twilio.com:3478").createIceServer()
     )
 
     private lateinit var factory: PeerConnectionFactory
