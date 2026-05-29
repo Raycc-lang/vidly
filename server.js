@@ -8,7 +8,9 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const TURN_URL = process.env.TURN_URL || '';
+const TURN_SERVER_URL = process.env.TURN_SERVER_URL || 'turn:xray.raycc.org:3478';
+const TURN_SECRET = process.env.TURN_SECRET || 'TURN_SECRET_PLACEHOLDER';
+const TURN_CREDENTIAL_TTL_SECONDS = parseInt(process.env.TURN_CREDENTIAL_TTL_SECONDS || '3600', 10);
 const ANDROID_VERSION_CODE = parseInt(process.env.ANDROID_VERSION_CODE || '1', 10);
 const ANDROID_VERSION_NAME = process.env.ANDROID_VERSION_NAME || '1.0';
 const ANDROID_APK_URL = process.env.ANDROID_APK_URL || 'https://voice.raycc.org/vidly-native.apk';
@@ -50,14 +52,37 @@ function sendFile(res, filePath, statusCode = 200) {
     });
 }
 
+function createTurnCredentials() {
+    const ttl = Number.isFinite(TURN_CREDENTIAL_TTL_SECONDS) && TURN_CREDENTIAL_TTL_SECONDS > 0
+        ? TURN_CREDENTIAL_TTL_SECONDS
+        : 3600;
+    const expires = Math.floor(Date.now() / 1000) + ttl;
+    const username = `${expires}:vidly`;
+    const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
+    return {
+        urls: TURN_SERVER_URL,
+        username,
+        credential,
+        ttl,
+        expires,
+    };
+}
+
+function sendTurnCredentials(res) {
+    const credentials = createTurnCredentials();
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({
+        ...credentials,
+        turnUrl: `${credentials.urls}?username=${encodeURIComponent(credentials.username)}&credential=${encodeURIComponent(credentials.credential)}`,
+    }));
+}
+
 const server = http.createServer((req, res) => {
     // Strip query string for routing
     const urlPath = (req.url || '/').split('?')[0];
 
-    // /config endpoint exposes TURN_URL to the client
-    if (urlPath === '/config' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ turnUrl: TURN_URL }));
+    if ((urlPath === '/turn-credentials' || urlPath === '/config') && req.method === 'GET') {
+        sendTurnCredentials(res);
         return;
     }
 
@@ -336,5 +361,5 @@ heartbeatTimer.unref?.();
 
 server.listen(PORT, () => {
     console.log(`Server listening on http://localhost:${PORT}`);
-    if (TURN_URL) console.log('TURN configured');
+    if (TURN_SERVER_URL && TURN_SECRET) console.log('TURN configured');
 });

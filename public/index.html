@@ -859,6 +859,10 @@ let intentionalClose = false;
 let wakeLock = null;
 let iceServers = [
     { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
 ];
 
 // ─── DOM refs ─────────────────────────────────────────────
@@ -1015,21 +1019,20 @@ window.addEventListener('popstate', () => location.reload());
 // ─── Server config (fetch TURN settings) ──────────────────
 async function loadConfig() {
     try {
-        const cfg = await (await fetch('/config')).json();
-        if (cfg.turnUrl) {
-            // TURN_URL format: "turn:HOST:PORT?username=USER&credential=PASS"
-            // The "turn:" scheme isn't recognised by the URL constructor, so we
-            // swap it for "https:" purely to get a parseable URL object.
-            const url = new URL(cfg.turnUrl.replace(/^turn:/, 'https:'));
-            const username = url.searchParams.get('username');
-            const credential = url.searchParams.get('credential');
+        const cfg = await (await fetch('/turn-credentials', { cache: 'no-store' })).json();
+        if (cfg.urls && cfg.username && cfg.credential) {
+            iceServers = iceServers.filter(server => {
+                const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+                return !urls.some(url => typeof url === 'string' && url.startsWith('turn:'));
+            });
             iceServers.push({
-                urls: 'turn:' + url.host + url.pathname.replace(/\/$/, ""),
-                username, credential
+                urls: cfg.urls,
+                username: cfg.username,
+                credential: cfg.credential
             });
         }
     } catch (e) {
-        console.warn('Failed to fetch /config', e);
+        console.warn('Failed to fetch /turn-credentials', e);
     }
 }
 

@@ -304,8 +304,7 @@ class NativeCallActivity : Activity(),
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        val hasVideo = cameraEnabled || hasRemoteVideo
-        if (callActive && hasVideo && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (callActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
                 val params = PictureInPictureParams.Builder()
                     .setAspectRatio(Rational(16, 9))
@@ -2363,19 +2362,17 @@ class NativeCallActivity : Activity(),
     }
 
     private fun loadTurnConfig(client: NativeWebRtcClient) {
-        http.newCall(Request.Builder().url(NativeSignalingClient.httpUrlFor("config")).build()).enqueue(object : Callback {
+        http.newCall(Request.Builder().url(NativeSignalingClient.httpUrlFor("turn-credentials")).build()).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) = Unit
 
             override fun onResponse(call: Call, response: Response) {
                 response.use {
-                    val turnUrl = JSONObject(it.body?.string().orEmpty()).optString("turnUrl")
-                    val match = Regex("""^turn:([^?]+)(?:\?(.+))?$""").matchEntire(turnUrl) ?: return
-                    val params = match.groupValues.getOrNull(2).orEmpty()
-                    val values = params.split("&").mapNotNull { part ->
-                        val pieces = part.split("=", limit = 2)
-                        if (pieces.size == 2) pieces[0] to pieces[1] else null
-                    }.toMap()
-                    client.addTurnServer("turn:${match.groupValues[1]}", values["username"], values["credential"])
+                    val json = JSONObject(it.body?.string().orEmpty())
+                    val urls = json.optString("urls")
+                    val username = json.optString("username")
+                    val credential = json.optString("credential")
+                    if (urls.isBlank() || username.isBlank() || credential.isBlank()) return
+                    client.addTurnServer(urls, username, credential)
                 }
             }
         })
