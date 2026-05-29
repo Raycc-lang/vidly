@@ -145,7 +145,7 @@ class NativeCallActivity : Activity(),
     private var fullscreen = false
 
     // State
-    private val signaling = NativeSignalingClient(this)
+    private val signaling = NativeSignalingClient(this, this)
     private val http = OkHttpClient()
     private var rtc: NativeWebRtcClient? = null
     private var micEnabled = false
