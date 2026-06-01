@@ -5,6 +5,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -36,19 +37,41 @@ const MIME = {
     '.map':  'application/json; charset=utf-8',
 };
 
+// MIME types worth compressing (text-based formats)
+const COMPRESSIBLE = new Set(['.html', '.js', '.css', '.json', '.svg', '.map']);
+
 function sendFile(res, filePath, statusCode = 200) {
-    fs.readFile(filePath, (err, data) => {
+    fs.stat(filePath, (err, stat) => {
         if (err) {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
             res.end('Not found');
             return;
         }
         const ext = path.extname(filePath).toLowerCase();
-        res.writeHead(statusCode, {
-            'Content-Type': MIME[ext] || 'application/octet-stream',
-            'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=300',
-        });
-        res.end(data);
+        const contentType = MIME[ext] || 'application/octet-stream';
+        const cacheControl = ext === '.html' ? 'no-cache' : 'public, max-age=300';
+        const acceptEncoding = res.req?.headers?.['accept-encoding'] || '';
+        const canGzip = COMPRESSIBLE.has(ext) && acceptEncoding.includes('gzip') && stat.size > 1024;
+
+        const headers = {
+            'Content-Type': contentType,
+            'Cache-Control': cacheControl,
+        };
+
+        if (canGzip) {
+            headers['Content-Encoding'] = 'gzip';
+            headers['Vary'] = 'Accept-Encoding';
+            res.writeHead(statusCode, headers);
+            const readStream = fs.createReadStream(filePath);
+            readStream.on('error', () => { try { res.end(); } catch {} });
+            readStream.pipe(zlib.createGzip({ level: 6 })).pipe(res);
+        } else {
+            headers['Content-Length'] = stat.size;
+            res.writeHead(statusCode, headers);
+            const readStream = fs.createReadStream(filePath);
+            readStream.on('error', () => { try { res.end(); } catch {} });
+            readStream.pipe(res);
+        }
     });
 }
 

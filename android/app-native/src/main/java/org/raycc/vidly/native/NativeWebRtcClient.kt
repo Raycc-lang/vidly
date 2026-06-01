@@ -334,6 +334,29 @@ class NativeWebRtcClient(
         return peer.fileChannel?.bufferedAmount() ?: 0
     }
 
+    /**
+     * Block until the file channel's bufferedAmount drops to [threshold] or below,
+     * up to [timeoutMs] milliseconds. Event-driven via DataChannel.Observer (no
+     * fixed-interval polling). Returns true if the threshold was met, false if the
+     * timeout fired, the channel closed, or the peer is gone.
+     */
+    fun waitForFileChannelDrain(peerId: String, threshold: Long, timeoutMs: Long): Boolean {
+        val peer = peers[peerId] ?: return false
+        val dc = peer.fileChannel ?: return false
+        synchronized(peer.fileChannelLock) {
+            if (dc.state() != DataChannel.State.OPEN) return false
+            if (dc.bufferedAmount() <= threshold) return true
+            try {
+                peer.fileChannelLock.wait(timeoutMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+            if (dc.state() != DataChannel.State.OPEN) return false
+            return dc.bufferedAmount() <= threshold
+        }
+    }
+
     fun knownPeers(): List<Pair<String, String?>> =
         peers.values.map { it.id to it.username }
 
@@ -668,8 +691,18 @@ class NativeWebRtcClient(
     private fun attachFileChannel(peer: Peer, dc: DataChannel) {
         peer.fileChannel = dc
         dc.registerObserver(object : DataChannel.Observer {
-            override fun onBufferedAmountChange(prev: Long) = Unit
-            override fun onStateChange() = Unit
+            override fun onBufferedAmountChange(prev: Long) {
+                // Wake any sender thread waiting for the SCTP queue to drain.
+                synchronized(peer.fileChannelLock) {
+                    peer.fileChannelLock.notifyAll()
+                }
+            }
+            override fun onStateChange() {
+                // State transitions (e.g. CLOSING) should release a stuck sender.
+                synchronized(peer.fileChannelLock) {
+                    peer.fileChannelLock.notifyAll()
+                }
+            }
             override fun onMessage(buffer: DataChannel.Buffer) {
                 if (!buffer.binary) return
                 val bytes = ByteArray(buffer.data.remaining())
@@ -776,6 +809,10 @@ class NativeWebRtcClient(
         var remoteScreenLive = false
         var chatChannel: DataChannel? = null
         var fileChannel: DataChannel? = null
+        // Monitor for event-driven backpressure on the file channel. Woken by
+        // DataChannel.Observer.onBufferedAmountChange so the sender thread doesn't
+        // have to poll bufferedAmount() with Thread.sleep().
+        val fileChannelLock: java.lang.Object = java.lang.Object()
 
         fun close() {
             runCatching { chatChannel?.close() }

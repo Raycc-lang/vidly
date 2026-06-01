@@ -881,9 +881,15 @@ const GIPHY_API_KEY = 'z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn';
 const GIPHY_LIMIT = 20;
 const MEDIA_URL_RE = /^https?:\/\/\S+\.(jpe?g|png|gif|webp)(\?\S*)?$/i;
 const GIF_SERVICE_RE = /^https?:\/\/\S*(giphy\.com|tenor\.com)\/\S+$/i;
-const FILE_CHUNK_SIZE = 16 * 1024;
-const FILE_BUFFER_HIGH = 256 * 1024;
-const FILE_BUFFER_LOW = 64 * 1024;
+// File transfer tuning. CHUNK_SIZE and BUFFER_HIGH are coupled: effective pipeline
+// depth ≈ BUFFER_HIGH / CHUNK_SIZE. Keep that ratio ≥ ~16 to avoid stop-and-wait.
+// BUFFER_HIGH must comfortably exceed the bandwidth-delay product of the slowest
+// link (TURN WAN ~500KB BDP); 1MB covers that headroom. CHUNK_SIZE must stay
+// under the negotiated SCTP maxMessageSize (typically 256KB in Chromium /
+// libwebrtc); 64KB is well inside that envelope and minimises iteration overhead.
+const FILE_CHUNK_SIZE = 64 * 1024;
+const FILE_BUFFER_HIGH = 1 * 1024 * 1024;
+const FILE_BUFFER_LOW = 256 * 1024;
 const outgoingFiles = new Map(); // fileId -> { file, peers:Set, accepted:Set, completed:Set, rejected:Set, card }
 const objectURLs = new Set();   // revoke on beforeunload to prevent memory leaks
 const incomingFiles = new Map(); // fileId -> { peer, meta, chunks, received, card, lastProgressSent }
@@ -2578,7 +2584,7 @@ function receiveFileOffer(peer, meta) {
     messagesEl.scrollTop = messagesEl.scrollHeight;
     updateChatCompact();
 
-    const transfer = { peer, meta, chunks: [], received: 0, card, lastProgressSent: 0 };
+    const transfer = { peer, meta, chunks: [], received: 0, card, lastProgressSent: 0, startedAt: performance.now() };
     incomingFiles.set(meta.id, transfer);
 
     if (peer.activeIncomingFileId) {
@@ -2599,14 +2605,40 @@ async function sendFileToPeer(peer, transfer) {
         sendPeerDataMessage(peer, { type: 'file-empty', id: transfer.meta.id });
         return;
     }
+    // Clamp chunk size to the negotiated SCTP message size, defensively.
+    const maxMsg = peer.pc?.sctp?.maxMessageSize | 0;
+    const chunkSize = (maxMsg > 0 && maxMsg < FILE_CHUNK_SIZE) ? maxMsg : FILE_CHUNK_SIZE;
+    const size = transfer.file.size;
+    // Prefetch the first chunk so disk I/O overlaps with the wait-for-buffer.
     let offset = 0;
-    while (offset < transfer.file.size) {
+    let pending = transfer.file.slice(0, Math.min(chunkSize, size)).arrayBuffer();
+    // Lightweight metrics — one summary line per transfer.
+    const t0 = performance.now();
+    let waitMs = 0;
+    let readMs = 0;
+    while (offset < size) {
         if (dc.readyState !== 'open') throw new Error('file channel is closed');
-        const chunk = await transfer.file.slice(offset, offset + FILE_CHUNK_SIZE).arrayBuffer();
+        const readStart = performance.now();
+        const chunk = await pending;
+        readMs += performance.now() - readStart;
+        const nextOff = offset + chunk.byteLength;
+        // Kick off the next disk read BEFORE awaiting backpressure, so it overlaps.
+        pending = nextOff < size
+            ? transfer.file.slice(nextOff, Math.min(nextOff + chunkSize, size)).arrayBuffer()
+            : null;
+        const waitStart = performance.now();
         await waitForFileBuffer(dc);
+        waitMs += performance.now() - waitStart;
+        if (dc.readyState !== 'open') throw new Error('file channel is closed');
         dc.send(chunk);
-        offset += chunk.byteLength;
+        offset = nextOff;
     }
+    const totalMs = performance.now() - t0;
+    const mbps = (size * 8) / (totalMs * 1000); // bits/us == Mb/s
+    console.log(
+        `[file-send] ${transfer.meta.name} ${formatBytes(size)} in ${totalMs.toFixed(0)}ms ` +
+        `→ ${mbps.toFixed(1)} Mb/s | chunk=${chunkSize} read=${readMs.toFixed(0)}ms wait=${waitMs.toFixed(0)}ms`
+    );
 }
 
 function waitForFileBuffer(dc) {
@@ -2618,9 +2650,13 @@ function waitForFileBuffer(dc) {
             if (poll) clearInterval(poll);
             resolve();
         };
+        // Trust the `bufferedamountlow` event in foreground tabs; keep a long-interval
+        // poll only as a safety net for background-tab throttling or missed events.
+        // (A short poll here previously injected up to 25ms of idle into every refill
+        // cycle and was the dominant tail-latency cost on fast links.)
         poll = setInterval(() => {
             if (dc.bufferedAmount <= FILE_BUFFER_LOW || dc.readyState !== 'open') done();
-        }, 25);
+        }, 250);
         dc.addEventListener('bufferedamountlow', done);
     });
 }
@@ -2649,6 +2685,13 @@ function completeIncomingFile(peer, id) {
     const transfer = incomingFiles.get(id);
     if (!transfer || transfer.peer !== peer) return;
     const blob = new Blob(transfer.chunks, { type: transfer.meta.type || 'application/octet-stream' });
+    const totalMs = performance.now() - (transfer.startedAt || performance.now());
+    const bytes = transfer.received || transfer.meta.size || 0;
+    const mbps = totalMs > 0 ? (bytes * 8) / (totalMs * 1000) : 0;
+    console.log(
+        `[file-recv] ${transfer.meta.name} ${formatBytes(bytes)} in ${totalMs.toFixed(0)}ms ` +
+        `→ ${mbps.toFixed(1)} Mb/s | chunks=${transfer.chunks.length}`
+    );
     transfer.card.el.remove();
     incomingFiles.delete(transfer.meta.id);
     if (peer.activeIncomingFileId === transfer.meta.id) peer.activeIncomingFileId = null;

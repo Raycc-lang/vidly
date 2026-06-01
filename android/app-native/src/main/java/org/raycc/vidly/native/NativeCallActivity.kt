@@ -222,7 +222,8 @@ class NativeCallActivity : Activity(),
         var fromUsername: String?,
         val chunks: MutableList<ByteArray> = mutableListOf(),
         var received: Long = 0,
-        var lastProgressSent: Long = 0
+        var lastProgressSent: Long = 0,
+        val startedAt: Long = SystemClock.elapsedRealtime()
     )
     private val outgoingFiles = HashMap<String, OutgoingFile>()
     private val incomingFiles = HashMap<String, IncomingFile>()
@@ -1899,20 +1900,38 @@ class NativeCallActivity : Activity(),
         }
         var offset = 0
         val chunkSize = FILE_CHUNK_SIZE
+        val t0 = SystemClock.elapsedRealtime()
+        var waitMs = 0L
         while (offset < file.bytes.size) {
             val rtcRef = rtc ?: break
+            // Event-driven backpressure: wake up the moment the SCTP queue drains
+            // below FILE_BUFFER_HIGH, with a 200ms safety timeout. The previous
+            // 20ms fixed sleep added up to 20ms of idle to every refill cycle.
             while (rtcRef.fileChannelBufferedAmount(peerId) > FILE_BUFFER_HIGH) {
-                try { Thread.sleep(20) } catch (_: InterruptedException) { return }
+                val ws = SystemClock.elapsedRealtime()
+                // Returns true when drained, false on timeout / closed / interrupt.
+                // On false we just re-check the while condition; if the channel
+                // really closed, bufferedAmount() returns 0 and the loop exits,
+                // then sendFileChunk() will fail and we report the error.
+                rtcRef.waitForFileChannelDrain(peerId, FILE_BUFFER_HIGH, 200)
+                waitMs += SystemClock.elapsedRealtime() - ws
+                if (Thread.currentThread().isInterrupted) return
             }
             val end = minOf(offset + chunkSize, file.bytes.size)
             val chunk = file.bytes.copyOfRange(offset, end)
-            val ok = rtcRef.sendFileChunk(peerId, chunk)
-            if (!ok) {
+            val sentOk = rtcRef.sendFileChunk(peerId, chunk)
+            if (!sentOk) {
                 runOnUiThread { appendChatText("System", "File send failed: ${file.name}", incoming = true) }
                 return
             }
             offset = end
         }
+        val totalMs = SystemClock.elapsedRealtime() - t0
+        val mbps = if (totalMs > 0) (file.bytes.size.toLong() * 8L) / totalMs / 1000.0 else 0.0
+        android.util.Log.i(
+            "VidlyFile",
+            "send ${file.name} ${file.bytes.size}B in ${totalMs}ms → %.1f Mb/s (chunk=$chunkSize wait=${waitMs}ms)".format(mbps)
+        )
     }
 
     private fun handleFileReject(fromPeerId: String, id: String) {
@@ -1939,6 +1958,12 @@ class NativeCallActivity : Activity(),
     }
 
     private fun completeIncomingFile(transfer: IncomingFile) {
+        val totalMs = SystemClock.elapsedRealtime() - transfer.startedAt
+        val mbps = if (totalMs > 0) (transfer.received * 8L) / totalMs / 1000.0 else 0.0
+        android.util.Log.i(
+            "VidlyFile",
+            "recv ${transfer.name} ${transfer.received}B in ${totalMs}ms → %.1f Mb/s (chunks=${transfer.chunks.size})".format(mbps)
+        )
         val all = ByteArray(transfer.received.toInt())
         var offset = 0
         for (chunk in transfer.chunks) {
@@ -2448,8 +2473,13 @@ class NativeCallActivity : Activity(),
         private const val FILE_PICK_REQUEST = 5102
         private const val STATE_ROOM = "stateRoom"
         private const val STATE_USERNAME = "stateUsername"
-        private const val FILE_CHUNK_SIZE = 16 * 1024
-        private const val FILE_BUFFER_HIGH = 256L * 1024L
+        // File transfer tuning. CHUNK_SIZE and BUFFER_HIGH are coupled: effective
+        // pipeline depth ≈ BUFFER_HIGH / CHUNK_SIZE. Keep that ratio ≥ ~16 to avoid
+        // stop-and-wait. BUFFER_HIGH must comfortably exceed the bandwidth-delay
+        // product of the slowest link (TURN WAN ~500KB BDP). Must match the web
+        // client's constants (public/index.html) for symmetric throughput.
+        private const val FILE_CHUNK_SIZE = 64 * 1024
+        private const val FILE_BUFFER_HIGH = 1L * 1024L * 1024L
         private const val APK_CACHE_DIR = "updates"
         private const val FRAME_STALL_MS = 5000L
         private const val FRAME_HEALTH_CHECK_MS = 3000L
