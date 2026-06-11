@@ -16,6 +16,8 @@ const ANDROID_VERSION_CODE = parseInt(process.env.ANDROID_VERSION_CODE || '1', 1
 const ANDROID_VERSION_NAME = process.env.ANDROID_VERSION_NAME || '1.0';
 const ANDROID_APK_URL = process.env.ANDROID_APK_URL || 'https://voice.raycc.org/vidly-native.apk';
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const CRASH_LOGS_DIR = path.join(__dirname, 'crash-logs');
+const CRASH_MAX_BYTES = 512 * 1024; // cap per report — keep the 1GB VPS safe
 const WS_REJOIN_GRACE_MS = parseInt(process.env.WS_REJOIN_GRACE_MS || '180000', 10);
 const WS_PING_INTERVAL_MS = parseInt(process.env.WS_PING_INTERVAL_MS || '25000', 10);
 
@@ -100,12 +102,72 @@ function sendTurnCredentials(res) {
     }));
 }
 
+function saveCrashReport(req, res) {
+    let size = 0;
+    const chunks = [];
+    let aborted = false;
+    req.on('data', (chunk) => {
+        if (aborted) return;
+        size += chunk.length;
+        if (size > CRASH_MAX_BYTES) {
+            aborted = true;
+            res.writeHead(413, { 'Content-Type': 'text/plain' });
+            res.end('Crash report too large');
+            req.destroy();
+            return;
+        }
+        chunks.push(chunk);
+    });
+    req.on('end', () => {
+        if (aborted) return;
+        const body = Buffer.concat(chunks).toString('utf8');
+        let report;
+        try { report = JSON.parse(body); } catch {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('Invalid JSON');
+            return;
+        }
+        const ts = (report.timestamp || new Date().toISOString()).replace(/[:.]/g, '-');
+        const model = String(report.deviceModel || 'unknown').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64);
+        const rand = crypto.randomBytes(3).toString('hex');
+        const fileName = `${ts}_${model}_${rand}.json`;
+        fs.mkdir(CRASH_LOGS_DIR, { recursive: true }, (mkErr) => {
+            if (mkErr) {
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                res.end('Could not store crash report');
+                return;
+            }
+            fs.writeFile(path.join(CRASH_LOGS_DIR, fileName), JSON.stringify(report, null, 2), (writeErr) => {
+                if (writeErr) {
+                    res.writeHead(500, { 'Content-Type': 'text/plain' });
+                    res.end('Could not store crash report');
+                    return;
+                }
+                console.log(`Crash report saved: ${fileName}`);
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ ok: true }));
+            });
+        });
+    });
+    req.on('error', () => {
+        if (!res.headersSent) {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('Bad request');
+        }
+    });
+}
+
 const server = http.createServer((req, res) => {
     // Strip query string for routing
     const urlPath = (req.url || '/').split('?')[0];
 
     if ((urlPath === '/turn-credentials' || urlPath === '/config') && req.method === 'GET') {
         sendTurnCredentials(res);
+        return;
+    }
+
+    if (urlPath === '/crash' && req.method === 'POST') {
+        saveCrashReport(req, res);
         return;
     }
 
