@@ -7,6 +7,7 @@ import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import org.webrtc.Camera2Enumerator
 import org.webrtc.CameraEnumerator
+import org.webrtc.CameraVideoCapturer
 import org.webrtc.DataChannel
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
@@ -22,7 +23,6 @@ import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.SurfaceViewRenderer
-import org.webrtc.VideoCapturer
 import org.webrtc.VideoSink
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
@@ -56,7 +56,7 @@ class NativeWebRtcClient(
 
     private lateinit var factory: PeerConnectionFactory
     private var surfaceHelper: SurfaceTextureHelper? = null
-    private var capturer: VideoCapturer? = null
+    private var capturer: CameraVideoCapturer? = null
     private var videoSource: VideoSource? = null
     private var audioSource: AudioSource? = null
     private var localVideoTrack: VideoTrack? = null
@@ -66,6 +66,12 @@ class NativeWebRtcClient(
     private var remoteScreenTrack: VideoTrack? = null
     private var renderedRemoteVideoTrack: VideoTrack? = null
     private var renderedRemoteCameraTrack: VideoTrack? = null
+    // Remote toggled its camera/screen off. We keep the cached remote VideoTrack
+    // (so we can resume rendering when it comes back) but stop drawing it. The
+    // remote uses a stable RtpSender across off→on, so no new track arrives and
+    // pc.onTrack does NOT refire; we must re-attach the existing track ourselves.
+    private var remoteCameraPaused = false
+    private var remoteScreenPaused = false
     @Volatile private var remoteVideoFrameTimestampMs: Long = 0L
     private val remoteVideoFrameSink = VideoSink {
         remoteVideoFrameTimestampMs = SystemClock.elapsedRealtime()
@@ -88,10 +94,6 @@ class NativeWebRtcClient(
         localRenderer.init(eglBase.eglBaseContext, null)
         remoteRenderer.init(eglBase.eglBaseContext, null)
         cameraRenderer?.init(eglBase.eglBaseContext, null)
-        localRenderer.setMirror(true)
-        remoteRenderer.setMirror(false)
-        cameraRenderer?.setMirror(false)
-
         val adm = JavaAudioDeviceModule.builder(context).createAudioDeviceModule()
         factory = PeerConnectionFactory.builder()
             .setAudioDeviceModule(adm)
@@ -201,7 +203,11 @@ class NativeWebRtcClient(
 
     /** Start camera preview: capture + show in localRenderer; do NOT push to peer senders. */
     fun startCameraPreview() {
-        ensureVideoTrack()
+        if (localVideoTrack != null) {
+            resumeVideo()
+        } else {
+            ensureVideoTrack()
+        }
         localVideoTrack?.setEnabled(true)
         status("Previewing camera")
     }
@@ -232,24 +238,31 @@ class NativeWebRtcClient(
 
     fun setCameraEnabled(enabled: Boolean) {
         if (enabled) {
-            ensureVideoTrack()
+            // Reuse the existing track on resume so the remote peer keeps the
+            // same RtpReceiver track. Replacing the track (sender.setTrack with
+            // a fresh one) does not re-fire pc.ontrack on the receiver, leaving
+            // the web client pointed at the old (disposed) track and the video
+            // never resumes for them.
+            if (localVideoTrack == null) {
+                ensureVideoTrack()
+            } else {
+                resumeVideo()
+            }
             val track = localVideoTrack ?: return
             track.setEnabled(true)
             peers.values.forEach { peer ->
                 if (peer.videoSender == null) {
                     peer.videoSender = peer.pc.addTrack(track, listOf(LOCAL_STREAM_ID))
-                } else {
-                    peer.videoSender?.setTrack(track, false)
                 }
             }
             cameraLive = true
             status("Camera on")
         } else {
-            // Detach but keep sender so we don't have to renegotiate next time on.
-            peers.values.forEach { peer ->
-                peer.videoSender?.setTrack(null, false)
-            }
-            stopVideo()
+            // Keep the track and sender alive across off→on toggles. We just
+            // release the camera (so the indicator goes away and the encoder
+            // stops sending) and disable the track so any in-flight frames
+            // are dropped before reaching peers.
+            pauseVideo()
             cameraLive = false
             status("Camera off")
         }
@@ -262,6 +275,23 @@ class NativeWebRtcClient(
 
     fun setBeautyIntensity(value: Float) {
         beautyProcessor.intensity = value
+    }
+
+    fun switchCamera() {
+        val activeCapturer = capturer
+        if (activeCapturer == null || localVideoTrack == null) {
+            status("Camera is off")
+            return
+        }
+        activeCapturer.switchCamera(object : CameraVideoCapturer.CameraSwitchHandler {
+            override fun onCameraSwitchDone(isFrontCamera: Boolean) {
+                status(if (isFrontCamera) "Front camera" else "Back camera")
+            }
+
+            override fun onCameraSwitchError(error: String) {
+                status("Camera switch failed: $error")
+            }
+        })
     }
 
     fun close() {
@@ -405,6 +435,61 @@ class NativeWebRtcClient(
         localRenderer.clearImage()
     }
 
+    /**
+     * Pause the local camera without disposing the track/capturer/source/sender.
+     * Keeps the same VideoTrack on every peer's RtpSender so resuming does not
+     * require track replacement (which would not re-fire pc.ontrack on the
+     * remote receiver). Safe to call when video is not currently set up.
+     */
+    private fun pauseVideo() {
+        localVideoTrack?.setEnabled(false)
+        runCatching { capturer?.stopCapture() }
+    }
+
+    /**
+     * Resume the local camera after [pauseVideo]. Restarts capture on the
+     * existing capturer and re-enables the track. Falls back to a full pipeline
+     * rebuild if the capturer is gone or fails to restart; in that case the new
+     * track is reattached to any existing RtpSender via [RtpSender.setTrack]
+     * so the remote transceiver (and the receiver's MediaStreamTrack) stays
+     * the same and we avoid an SDP renegotiation we don't need.
+     */
+    private fun resumeVideo() {
+        capturer?.let { activeCapturer ->
+            runCatching { activeCapturer.startCapture(1280, 720, 30) }
+                .onSuccess {
+                    localVideoTrack?.setEnabled(true)
+                    return
+                }
+                .onFailure { status("Camera restart failed, recreating: ${it.localizedMessage}") }
+        }
+
+        // Snapshot sender state BEFORE tearing things down. `cameraLive` is
+        // already false at this point (setCameraEnabled sets it after us),
+        // so use sender presence instead to decide whether to reattach.
+        val hadVideoSender = peers.values.any { it.videoSender != null }
+
+        runCatching { capturer?.stopCapture() }
+        capturer?.dispose()
+        capturer = null
+        videoSource?.dispose()
+        videoSource = null
+        surfaceHelper?.dispose()
+        surfaceHelper = null
+        localVideoTrack?.removeSink(localRenderer)
+        localVideoTrack?.dispose()
+        localVideoTrack = null
+        ensureVideoTrack()
+
+        val track = localVideoTrack ?: return
+        track.setEnabled(true)
+        if (hadVideoSender) {
+            peers.values.forEach { peer ->
+                peer.videoSender?.setTrack(track, false)
+            }
+        }
+    }
+
     private fun clearRemoteVideo() {
         detachRenderedRemoteVideo()
         detachRenderedRemoteCamera()
@@ -415,6 +500,8 @@ class NativeWebRtcClient(
         remoteScreenTrack?.removeSink(remoteRenderer)
         remoteCameraTrack = null
         remoteScreenTrack = null
+        remoteCameraPaused = false
+        remoteScreenPaused = false
         remoteVideoPeerId = null
         remoteVideoFrameTimestampMs = 0L
         remoteRenderer.clearImage()
@@ -435,7 +522,7 @@ class NativeWebRtcClient(
     }
 
     private fun updateRenderedRemoteVideo() {
-        val track = remoteScreenTrack
+        val track = if (remoteScreenPaused) null else remoteScreenTrack
         if (renderedRemoteVideoTrack === track) return
         detachRenderedRemoteVideo()
         remoteVideoFrameTimestampMs = 0L
@@ -453,7 +540,7 @@ class NativeWebRtcClient(
     }
 
     private fun updateRenderedRemoteCamera() {
-        val track = remoteCameraTrack
+        val track = if (remoteCameraPaused) null else remoteCameraTrack
         if (renderedRemoteCameraTrack === track) return
         detachRenderedRemoteCamera()
         renderedRemoteCameraTrack = track
@@ -473,10 +560,12 @@ class NativeWebRtcClient(
         var screenChanged = false
         if (remoteCameraTrack === track) {
             remoteCameraTrack = null
+            remoteCameraPaused = false
             cameraChanged = true
         }
         if (remoteScreenTrack === track) {
             remoteScreenTrack = null
+            remoteScreenPaused = false
             screenChanged = true
         }
         if (screenChanged) updateRenderedRemoteVideo()
@@ -503,7 +592,7 @@ class NativeWebRtcClient(
         audioSource = null
     }
 
-    private fun createCameraCapturer(enumerator: CameraEnumerator): VideoCapturer? {
+    private fun createCameraCapturer(enumerator: CameraEnumerator): CameraVideoCapturer? {
         enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }?.let {
             return enumerator.createCapturer(it, null)
         }
@@ -667,20 +756,18 @@ class NativeWebRtcClient(
                 if (json.optString("type") == "media-state") {
                     peer.remoteCameraLive = json.optBoolean("cam", false)
                     peer.remoteScreenLive = json.optBoolean("screen", false)
-                    val remoteVideoLive = if (json.has("video")) {
-                        json.optBoolean("video", false)
-                    } else {
-                        peer.remoteCameraLive || peer.remoteScreenLive
-                    }
-                    if (!remoteVideoLive && remoteVideoPeerId == peer.id) {
-                        clearRemoteVideo()
-                    } else if (remoteVideoPeerId == peer.id) {
-                        if (!peer.remoteCameraLive && remoteCameraTrack != null) {
-                            removeRemoteVideoTrack(remoteCameraTrack!!)
-                        }
-                        if (!peer.remoteScreenLive && remoteScreenTrack != null) {
-                            removeRemoteVideoTrack(remoteScreenTrack!!)
-                        }
+                    if (remoteVideoPeerId == peer.id) {
+                        // A media-state toggle is a PAUSE, not a track teardown:
+                        // the remote keeps its RtpSender (no renegotiation), so
+                        // the cached VideoTrack stays valid and frames will flow
+                        // again when it resumes. Only stop/start rendering; never
+                        // null the track here (that's what onRemoveTrack /
+                        // peer-left are for). Otherwise camera off→on would never
+                        // re-render because pc.onTrack does not refire.
+                        remoteCameraPaused = !peer.remoteCameraLive
+                        remoteScreenPaused = !peer.remoteScreenLive
+                        updateRenderedRemoteCamera()
+                        updateRenderedRemoteVideo()
                     }
                 }
                 dataListener?.onChatMessage(peer.id, sender ?: peer.username, json)

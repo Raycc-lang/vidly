@@ -2335,6 +2335,34 @@ function attachDataChannel(peer, dc) {
                 if (!peer.mediaState.screen && peer.remoteScreenTrack) {
                     removeRemoteVideoTrack(peer, peer.remoteScreenTrack);
                 }
+                // Remote may have toggled its camera off then on. With a
+                // stable RtpSender (no renegotiation) the receiver track
+                // identity is unchanged, so pc.ontrack does NOT refire. We
+                // previously nulled remoteCameraTrack on cam:false above, so
+                // find a live video receiver that isn't the screen track and
+                // re-bind it now that the remote is sending again.
+                if (peer.mediaState.cam && !peer.remoteCameraTrack) {
+                    const cameraTrack = peer.pc.getReceivers()
+                        .map(r => r.track)
+                        .find(t => t && t.kind === 'video' &&
+                                   t.readyState === 'live' &&
+                                   t !== peer.remoteScreenTrack);
+                    if (cameraTrack) {
+                        peer.remoteCameraTrack = cameraTrack;
+                        renderRemoteCameraTrack(peer);
+                    }
+                }
+                if (peer.mediaState.screen && !peer.remoteScreenTrack) {
+                    const screenTrack = peer.pc.getReceivers()
+                        .map(r => r.track)
+                        .find(t => t && t.kind === 'video' &&
+                                   t.readyState === 'live' &&
+                                   t !== peer.remoteCameraTrack);
+                    if (screenTrack) {
+                        peer.remoteScreenTrack = screenTrack;
+                        renderRemoteVideoTrack(peer);
+                    }
+                }
             }
         } else if (msg.type && msg.type.startsWith('file-')) {
             handleFileControl(peer, msg);

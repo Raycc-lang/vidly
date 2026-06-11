@@ -18,7 +18,9 @@ import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -60,7 +62,6 @@ import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
@@ -129,12 +130,12 @@ class NativeCallActivity : Activity(),
     // Preview controls (below local renderer)
     private lateinit var previewControls: LinearLayout
     private var beautySwitch: Switch? = null
-    private var beautySlider: SeekBar? = null
 
     // Bottom buttons
     private var micButton: Button? = null
     private var cameraButton: Button? = null
     private var speakerButton: Button? = null
+    private var hangupButton: Button? = null
 
     // PiP / proximity
     private var proximityWakeLock: PowerManager.WakeLock? = null
@@ -305,7 +306,8 @@ class NativeCallActivity : Activity(),
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (callActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val hasVideo = cameraEnabled || hasRemoteVideo
+        if (callActive && hasVideo && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
                 val params = PictureInPictureParams.Builder()
                     .setAspectRatio(Rational(16, 9))
@@ -492,8 +494,11 @@ class NativeCallActivity : Activity(),
         }
         videoContainer.addView(remoteRenderer, FrameLayout.LayoutParams(-1, -1))
 
-        previewTileWidth = dp(112)
-        previewTileHeight = dp(160)
+        val screenWidthPx = resources.displayMetrics.widthPixels
+        previewTileWidth = ((screenWidthPx - dp(36)) / 2).coerceAtLeast(dp(112))
+        previewTileHeight = (previewTileWidth * 160f / 112f).toInt()
+        val minTilePx = dp(96)
+        val maxTilePx = ((screenWidthPx - dp(20)) / 2).coerceAtLeast(previewTileWidth + dp(40))
         previewScaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 previewScaleStartWidth = previewTileWidth
@@ -503,7 +508,7 @@ class NativeCallActivity : Activity(),
 
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 val newWidth = (previewScaleStartWidth * detector.scaleFactor).toInt()
-                    .coerceIn(dp(84), dp(224))
+                    .coerceIn(minTilePx, maxTilePx)
                 setPreviewTileSize(newWidth)
                 keepLocalPreviewInBounds()
                 return true
@@ -644,20 +649,32 @@ class NativeCallActivity : Activity(),
     }
 
     private fun buildPreviewControls() {
-        val confirmCancelRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val confirmCancelRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         previewControls.addView(confirmCancelRow, LinearLayout.LayoutParams(-1, -2))
 
-        val confirmBtn = Button(this).apply {
-            text = "✓"
+        val confirmBtn = compactIconButton("✓", Color.WHITE, Color.rgb(45, 164, 78)).apply {
             setOnClickListener { confirmPreview() }
         }
-        confirmCancelRow.addView(confirmBtn, LinearLayout.LayoutParams(0, dp(40), 1f))
+        confirmCancelRow.addView(confirmBtn, LinearLayout.LayoutParams(0, dp(36), 1f))
 
-        val cancelBtn = Button(this).apply {
-            text = "✕"
+        val cancelBtn = compactIconButton("✕", Color.WHITE, Color.rgb(58, 63, 77)).apply {
             setOnClickListener { cancelPreview() }
         }
-        confirmCancelRow.addView(cancelBtn, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginStart = dp(6) })
+        confirmCancelRow.addView(cancelBtn, LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginStart = dp(6) })
+
+        val flipBtn = compactIconButton("🔄", Color.WHITE, Color.argb(80, 255, 255, 255)).apply {
+            setOnClickListener {
+                if (!cameraEnabled && !inPreview) {
+                    Toast.makeText(this@NativeCallActivity, "Camera is off", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                rtc?.switchCamera()
+            }
+        }
+        confirmCancelRow.addView(flipBtn, LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginStart = dp(6) })
 
         val beautyBlock = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         previewControls.addView(beautyBlock, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
@@ -665,24 +682,36 @@ class NativeCallActivity : Activity(),
         val beautyToggle = Switch(this).apply {
             text = "Beauty"
             setTextColor(Color.WHITE)
-            setOnCheckedChangeListener { _: CompoundButton, enabled: Boolean -> rtc?.setBeautyEnabled(enabled) }
+            setOnCheckedChangeListener { _: CompoundButton, enabled: Boolean ->
+                rtc?.setBeautyEnabled(enabled)
+                rtc?.setBeautyIntensity(if (enabled) 1.0f else 0f)
+            }
         }
         beautySwitch = beautyToggle
         beautyBlock.addView(beautyToggle, LinearLayout.LayoutParams(-2, -2))
+    }
 
-        val slider = SeekBar(this).apply {
-            max = 100
-            progress = 45
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    rtc?.setBeautyIntensity(progress / 100f)
-                }
-                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
-            })
+    private fun roundedDrawable(color: Int, radiusDp: Int = 10): GradientDrawable {
+        return GradientDrawable().apply {
+            cornerRadius = dp(radiusDp).toFloat()
+            setColor(color)
         }
-        beautySlider = slider
-        beautyBlock.addView(slider, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+    }
+
+    private fun compactIconButton(label: String, textColor: Int, bgColor: Int): Button {
+        return Button(this).apply {
+            text = label
+            setTextColor(textColor)
+            textSize = 14f
+            isAllCaps = false
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(dp(4), dp(2), dp(4), dp(2))
+            background = roundedDrawable(bgColor)
+            stateListAnimator = null
+        }
     }
 
     private fun buildBottomContainer() {
@@ -724,16 +753,19 @@ class NativeCallActivity : Activity(),
         chatScroll.addView(chatList)
         chatMessagesContainer.addView(chatScroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        // 2) Main controls (mic / cam / hangup)
+        // 2) Main controls (mic / cam / speaker / hangup) — compact emoji buttons.
         controlsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setPadding(dp(8), dp(6), dp(8), dp(6))
         }
         bottomContainer.addView(controlsRow, LinearLayout.LayoutParams(-1, -2))
 
-        val mic = Button(this).apply {
-            text = "Mic off"
+        val ctrlW = dp(44)
+        val ctrlH = dp(40)
+        val ctrlGap = dp(10)
+
+        val mic = compactIconButton("🎙️", Color.WHITE, Color.rgb(42, 45, 53)).apply {
             setOnClickListener {
                 if (!micEnabled && !ensureMediaPermissions()) return@setOnClickListener
                 micEnabled = !micEnabled
@@ -743,10 +775,9 @@ class NativeCallActivity : Activity(),
             }
         }
         micButton = mic
-        controlsRow.addView(mic, LinearLayout.LayoutParams(0, dp(44), 1f))
+        controlsRow.addView(mic, LinearLayout.LayoutParams(ctrlW, ctrlH))
 
-        val cam = Button(this).apply {
-            text = "Cam off"
+        val cam = compactIconButton("📷", Color.WHITE, Color.rgb(42, 45, 53)).apply {
             setOnClickListener {
                 if (inPreview) return@setOnClickListener
                 if (!ensureMediaPermissions()) return@setOnClickListener
@@ -762,10 +793,9 @@ class NativeCallActivity : Activity(),
             }
         }
         cameraButton = cam
-        controlsRow.addView(cam, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
+        controlsRow.addView(cam, LinearLayout.LayoutParams(ctrlW, ctrlH).apply { marginStart = ctrlGap })
 
-        val speaker = Button(this).apply {
-            text = "Speaker"
+        val speaker = compactIconButton("🔈", Color.WHITE, Color.rgb(42, 45, 53)).apply {
             setOnClickListener {
                 if (!canToggleAudioRoute()) {
                     Toast.makeText(this@NativeCallActivity, "Only one audio route available", Toast.LENGTH_SHORT).show()
@@ -778,13 +808,13 @@ class NativeCallActivity : Activity(),
             }
         }
         speakerButton = speaker
-        controlsRow.addView(speaker, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
+        controlsRow.addView(speaker, LinearLayout.LayoutParams(ctrlW, ctrlH).apply { marginStart = ctrlGap })
 
-        val hangup = Button(this).apply {
-            text = "Hang up"
+        val hangup = compactIconButton("📞", Color.WHITE, Color.rgb(177, 60, 60)).apply {
             setOnClickListener { leaveCall() }
         }
-        controlsRow.addView(hangup, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(6) })
+        hangupButton = hangup
+        controlsRow.addView(hangup, LinearLayout.LayoutParams(ctrlW, ctrlH).apply { marginStart = ctrlGap })
 
         // 4) Chat input row (inside chatMessagesContainer, hidden when collapsed)
         chatInputRow = LinearLayout(this).apply {
@@ -918,6 +948,17 @@ class NativeCallActivity : Activity(),
         val savedRoom = prefs.getString("room", "")
         if (!savedUsername.isNullOrBlank()) usernameInput.setText(savedUsername)
         if (!savedRoom.isNullOrBlank()) roomInput.setText(savedRoom)
+
+        // Version label at bottom-right
+        val versionLabel = TextView(this).apply {
+            text = "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
+            textSize = 11f
+            setTextColor(Color.rgb(100, 105, 120))
+            gravity = Gravity.END
+        }
+        // Spacer to push version label to bottom
+        joinPanel.addView(View(this), LinearLayout.LayoutParams(-1, 0).apply { weight = 1f })
+        joinPanel.addView(versionLabel, LinearLayout.LayoutParams(-1, -2))
     }
 
     // ─── Actions ──────────────────────────────────────────────
@@ -993,6 +1034,14 @@ class NativeCallActivity : Activity(),
             it.dataListener = this
             it.start()
             loadTurnConfig(it)
+            // WebRTC's JavaAudioDeviceModule creates its own AudioTrack on start(),
+            // which can override the audio route we set in configureCallAudioRouting().
+            // Re-apply at multiple intervals to ensure external devices (headsets)
+            // take effect even if ADM initialization is slow.
+            val h = Handler(Looper.getMainLooper())
+            h.postDelayed({ applyAudioRoute() }, 300)
+            h.postDelayed({ applyAudioRoute() }, 800)
+            h.postDelayed({ applyAudioRoute() }, 1500)
         }
         signaling.connect(room, username)
     }
@@ -2245,13 +2294,27 @@ class NativeCallActivity : Activity(),
     }
 
     private fun updateMediaButtons() {
-        micButton?.text = if (micEnabled) "Mic" else "Mic off"
-        cameraButton?.text = when {
-            inPreview -> "Preview..."
-            cameraEnabled -> "Cam"
-            else -> "Cam off"
+        micButton?.apply {
+            text = "🎙️"
+            applyToggleState(this, micEnabled)
+        }
+        cameraButton?.apply {
+            text = "📷"
+            applyToggleState(this, cameraEnabled || inPreview)
         }
         updateAudioRouteButton()
+    }
+
+    private fun applyToggleState(button: Button, on: Boolean) {
+        if (on) {
+            button.background = roundedDrawable(Color.rgb(42, 45, 53))
+            button.setTextColor(Color.WHITE)
+            button.paintFlags = button.paintFlags and Paint.STRIKE_THRU_TEXT_FLAG.inv()
+        } else {
+            button.background = roundedDrawable(Color.rgb(58, 34, 34))
+            button.setTextColor(Color.rgb(255, 180, 180))
+            button.paintFlags = button.paintFlags or Paint.STRIKE_THRU_TEXT_FLAG
+        }
     }
 
     private fun configureCallAudioRouting(defaultSpeakerphone: Boolean) {
@@ -2319,12 +2382,16 @@ class NativeCallActivity : Activity(),
             val audioManager = getSystemService(AudioManager::class.java)
             val usingExternalAudio = audioManager != null && hasExternalAudioRoute(audioManager)
             text = when {
-                usingExternalAudio -> "Headset"
-                speakerphoneEnabled -> "Speaker"
-                else -> "Earpiece"
+                usingExternalAudio -> "🎧"
+                speakerphoneEnabled -> "🔈"
+                else -> "📞"
             }
+            background = roundedDrawable(Color.rgb(42, 45, 53))
+            setTextColor(Color.WHITE)
+            paintFlags = paintFlags and Paint.STRIKE_THRU_TEXT_FLAG.inv()
             isSelected = speakerphoneEnabled && !usingExternalAudio
             isEnabled = !usingExternalAudio && canToggleAudioRoute()
+            alpha = if (isEnabled) 1f else 0.5f
         }
     }
 
