@@ -1021,29 +1021,38 @@ class NativeCallActivity : Activity(),
         updateMediaButtons()
 
         rtc?.dispose()
-        rtc = NativeWebRtcClient(
-            this,
-            localRenderer,
-            remoteRenderer,
-            signaling,
-            { msg -> runOnUiThread { updateHeaderStatus(msg) } },
-            { active -> runOnUiThread { setRemoteVideoActive(active) } },
-            cameraRenderer,
-            { active -> runOnUiThread { setRemoteCameraActive(active) } }
-        ).also {
-            it.dataListener = this
-            it.start()
-            loadTurnConfig(it)
-            // WebRTC's JavaAudioDeviceModule creates its own AudioTrack on start(),
-            // which can override the audio route we set in configureCallAudioRouting().
-            // Re-apply at multiple intervals to ensure external devices (headsets)
-            // take effect even if ADM initialization is slow.
-            val h = Handler(Looper.getMainLooper())
-            h.postDelayed({ applyAudioRoute() }, 300)
-            h.postDelayed({ applyAudioRoute() }, 800)
-            h.postDelayed({ applyAudioRoute() }, 1500)
-        }
-        signaling.connect(room, username)
+
+        // Fetch TURN credentials synchronously BEFORE creating PeerConnections.
+        // The old async loadTurnConfig raced with signaling.connect() — peers
+        // arrived while iceServers still had only STUN, causing ICE failed.
+        Thread {
+            val turnServers = fetchTurnServersSync()
+            runOnUiThread {
+                rtc = NativeWebRtcClient(
+                    this,
+                    localRenderer,
+                    remoteRenderer,
+                    signaling,
+                    { msg -> runOnUiThread { updateHeaderStatus(msg) } },
+                    { active -> runOnUiThread { setRemoteVideoActive(active) } },
+                    cameraRenderer,
+                    { active -> runOnUiThread { setRemoteCameraActive(active) } }
+                ).also {
+                    it.dataListener = this
+                    for (ts in turnServers) it.addTurnServer(ts.urls, ts.username, ts.credential)
+                    it.start()
+                    // WebRTC's JavaAudioDeviceModule creates its own AudioTrack on start(),
+                    // which can override the audio route we set in configureCallAudioRouting().
+                    // Re-apply at multiple intervals to ensure external devices (headsets)
+                    // take effect even if ADM initialization is slow.
+                    val h = Handler(Looper.getMainLooper())
+                    h.postDelayed({ applyAudioRoute() }, 300)
+                    h.postDelayed({ applyAudioRoute() }, 800)
+                    h.postDelayed({ applyAudioRoute() }, 1500)
+                }
+                signaling.connect(room, username)
+            }
+        }.start()
     }
 
     private fun leaveCall() {
@@ -2451,6 +2460,26 @@ class NativeCallActivity : Activity(),
             type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
             type == AudioDeviceInfo.TYPE_USB_HEADSET ||
             type == AudioDeviceInfo.TYPE_USB_DEVICE
+    }
+
+    private data class TurnServerInfo(val urls: String, val username: String, val credential: String)
+
+    private fun fetchTurnServersSync(): List<TurnServerInfo> {
+        return try {
+            val req = Request.Builder().url(NativeSignalingClient.httpUrlFor("turn-credentials")).build()
+            val resp = http.newCall(req).execute()
+            resp.use {
+                if (!it.isSuccessful) return emptyList()
+                val json = JSONObject(it.body?.string().orEmpty())
+                val urls = json.optString("urls")
+                val username = json.optString("username")
+                val credential = json.optString("credential")
+                if (urls.isBlank() || username.isBlank() || credential.isBlank()) emptyList()
+                else listOf(TurnServerInfo(urls, username, credential))
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     private fun loadTurnConfig(client: NativeWebRtcClient) {
