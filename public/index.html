@@ -1805,7 +1805,7 @@ function ensurePeer(peerId, polite, createDC, username) {
     let peer = peers.get(peerId);
     if (peer) return peer;
 
-    const pc = new RTCPeerConnection({ iceServers });
+    const pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
     const remoteStream = new MediaStream();
     const remoteAudioStream = new MediaStream();
     const { tileEl, videoEl, audioEl, dot } = createTile(peerId, username);

@@ -607,6 +607,11 @@ class NativeWebRtcClient(
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            // Force TURN relay only. Without this, ICE creates permissions for
+            // the remote peer's private host candidate (e.g. 10.x.x.x). The
+            // peer actually sends from a different public IP behind NAT, so
+            // coturn drops packets (source IP != permitted IP) → ICE failed.
+            iceTransportsType = PeerConnection.IceTransportsType.RELAY
         }
         val peer = Peer(peerId, polite)
         val pc = factory.createPeerConnection(rtcConfig, PeerObserver(peer)) ?: error("PeerConnection failed")
