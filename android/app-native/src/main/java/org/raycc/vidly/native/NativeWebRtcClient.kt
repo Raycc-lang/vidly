@@ -1,7 +1,11 @@
 package org.raycc.vidly.native
 
 import android.content.Context
+import android.media.AudioDeviceInfo
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import org.json.JSONObject
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
@@ -15,6 +19,7 @@ import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
+import org.webrtc.MediaStreamTrack
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
@@ -59,6 +64,7 @@ class NativeWebRtcClient(
     private var capturer: CameraVideoCapturer? = null
     private var videoSource: VideoSource? = null
     private var audioSource: AudioSource? = null
+    private var audioDeviceModule: JavaAudioDeviceModule? = null
     private var localVideoTrack: VideoTrack? = null
     private var localAudioTrack: AudioTrack? = null
     private var remoteVideoPeerId: String? = null
@@ -77,6 +83,7 @@ class NativeWebRtcClient(
         remoteVideoFrameTimestampMs = SystemClock.elapsedRealtime()
     }
     private var started = false
+    private val iceRestartHandler = Handler(Looper.getMainLooper())
 
     // Logical state — does the local user want camera/mic to be sending?
     private var cameraLive = false
@@ -95,12 +102,12 @@ class NativeWebRtcClient(
         remoteRenderer.init(eglBase.eglBaseContext, null)
         cameraRenderer?.init(eglBase.eglBaseContext, null)
         val adm = JavaAudioDeviceModule.builder(context).createAudioDeviceModule()
+        audioDeviceModule = adm
         factory = PeerConnectionFactory.builder()
             .setAudioDeviceModule(adm)
             .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
             .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
             .createPeerConnectionFactory()
-        adm.release()
         status("Joined with camera and mic off")
     }
 
@@ -137,7 +144,7 @@ class NativeWebRtcClient(
     }
 
     fun onPeerLeft(peerId: String) {
-        peers.remove(peerId)?.close()
+        peers.remove(peerId)?.close(iceRestartHandler)
         if (remoteVideoPeerId == peerId) {
             clearRemoteVideo()
         } else if (peers.isEmpty()) {
@@ -295,7 +302,7 @@ class NativeWebRtcClient(
     }
 
     fun close() {
-        peers.values.forEach { it.close() }
+        peers.values.forEach { it.close(iceRestartHandler) }
         peers.clear()
         stopVideo()
         stopAudio()
@@ -311,7 +318,25 @@ class NativeWebRtcClient(
         remoteRenderer.release()
         cameraRenderer?.release()
         if (::factory.isInitialized) factory.dispose()
+        audioDeviceModule?.release()
+        audioDeviceModule = null
         eglBase.release()
+    }
+
+    fun setPreferredOutputDevice(device: AudioDeviceInfo?) {
+        val adm = audioDeviceModule ?: return
+        try {
+            val audioOutputField = adm.javaClass.getDeclaredField("audioOutput")
+            audioOutputField.isAccessible = true
+            val audioOutput = audioOutputField.get(adm) ?: return
+
+            val audioTrackField = audioOutput.javaClass.getDeclaredField("audioTrack")
+            audioTrackField.isAccessible = true
+            val audioTrack = audioTrackField.get(audioOutput) as? android.media.AudioTrack
+            audioTrack?.preferredDevice = device
+        } catch (e: Exception) {
+            Log.w("VidlyAudio", "setPreferredOutputDevice failed", e)
+        }
     }
 
     // ─── DataChannel send API ─────────────────────────────────
@@ -652,6 +677,21 @@ class NativeWebRtcClient(
         makeOffer(peer)
     }
 
+    private fun scheduleIceRestart(peer: Peer, delayMs: Long) {
+        iceRestartHandler.removeCallbacksAndMessages(peer)
+        val runnable = Runnable {
+            if (peer.pc.iceConnectionState() == PeerConnection.IceConnectionState.DISCONNECTED ||
+                peer.pc.iceConnectionState() == PeerConnection.IceConnectionState.FAILED) {
+                restartIce(peer)
+            }
+        }
+        iceRestartHandler.postDelayed(runnable, peer, delayMs)
+    }
+
+    private fun cancelPendingIceRestart(peer: Peer) {
+        iceRestartHandler.removeCallbacksAndMessages(peer)
+    }
+
     private fun makeAnswer(peer: Peer) {
         peer.pc.createAnswer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription) {
@@ -836,16 +876,18 @@ class NativeWebRtcClient(
             when (state) {
                 PeerConnection.IceConnectionState.CONNECTED,
                 PeerConnection.IceConnectionState.COMPLETED -> {
+                    cancelPendingIceRestart(peer)
                     status("Connected")
                     dataListener?.onPeerConnectionStateChanged(peer.id, true)
                 }
                 PeerConnection.IceConnectionState.DISCONNECTED -> {
                     status("Reconnecting...")
-                    restartIce(peer)
+                    scheduleIceRestart(peer, ICE_RESTART_DELAY_MS)
                     dataListener?.onPeerConnectionStateChanged(peer.id, false)
                 }
                 PeerConnection.IceConnectionState.FAILED -> {
                     status("ICE failed")
+                    cancelPendingIceRestart(peer)
                     restartIce(peer)
                     dataListener?.onPeerConnectionStateChanged(peer.id, false)
                 }
@@ -901,7 +943,8 @@ class NativeWebRtcClient(
         // have to poll bufferedAmount() with Thread.sleep().
         val fileChannelLock: java.lang.Object = java.lang.Object()
 
-        fun close() {
+        fun close(iceRestartHandler: Handler) {
+            iceRestartHandler.removeCallbacksAndMessages(this)
             runCatching { chatChannel?.close() }
             runCatching { fileChannel?.close() }
             runCatching { pc.close() }
@@ -910,5 +953,6 @@ class NativeWebRtcClient(
 
     private companion object {
         const val LOCAL_STREAM_ID = "vidly-native"
+        const val ICE_RESTART_DELAY_MS = 8_000L
     }
 }

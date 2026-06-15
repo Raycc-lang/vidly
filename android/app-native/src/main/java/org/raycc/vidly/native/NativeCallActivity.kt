@@ -157,6 +157,7 @@ class NativeCallActivity : Activity(),
     private var userRequestedLeave = false
     private var currentRoom = ""
     private var currentUsername = ""
+    private var loadingHistory = false
     private var hasRemoteVideo = false
     private var hasRemoteCamera = false
     private var headerStatus = "Native Vidly"
@@ -397,15 +398,36 @@ class NativeCallActivity : Activity(),
 
     override fun onChatMessage(fromPeerId: String, fromUsername: String?, msg: JSONObject) {
         runOnUiThread {
+            val senderName = fromUsername ?: "Peer"
             when (msg.optString("type")) {
-                "chat" -> appendChatText(fromUsername ?: "Peer", msg.optString("body"), incoming = true)
+                "chat" -> {
+                    val body = msg.optString("body")
+                    appendChatText(senderName, body, incoming = true)
+                    saveChatMsg(JSONObject()
+                        .put("type", "chat").put("kind", "other")
+                        .put("body", body).put("ts", msg.optLong("ts"))
+                        .put("senderName", senderName))
+                }
                 "reaction" -> {
                     val emoji = msg.optString("emoji")
                     if (emoji.isNotBlank()) {
-                        appendChatText(fromUsername ?: "Peer", emoji, incoming = true)
+                        appendChatText(senderName, emoji, incoming = true)
+                        saveChatMsg(JSONObject()
+                            .put("type", "reaction").put("kind", "other")
+                            .put("emoji", emoji).put("ts", msg.optLong("ts"))
+                            .put("senderName", senderName))
                     }
                 }
-                "media" -> appendChatMedia(fromUsername ?: "Peer", msg.optString("url"), msg.optString("kind"), incoming = true)
+                "media" -> {
+                    val url = msg.optString("url")
+                    val mediaKind = msg.optString("kind")
+                    appendChatMedia(senderName, url, mediaKind, incoming = true)
+                    saveChatMsg(JSONObject()
+                        .put("type", "media").put("kind", "other")
+                        .put("url", url).put("mediaKind", mediaKind)
+                        .put("ts", msg.optLong("ts"))
+                        .put("senderName", senderName))
+                }
                 "media-state" -> {
                     val mic = msg.optBoolean("mic", false)
                     val cam = msg.optBoolean("cam", false)
@@ -1008,6 +1030,7 @@ class NativeCallActivity : Activity(),
         resetLocalPreviewPosition()
         refreshParticipants()
         chatList.removeAllViews()
+        loadChatHistory()
         outgoingFiles.clear()
         incomingFiles.clear()
         activeIncomingByPeer.clear()
@@ -1041,10 +1064,8 @@ class NativeCallActivity : Activity(),
                     it.dataListener = this
                     for (ts in turnServers) it.addTurnServer(ts.urls, ts.username, ts.credential)
                     it.start()
-                    // WebRTC's JavaAudioDeviceModule creates its own AudioTrack on start(),
-                    // which can override the audio route we set in configureCallAudioRouting().
-                    // Re-apply at multiple intervals to ensure external devices (headsets)
-                    // take effect even if ADM initialization is slow.
+                    // WebRTC's internal AudioTrack may not exist yet when applyAudioRoute()
+                    // first runs. Re-apply so setPreferredOutputDevice() reaches it once created.
                     val h = Handler(Looper.getMainLooper())
                     h.postDelayed({ applyAudioRoute() }, 300)
                     h.postDelayed({ applyAudioRoute() }, 800)
@@ -1551,35 +1572,92 @@ class NativeCallActivity : Activity(),
     private fun sendChatFromInput() {
         val body = chatInput.text.toString().trim()
         if (body.isBlank()) return
+        val ts = System.currentTimeMillis()
         val msg = JSONObject()
             .put("type", "chat")
             .put("body", body)
-            .put("ts", System.currentTimeMillis())
+            .put("ts", ts)
             .put("username", currentUsername)
         rtc?.sendChatJson(msg)
         appendChatText(currentUsername.ifBlank { "You" }, body, incoming = false)
+        saveChatMsg(JSONObject()
+            .put("type", "chat").put("kind", "own")
+            .put("body", body).put("ts", ts)
+            .put("senderName", currentUsername))
         chatInput.setText("")
     }
 
     private fun sendReaction(emoji: String) {
+        val ts = System.currentTimeMillis()
         val msg = JSONObject()
             .put("type", "reaction")
             .put("emoji", emoji)
-            .put("ts", System.currentTimeMillis())
+            .put("ts", ts)
             .put("username", currentUsername)
         rtc?.sendChatJson(msg)
         appendChatText(currentUsername.ifBlank { "You" }, emoji, incoming = false)
+        saveChatMsg(JSONObject()
+            .put("type", "reaction").put("kind", "own")
+            .put("emoji", emoji).put("ts", ts)
+            .put("senderName", currentUsername))
     }
 
     private fun sendMedia(url: String, kind: String) {
+        val ts = System.currentTimeMillis()
         val msg = JSONObject()
             .put("type", "media")
             .put("url", url)
             .put("kind", kind)
-            .put("ts", System.currentTimeMillis())
+            .put("ts", ts)
             .put("username", currentUsername)
         rtc?.sendChatJson(msg)
         appendChatMedia(currentUsername.ifBlank { "You" }, url, kind, incoming = false)
+        saveChatMsg(JSONObject()
+            .put("type", "media").put("kind", "own")
+            .put("url", url).put("mediaKind", kind).put("ts", ts)
+            .put("senderName", currentUsername))
+    }
+
+    // ─── Chat history (SharedPreferences) ─────────────────────
+
+    private fun chatKey() = "chat-$currentRoom"
+
+    private fun saveChatMsg(msg: JSONObject) {
+        if (currentRoom.isBlank() || loadingHistory) return
+        try {
+            val prefs = getSharedPreferences("vidly_prefs", MODE_PRIVATE)
+            val arr = JSONArray(prefs.getString(chatKey(), "[]"))
+            arr.put(msg)
+            val out = if (arr.length() > CHAT_MAX) {
+                JSONArray().apply {
+                    for (i in arr.length() - CHAT_MAX until arr.length()) put(arr.get(i))
+                }
+            } else arr
+            prefs.edit().putString(chatKey(), out.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun loadChatHistory() {
+        if (currentRoom.isBlank()) return
+        loadingHistory = true
+        try {
+            val arr = JSONArray(getSharedPreferences("vidly_prefs", MODE_PRIVATE).getString(chatKey(), "[]"))
+            for (i in 0 until arr.length()) {
+                val m = arr.getJSONObject(i)
+                val incoming = m.optString("kind") == "other"
+                val sender = if (incoming) m.optString("senderName", "Peer")
+                             else currentUsername.ifBlank { "You" }
+                when (m.optString("type")) {
+                    "chat" -> appendChatText(sender, m.optString("body"), incoming)
+                    "reaction" -> appendChatText(sender, m.optString("emoji"), incoming)
+                    "media" -> {
+                        val mediaKind = m.optString("mediaKind", m.optString("kind"))
+                        appendChatMedia(sender, m.optString("url"), mediaKind, incoming)
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        loadingHistory = false
     }
 
     // ─── Chat rendering ───────────────────────────────────────
@@ -2362,6 +2440,7 @@ class NativeCallActivity : Activity(),
             } else if (speakerphoneEnabled) {
                 try { audioManager.clearCommunicationDevice() } catch (_: Throwable) {}
             }
+            rtc?.setPreferredOutputDevice(externalRoute)
         }
         try { audioManager.isSpeakerphoneOn = externalRoute == null && speakerphoneEnabled } catch (_: Throwable) {}
     }
@@ -2582,6 +2661,7 @@ class NativeCallActivity : Activity(),
         private const val ICE_RESTART_COOLDOWN_MS = 30_000L
         private const val GIPHY_API_KEY = "z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn"
         private const val GIPHY_LIMIT = 20
+        private const val CHAT_MAX = 200
         private val REACTIONS = listOf("❤️", "😂", "🎉", "😮", "👏", "🤗")
     }
 }
