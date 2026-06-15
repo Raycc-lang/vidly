@@ -85,7 +85,7 @@ function createTurnCredentials() {
     const username = `${expires}:vidly`;
     const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
     return {
-        urls: TURN_SERVER_URL,
+        urls: [TURN_SERVER_URL, TURN_SERVER_URL + "?transport=tcp"],
         username,
         credential,
         ttl,
@@ -96,10 +96,7 @@ function createTurnCredentials() {
 function sendTurnCredentials(res) {
     const credentials = createTurnCredentials();
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify({
-        ...credentials,
-        turnUrl: `${credentials.urls}?username=${encodeURIComponent(credentials.username)}&credential=${encodeURIComponent(credentials.credential)}`,
-    }));
+    res.end(JSON.stringify(credentials));
 }
 
 function saveCrashReport(req, res) {

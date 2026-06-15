@@ -2550,32 +2550,25 @@ class NativeCallActivity : Activity(),
             resp.use {
                 if (!it.isSuccessful) return emptyList()
                 val json = JSONObject(it.body?.string().orEmpty())
-                val urls = json.optString("urls")
+                val rawUrls = json.opt("urls")
+                val urls = when (rawUrls) {
+                    is JSONArray -> rawUrls
+                    is String -> JSONArray().put(rawUrls)  // 兼容旧 string 格式
+                    else -> return emptyList()
+                }
                 val username = json.optString("username")
                 val credential = json.optString("credential")
-                if (urls.isBlank() || username.isBlank() || credential.isBlank()) emptyList()
-                else listOf(TurnServerInfo(urls, username, credential))
+                if (username.isBlank() || credential.isBlank()) return emptyList()
+                val result = mutableListOf<TurnServerInfo>()
+                for (i in 0 until urls.length()) {
+                    val url = urls.optString(i, "").trim()
+                    if (url.isNotBlank()) result.add(TurnServerInfo(url, username, credential))
+                }
+                result
             }
         } catch (_: Exception) {
             emptyList()
         }
-    }
-
-    private fun loadTurnConfig(client: NativeWebRtcClient) {
-        http.newCall(Request.Builder().url(NativeSignalingClient.httpUrlFor("turn-credentials")).build()).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = Unit
-
-            override fun onResponse(call: Call, response: Response) {
-                response.use {
-                    val json = JSONObject(it.body?.string().orEmpty())
-                    val urls = json.optString("urls")
-                    val username = json.optString("username")
-                    val credential = json.optString("credential")
-                    if (urls.isBlank() || username.isBlank() || credential.isBlank()) return
-                    client.addTurnServer(urls, username, credential)
-                }
-            }
-        })
     }
 
     private fun ensureMediaPermissions(): Boolean {
