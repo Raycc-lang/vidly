@@ -187,6 +187,11 @@ class NativeCallActivity : Activity(),
     private var previousAudioMode = AudioManager.MODE_NORMAL
     private var previousSpeakerphoneOn = false
     private var preferSpeakerphoneWhenNoExternal = true
+    // User explicitly overrode external-device routing to force the built-in
+    // speaker (e.g. glitchy headset, or BT playing music while call should use
+    // speaker). When true, applyAudioRoute() ignores connected headphones and
+    // routes to the speaker. Cleared on hot-plug changes and call reset.
+    private var userForcedSpeaker = false
     private val audioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
             runOnUiThread { refreshCallAudioRouteForDevices() }
@@ -819,14 +824,25 @@ class NativeCallActivity : Activity(),
 
         val speaker = compactIconButton("🔈", Color.WHITE, Color.rgb(42, 45, 53)).apply {
             setOnClickListener {
-                if (!canToggleAudioRoute()) {
-                    Toast.makeText(this@NativeCallActivity, "Only one audio route available", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
+                val audioManager = getSystemService(AudioManager::class.java)
+                val usingExternalAudio = audioManager != null && hasExternalAudioRoute(audioManager)
+                if (usingExternalAudio) {
+                    // Headphones connected: toggle between forcing the built-in
+                    // speaker (override) and returning to the external device.
+                    userForcedSpeaker = !userForcedSpeaker
+                    speakerphoneEnabled = userForcedSpeaker
+                    applyAudioRoute()
+                    updateAudioRouteButton()
+                } else {
+                    if (!canToggleAudioRoute()) {
+                        Toast.makeText(this@NativeCallActivity, "Only one audio route available", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+                    speakerphoneEnabled = !speakerphoneEnabled
+                    preferSpeakerphoneWhenNoExternal = speakerphoneEnabled
+                    applyAudioRoute()
+                    updateAudioRouteButton()
                 }
-                speakerphoneEnabled = !speakerphoneEnabled
-                preferSpeakerphoneWhenNoExternal = speakerphoneEnabled
-                applyAudioRoute()
-                updateAudioRouteButton()
             }
         }
         speakerButton = speaker
@@ -1059,17 +1075,15 @@ class NativeCallActivity : Activity(),
                     { msg -> runOnUiThread { updateHeaderStatus(msg) } },
                     { active -> runOnUiThread { setRemoteVideoActive(active) } },
                     cameraRenderer,
-                    { active -> runOnUiThread { setRemoteCameraActive(active) } }
+                    { active -> runOnUiThread { setRemoteCameraActive(active) } },
+                    // Fires once WebRTC's AudioTrack actually starts playing — the
+                    // deterministic moment to pin the output device. Replaces the
+                    // old 300/800/1500ms fixed-delay retries that raced with it.
+                    { runOnUiThread { applyAudioRoute() } }
                 ).also {
                     it.dataListener = this
                     for (ts in turnServers) it.addTurnServer(ts.urls, ts.username, ts.credential)
                     it.start()
-                    // WebRTC's internal AudioTrack may not exist yet when applyAudioRoute()
-                    // first runs. Re-apply so setPreferredOutputDevice() reaches it once created.
-                    val h = Handler(Looper.getMainLooper())
-                    h.postDelayed({ applyAudioRoute() }, 300)
-                    h.postDelayed({ applyAudioRoute() }, 800)
-                    h.postDelayed({ applyAudioRoute() }, 1500)
                 }
                 signaling.connect(room, username)
             }
@@ -2416,6 +2430,7 @@ class NativeCallActivity : Activity(),
         }
         volumeControlStream = AudioManager.STREAM_VOICE_CALL
         preferSpeakerphoneWhenNoExternal = defaultSpeakerphone
+        userForcedSpeaker = false
         speakerphoneEnabled = shouldUseSpeakerphone(audioManager)
         try {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
@@ -2426,8 +2441,20 @@ class NativeCallActivity : Activity(),
 
     private fun applyAudioRoute() {
         val audioManager = getSystemService(AudioManager::class.java) ?: return
-        val externalRoute = preferredExternalAudioRoute(audioManager)
+        // userForcedSpeaker: user tapped the button to override connected
+        // headphones and force built-in speaker. Ignore any external route so
+        // setCommunicationDevice picks TYPE_BUILTIN_SPEAKER and
+        // setPreferredOutputDevice(null) releases the WebRTC track's pin.
+        val externalRoute = if (userForcedSpeaker) null else preferredExternalAudioRoute(audioManager)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Set the WebRTC AudioTrack's preferred device BEFORE changing the
+            // communication device. AudioTrack.setPreferredDevice() only takes
+            // effect on the NEXT routing change, and setCommunicationDevice is
+            // what triggers that change. If we swap them (comm first, then
+            // preferred), the preferred hint arrives after the re-route already
+            // happened using the previous hint — so speaker→headphone switches
+            // left the track pinned to the speaker even though the icon updated.
+            rtc?.setPreferredOutputDevice(externalRoute)
             val target = externalRoute ?: audioManager.availableCommunicationDevices.firstOrNull {
                 it.type == if (speakerphoneEnabled) {
                     AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
@@ -2440,6 +2467,9 @@ class NativeCallActivity : Activity(),
             } else if (speakerphoneEnabled) {
                 try { audioManager.clearCommunicationDevice() } catch (_: Throwable) {}
             }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // Pre-S fallback: no setCommunicationDevice; the preferred device on
+            // the WebRTC track plus the legacy speaker flag are all we have.
             rtc?.setPreferredOutputDevice(externalRoute)
         }
         try { audioManager.isSpeakerphoneOn = externalRoute == null && speakerphoneEnabled } catch (_: Throwable) {}
@@ -2462,6 +2492,7 @@ class NativeCallActivity : Activity(),
         audioRoutingConfigured = false
         speakerphoneEnabled = true
         preferSpeakerphoneWhenNoExternal = true
+        userForcedSpeaker = false
         updateAudioRouteButton()
     }
 
@@ -2469,7 +2500,10 @@ class NativeCallActivity : Activity(),
         speakerButton?.apply {
             val audioManager = getSystemService(AudioManager::class.java)
             val usingExternalAudio = audioManager != null && hasExternalAudioRoute(audioManager)
+            // userForcedSpeaker takes priority over the connected-headphone icon
+            // since the user explicitly asked for speaker output.
             text = when {
+                userForcedSpeaker -> "🔈"
                 usingExternalAudio -> "🎧"
                 speakerphoneEnabled -> "🔈"
                 else -> "📞"
@@ -2477,8 +2511,11 @@ class NativeCallActivity : Activity(),
             background = roundedDrawable(Color.rgb(42, 45, 53))
             setTextColor(Color.WHITE)
             paintFlags = paintFlags and Paint.STRIKE_THRU_TEXT_FLAG.inv()
-            isSelected = speakerphoneEnabled && !usingExternalAudio
-            isEnabled = !usingExternalAudio && canToggleAudioRoute()
+            isSelected = (speakerphoneEnabled && !usingExternalAudio) || userForcedSpeaker
+            // Keep the button enabled while headphones are connected so the user
+            // can override routing to speaker. Only disable when there's nothing
+            // to switch to (no speaker/earpiece pair and no external device).
+            isEnabled = usingExternalAudio || canToggleAudioRoute()
             alpha = if (isEnabled) 1f else 0.5f
         }
     }
@@ -2486,6 +2523,11 @@ class NativeCallActivity : Activity(),
     private fun refreshCallAudioRouteForDevices() {
         if (!audioRoutingConfigured) return
         val audioManager = getSystemService(AudioManager::class.java) ?: return
+        // Any hot-plug change (headphones added OR removed) returns control to
+        // auto-routing: drop the user's forced-speaker override. On reconnect this
+        // restores the "auto-switch back to headphones" behavior; on disconnect
+        // it falls back to the speaker/earpiece default.
+        userForcedSpeaker = false
         speakerphoneEnabled = shouldUseSpeakerphone(audioManager)
         applyAudioRoute()
         updateAudioRouteButton()

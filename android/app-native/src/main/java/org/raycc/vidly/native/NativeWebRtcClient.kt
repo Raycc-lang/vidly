@@ -42,7 +42,13 @@ class NativeWebRtcClient(
     private val status: (String) -> Unit,
     private val onRemoteVideo: (Boolean) -> Unit = {},
     private val cameraRenderer: SurfaceViewRenderer? = null,
-    private val onRemoteCamera: (Boolean) -> Unit = {}
+    private val onRemoteCamera: (Boolean) -> Unit = {},
+    // Fired the moment WebRTC's internal AudioTrack is created and starts
+    // playing. This is the deterministic hook for applying output routing
+    // (setCommunicationDevice / preferredDevice) — replaces the fixed-delay
+    // retries that raced with AudioTrack creation. Fires on the WebRTC
+    // AudioTrack thread; callers must marshal to the main thread.
+    private val onAudioOutputStarted: () -> Unit = {}
 ) {
     interface DataListener {
         fun onChatMessage(fromPeerId: String, fromUsername: String?, msg: JSONObject)
@@ -101,7 +107,17 @@ class NativeWebRtcClient(
         localRenderer.init(eglBase.eglBaseContext, null)
         remoteRenderer.init(eglBase.eglBaseContext, null)
         cameraRenderer?.init(eglBase.eglBaseContext, null)
-        val adm = JavaAudioDeviceModule.builder(context).createAudioDeviceModule()
+        // setAudioTrackStateCallback fires AFTER the ADM creates its internal
+        // AudioTrack and calls play() — the earliest reliable moment to pin the
+        // output device. Before this, audioOutput.audioTrack is null, so the
+        // preferred-device reflection in setPreferredOutputDevice() silently
+        // no-op'd. This replaces the old fixed-delay (300/800/1500ms) retries.
+        val adm = JavaAudioDeviceModule.builder(context)
+            .setAudioTrackStateCallback(object : JavaAudioDeviceModule.AudioTrackStateCallback {
+                override fun onWebRtcAudioTrackStart() = onAudioOutputStarted()
+                override fun onWebRtcAudioTrackStop() = Unit
+            })
+            .createAudioDeviceModule()
         audioDeviceModule = adm
         factory = PeerConnectionFactory.builder()
             .setAudioDeviceModule(adm)
