@@ -14,10 +14,6 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -61,8 +57,7 @@ import java.util.UUID
 
 class NativeCallActivity : Activity(),
     NativeSignalingClient.Listener,
-    NativeWebRtcClient.DataListener,
-    SensorEventListener {
+    NativeWebRtcClient.DataListener {
 
     // Root layout
     private lateinit var root: FrameLayout
@@ -108,8 +103,6 @@ class NativeCallActivity : Activity(),
 
     // PiP / proximity
     private var proximityWakeLock: PowerManager.WakeLock? = null
-    private var sensorManager: SensorManager? = null
-    private var proximitySensor: Sensor? = null
     private var inPip = false
     private var fullscreen = false
 
@@ -1330,29 +1323,21 @@ class NativeCallActivity : Activity(),
                 "Vidly:NativeProximityWakeLock"
             ).apply { setReferenceCounted(false) }
         }
-        sensorManager = getSystemService(SensorManager::class.java)
-        proximitySensor = sensorManager?.getDefaultSensor(Sensor.TYPE_PROXIMITY)
     }
 
+    // Hold PROXIMITY_SCREEN_OFF_WAKE_LOCK during the call and let the system
+    // (PowerManagerService) drive screen off/on from the proximity sensor. We do
+    // NOT register our own SensorEventListener: a second consumer reacting to the
+    // same sensor jitter fights the system at the near/far boundary and causes
+    // screen blackout/flicker.
     private fun registerProximity() {
-        val sensor = proximitySensor ?: return
-        sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+        val lock = proximityWakeLock ?: return
+        if (!lock.isHeld) lock.acquire()
     }
 
     private fun unregisterProximity() {
-        sensorManager?.unregisterListener(this)
         proximityWakeLock?.takeIf { it.isHeld }?.release()
     }
-
-    override fun onSensorChanged(event: SensorEvent) {
-        if (!callActive || event.sensor.type != Sensor.TYPE_PROXIMITY) return
-        val near = event.values.firstOrNull()?.let { it < event.sensor.maximumRange } ?: false
-        val lock = proximityWakeLock ?: return
-        if (near && !lock.isHeld) lock.acquire()
-        else if (!near && lock.isHeld) lock.release()
-    }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 

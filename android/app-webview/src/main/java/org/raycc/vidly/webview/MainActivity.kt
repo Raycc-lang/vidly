@@ -9,10 +9,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import org.raycc.vidly.R
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -32,7 +28,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 
-class MainActivity : Activity(), SensorEventListener {
+class MainActivity : Activity() {
     private lateinit var webView: WebView
     private var pendingWebPermission: PermissionRequest? = null
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
@@ -40,8 +36,6 @@ class MainActivity : Activity(), SensorEventListener {
     private var currentUsername = ""
     private var callActive = false
     private var proximityWakeLock: PowerManager.WakeLock? = null
-    private var sensorManager: SensorManager? = null
-    private var proximitySensor: Sensor? = null
     private var lastLoadedUrl = BASE_URL
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -243,19 +237,6 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
-    override fun onSensorChanged(event: SensorEvent) {
-        if (!callActive || event.sensor.type != Sensor.TYPE_PROXIMITY) return
-        val near = event.values.firstOrNull()?.let { it < event.sensor.maximumRange } ?: false
-        val lock = proximityWakeLock ?: return
-        if (near && !lock.isHeld) {
-            lock.acquire()
-        } else if (!near && lock.isHeld) {
-            lock.release()
-        }
-    }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
-
     private fun urlFromIntent(intent: Intent?): String {
         val room = intent?.getStringExtra(SignalingListener.EXTRA_ROOM).orEmpty()
         if (room.isNotBlank()) return "$BASE_URL/room/${Uri.encode(room)}"
@@ -326,17 +307,19 @@ class MainActivity : Activity(), SensorEventListener {
                 "Vidly:ProximityWakeLock"
             ).apply { setReferenceCounted(false) }
         }
-        sensorManager = getSystemService(SensorManager::class.java)
-        proximitySensor = sensorManager?.getDefaultSensor(Sensor.TYPE_PROXIMITY)
     }
 
+    // Hold PROXIMITY_SCREEN_OFF_WAKE_LOCK during the call and let the system
+    // (PowerManagerService) drive screen off/on from the proximity sensor. We do
+    // NOT register our own SensorEventListener: a second consumer reacting to the
+    // same sensor jitter fights the system at the near/far boundary and causes
+    // screen blackout/flicker.
     private fun registerProximity() {
-        val sensor = proximitySensor ?: return
-        sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+        val lock = proximityWakeLock ?: return
+        if (!lock.isHeld) lock.acquire()
     }
 
     private fun unregisterProximity() {
-        sensorManager?.unregisterListener(this)
         proximityWakeLock?.takeIf { it.isHeld }?.release()
     }
 

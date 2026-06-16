@@ -21,10 +21,6 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
@@ -87,8 +83,7 @@ import java.util.UUID
 
 class NativeCallActivity : Activity(),
     NativeSignalingClient.Listener,
-    NativeWebRtcClient.DataListener,
-    SensorEventListener {
+    NativeWebRtcClient.DataListener {
 
     // Root layout
     private lateinit var root: FrameLayout
@@ -139,10 +134,7 @@ class NativeCallActivity : Activity(),
 
     // PiP / proximity
     private var proximityWakeLock: PowerManager.WakeLock? = null
-    private var sensorManager: SensorManager? = null
-    private var proximitySensor: Sensor? = null
     private var inPip = false
-    private var isProximityRegistered = false
     private var fullscreen = false
 
     // State
@@ -187,11 +179,6 @@ class NativeCallActivity : Activity(),
     private var previousAudioMode = AudioManager.MODE_NORMAL
     private var previousSpeakerphoneOn = false
     private var preferSpeakerphoneWhenNoExternal = true
-    // User explicitly overrode external-device routing to force the built-in
-    // speaker (e.g. glitchy headset, or BT playing music while call should use
-    // speaker). When true, applyAudioRoute() ignores connected headphones and
-    // routes to the speaker. Cleared on hot-plug changes and call reset.
-    private var userForcedSpeaker = false
     private val audioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
             runOnUiThread { refreshCallAudioRouteForDevices() }
@@ -824,25 +811,14 @@ class NativeCallActivity : Activity(),
 
         val speaker = compactIconButton("🔈", Color.WHITE, Color.rgb(42, 45, 53)).apply {
             setOnClickListener {
-                val audioManager = getSystemService(AudioManager::class.java)
-                val usingExternalAudio = audioManager != null && hasExternalAudioRoute(audioManager)
-                if (usingExternalAudio) {
-                    // Headphones connected: toggle between forcing the built-in
-                    // speaker (override) and returning to the external device.
-                    userForcedSpeaker = !userForcedSpeaker
-                    speakerphoneEnabled = userForcedSpeaker
-                    applyAudioRoute()
-                    updateAudioRouteButton()
-                } else {
-                    if (!canToggleAudioRoute()) {
-                        Toast.makeText(this@NativeCallActivity, "Only one audio route available", Toast.LENGTH_SHORT).show()
-                        return@setOnClickListener
-                    }
-                    speakerphoneEnabled = !speakerphoneEnabled
-                    preferSpeakerphoneWhenNoExternal = speakerphoneEnabled
-                    applyAudioRoute()
-                    updateAudioRouteButton()
+                if (!canToggleAudioRoute()) {
+                    Toast.makeText(this@NativeCallActivity, "Only one audio route available", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
                 }
+                speakerphoneEnabled = !speakerphoneEnabled
+                preferSpeakerphoneWhenNoExternal = speakerphoneEnabled
+                applyAudioRoute()
+                updateAudioRouteButton()
             }
         }
         speakerButton = speaker
@@ -2430,7 +2406,6 @@ class NativeCallActivity : Activity(),
         }
         volumeControlStream = AudioManager.STREAM_VOICE_CALL
         preferSpeakerphoneWhenNoExternal = defaultSpeakerphone
-        userForcedSpeaker = false
         speakerphoneEnabled = shouldUseSpeakerphone(audioManager)
         try {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
@@ -2441,11 +2416,7 @@ class NativeCallActivity : Activity(),
 
     private fun applyAudioRoute() {
         val audioManager = getSystemService(AudioManager::class.java) ?: return
-        // userForcedSpeaker: user tapped the button to override connected
-        // headphones and force built-in speaker. Ignore any external route so
-        // setCommunicationDevice picks TYPE_BUILTIN_SPEAKER and
-        // setPreferredOutputDevice(null) releases the WebRTC track's pin.
-        val externalRoute = if (userForcedSpeaker) null else preferredExternalAudioRoute(audioManager)
+        val externalRoute = preferredExternalAudioRoute(audioManager)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             // Set the WebRTC AudioTrack's preferred device BEFORE changing the
             // communication device. AudioTrack.setPreferredDevice() only takes
@@ -2492,7 +2463,6 @@ class NativeCallActivity : Activity(),
         audioRoutingConfigured = false
         speakerphoneEnabled = true
         preferSpeakerphoneWhenNoExternal = true
-        userForcedSpeaker = false
         updateAudioRouteButton()
     }
 
@@ -2500,10 +2470,7 @@ class NativeCallActivity : Activity(),
         speakerButton?.apply {
             val audioManager = getSystemService(AudioManager::class.java)
             val usingExternalAudio = audioManager != null && hasExternalAudioRoute(audioManager)
-            // userForcedSpeaker takes priority over the connected-headphone icon
-            // since the user explicitly asked for speaker output.
             text = when {
-                userForcedSpeaker -> "🔈"
                 usingExternalAudio -> "🎧"
                 speakerphoneEnabled -> "🔈"
                 else -> "📞"
@@ -2511,11 +2478,10 @@ class NativeCallActivity : Activity(),
             background = roundedDrawable(Color.rgb(42, 45, 53))
             setTextColor(Color.WHITE)
             paintFlags = paintFlags and Paint.STRIKE_THRU_TEXT_FLAG.inv()
-            isSelected = (speakerphoneEnabled && !usingExternalAudio) || userForcedSpeaker
-            // Keep the button enabled while headphones are connected so the user
-            // can override routing to speaker. Only disable when there's nothing
-            // to switch to (no speaker/earpiece pair and no external device).
-            isEnabled = usingExternalAudio || canToggleAudioRoute()
+            isSelected = speakerphoneEnabled && !usingExternalAudio
+            // Only enable when there's a speaker/earpiece pair to toggle between;
+            // external devices are routed automatically and not user-toggleable.
+            isEnabled = canToggleAudioRoute()
             alpha = if (isEnabled) 1f else 0.5f
         }
     }
@@ -2523,11 +2489,8 @@ class NativeCallActivity : Activity(),
     private fun refreshCallAudioRouteForDevices() {
         if (!audioRoutingConfigured) return
         val audioManager = getSystemService(AudioManager::class.java) ?: return
-        // Any hot-plug change (headphones added OR removed) returns control to
-        // auto-routing: drop the user's forced-speaker override. On reconnect this
-        // restores the "auto-switch back to headphones" behavior; on disconnect
-        // it falls back to the speaker/earpiece default.
-        userForcedSpeaker = false
+        // Hot-plug changes return control to auto-routing: auto-switch to
+        // headphones on connect, fall back to speaker/earpiece on disconnect.
         speakerphoneEnabled = shouldUseSpeakerphone(audioManager)
         applyAudioRoute()
         updateAudioRouteButton()
@@ -2632,46 +2595,20 @@ class NativeCallActivity : Activity(),
                 "Vidly:NativeProximityWakeLock"
             ).apply { setReferenceCounted(false) }
         }
-        sensorManager = getSystemService(SensorManager::class.java)
-        proximitySensor = sensorManager?.getDefaultSensor(Sensor.TYPE_PROXIMITY)
     }
 
-    private fun registerProximity() {
-        if (isProximityRegistered) return
-        val sensor = proximitySensor ?: return
-        sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
-        isProximityRegistered = true
-    }
-
-    private fun unregisterProximity() {
-        if (!isProximityRegistered) return
-        sensorManager?.unregisterListener(this)
-        proximityWakeLock?.takeIf { it.isHeld }?.release()
-        isProximityRegistered = false
-    }
-
+    // Hold PROXIMITY_SCREEN_OFF_WAKE_LOCK during the call and let the system
+    // (PowerManagerService) drive screen off/on from the proximity sensor. We do
+    // NOT register our own SensorEventListener: a second consumer reacting to the
+    // same sensor jitter fights the system at the near/far boundary and causes
+    // screen blackout/flicker.
     private fun updateProximitySensorState() {
-        if (!callActive) {
-            unregisterProximity()
-            return
-        }
-        val isAnyRemoteSharingScreen = peerMediaStates.values.any { it.screen }
-        if (isAnyRemoteSharingScreen) {
-            unregisterProximity()
-        } else {
-            registerProximity()
-        }
-    }
-
-    override fun onSensorChanged(event: SensorEvent) {
-        if (!callActive || event.sensor.type != Sensor.TYPE_PROXIMITY) return
-        val near = event.values.firstOrNull()?.let { it < event.sensor.maximumRange } ?: false
         val lock = proximityWakeLock ?: return
-        if (near && !lock.isHeld) lock.acquire()
-        else if (!near && lock.isHeld) lock.release()
+        val isAnyRemoteSharingScreen = peerMediaStates.values.any { it.screen }
+        val shouldHold = callActive && !isAnyRemoteSharingScreen
+        if (shouldHold && !lock.isHeld) lock.acquire()
+        else if (!shouldHold && lock.isHeld) lock.release()
     }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
