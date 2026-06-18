@@ -2,6 +2,7 @@
 // Serves static files from public/ and provides WebSocket signaling for WebRTC.
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -15,6 +16,12 @@ const TURN_CREDENTIAL_TTL_SECONDS = parseInt(process.env.TURN_CREDENTIAL_TTL_SEC
 const ANDROID_VERSION_CODE = parseInt(process.env.ANDROID_VERSION_CODE || '1', 10);
 const ANDROID_VERSION_NAME = process.env.ANDROID_VERSION_NAME || '1.0';
 const ANDROID_APK_URL = process.env.ANDROID_APK_URL || 'https://voice.raycc.org/vidly-native.apk';
+// GIPHY proxy — api.giphy.com is blocked on some client networks (e.g. CN),
+// while the signaling server (this) can reach it. Clients fetch GIF metadata
+// via /giphy instead of hitting GIPHY directly. Key lives server-side only.
+const GIPHY_API_KEY = process.env.GIPHY_API_KEY || 'z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn';
+const GIPHY_LIMIT = parseInt(process.env.GIPHY_LIMIT || '20', 10);
+const GIPHY_TIMEOUT_MS = parseInt(process.env.GIPHY_TIMEOUT_MS || '8000', 10);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const CRASH_LOGS_DIR = path.join(__dirname, 'crash-logs');
 const CRASH_MAX_BYTES = 512 * 1024; // cap per report — keep the 1GB VPS safe
@@ -99,6 +106,40 @@ function sendTurnCredentials(res) {
     res.end(JSON.stringify(credentials));
 }
 
+// Proxy GIPHY trending/search. Clients behind networks that block api.giphy.com
+// hit /giphy here instead. `q` empty -> trending, otherwise -> search.
+function proxyGiphy(req, res) {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const query = (params.get('q') || '').trim();
+    const isSearch = query.length > 0;
+    const giphyUrl = 'https://api.giphy.com/v1/gifs/' + (isSearch ? 'search' : 'trending')
+        + '?api_key=' + encodeURIComponent(GIPHY_API_KEY)
+        + '&limit=' + GIPHY_LIMIT
+        + (isSearch ? '&q=' + encodeURIComponent(query) : '');
+
+    const upstream = https.get(giphyUrl, { timeout: GIPHY_TIMEOUT_MS }, (upRes) => {
+        // Pass GIPHY's status through; stream the body straight to the client.
+        const chunks = [];
+        upRes.on('data', (c) => chunks.push(c));
+        upRes.on('end', () => {
+            const body = Buffer.concat(chunks);
+            res.writeHead(upRes.statusCode || 502, {
+                'Content-Type': upRes.headers['content-type'] || 'application/json; charset=utf-8',
+                'Cache-Control': 'no-store',
+            });
+            res.end(body);
+        });
+    });
+    upstream.on('timeout', () => upstream.destroy(new Error('GIPHY upstream timeout')));
+    upstream.on('error', (err) => {
+        console.error('GIPHY proxy error:', err.message);
+        if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: 'giphy_unreachable' }));
+        }
+    });
+}
+
 function saveCrashReport(req, res) {
     let size = 0;
     const chunks = [];
@@ -175,6 +216,11 @@ const server = http.createServer((req, res) => {
             versionName: ANDROID_VERSION_NAME,
             apkUrl: ANDROID_APK_URL,
         }));
+        return;
+    }
+
+    if (urlPath === '/giphy' && req.method === 'GET') {
+        proxyGiphy(req, res);
         return;
     }
 

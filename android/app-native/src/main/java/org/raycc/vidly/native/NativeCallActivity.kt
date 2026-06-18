@@ -67,6 +67,7 @@ import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.raycc.vidly.BuildConfig
 import org.json.JSONArray
 import org.json.JSONObject
@@ -2190,15 +2191,18 @@ class NativeCallActivity : Activity(),
     private data class GiphyItem(val url: String, val previewUrl: String)
 
     private fun fetchGiphy(query: String, onResult: (List<GiphyItem>) -> Unit) {
-        val urlBuilder = okhttp3.HttpUrl.Builder()
-            .scheme("https")
-            .host("api.giphy.com")
-            .addPathSegments(if (query.isNotBlank()) "v1/gifs/search" else "v1/gifs/trending")
-        urlBuilder.addQueryParameter("api_key", GIPHY_API_KEY)
-        urlBuilder.addQueryParameter("limit", GIPHY_LIMIT.toString())
-        if (query.isNotBlank()) urlBuilder.addQueryParameter("q", query)
-        http.newCall(Request.Builder().url(urlBuilder.build()).build()).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) { onResult(emptyList()) }
+        // Route through our own signaling server (/giphy proxy): api.giphy.com is
+        // blocked on some client networks (e.g. CN), but the server can reach it.
+        // Response is GIPHY's JSON, parsed unchanged below.
+        val url = NativeSignalingClient.httpUrlFor("giphy").toHttpUrl()
+            .newBuilder()
+            .apply { if (query.isNotBlank()) addQueryParameter("q", query) }
+            .build()
+        http.newCall(Request.Builder().url(url).build()).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                runOnUiThread { Toast.makeText(this@NativeCallActivity, "GIFs unavailable (network)", Toast.LENGTH_SHORT).show() }
+                onResult(emptyList())
+            }
             override fun onResponse(call: Call, response: Response) {
                 response.use {
                     val body = it.body?.string().orEmpty()
@@ -2631,8 +2635,6 @@ class NativeCallActivity : Activity(),
         private const val FRAME_STALL_MS = 5000L
         private const val FRAME_HEALTH_CHECK_MS = 3000L
         private const val ICE_RESTART_COOLDOWN_MS = 30_000L
-        private const val GIPHY_API_KEY = "z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn"
-        private const val GIPHY_LIMIT = 20
         private const val CHAT_MAX = 200
         private val REACTIONS = listOf("❤️", "😂", "🎉", "😮", "👏", "🤗")
     }

@@ -877,8 +877,6 @@ const localAvatar = $('localAvatar');
 const previewBtns = $('previewBtns');
 const messagesEl = $('messages');
 const REACTIONS = ['❤️', '😂', '🎉', '😮', '👏', '🤗'];
-const GIPHY_API_KEY = 'z3JlLEdcXBGP0Bitbf3ut2XjlnKaV0xn';
-const GIPHY_LIMIT = 20;
 const MEDIA_URL_RE = /^https?:\/\/\S+\.(jpe?g|png|gif|webp)(\?\S*)?$/i;
 const GIF_SERVICE_RE = /^https?:\/\/\S*(giphy\.com|tenor\.com)\/\S+$/i;
 // File transfer tuning. CHUNK_SIZE and BUFFER_HIGH are coupled: effective pipeline
@@ -3162,19 +3160,14 @@ function initStickerPicker() {
     const fetchGifs = async (query = '') => {
         const currentRequest = ++requestId;
         setState('Loading...');
-        const params = new URLSearchParams({
-            api_key: GIPHY_API_KEY,
-            limit: String(GIPHY_LIMIT),
-            rating: 'g',
-        });
+        // Route through our own server (/giphy proxy) — api.giphy.com is blocked
+        // on some client networks. Response is GIPHY's JSON, parsed unchanged.
         const trimmedQuery = query.trim();
-        const endpoint = trimmedQuery
-            ? 'https://api.giphy.com/v1/gifs/search'
-            : 'https://api.giphy.com/v1/gifs/trending';
+        const params = new URLSearchParams({ rating: 'g' });
         if (trimmedQuery) params.set('q', trimmedQuery);
 
         try {
-            const res = await fetch(`${endpoint}?${params}`);
+            const res = await fetch(`/giphy?${params}`);
             if (!res.ok) throw new Error('GIPHY request failed');
             const json = await res.json();
             if (currentRequest !== requestId) return;
