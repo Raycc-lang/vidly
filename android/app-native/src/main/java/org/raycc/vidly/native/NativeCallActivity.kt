@@ -145,7 +145,6 @@ class NativeCallActivity : Activity(),
     private var micEnabled = false
     private var cameraEnabled = false
     private var inPreview = false
-    private var micEnabledBeforePreview = false
     private var callActive = false
     private var userRequestedLeave = false
     private var currentRoom = ""
@@ -1082,11 +1081,9 @@ class NativeCallActivity : Activity(),
 
     private fun startPreview() {
         inPreview = true
-        micEnabledBeforePreview = micEnabled
-        if (!micEnabled) {
-            micEnabled = true
-            rtc?.setMicEnabled(true)
-        }
+        // Mic is independent of camera preview — don't touch it here. The user
+        // toggles mic via its own button. Starting the camera never enables the
+        // mic, and canceling the camera never disables it.
         rtc?.startCameraPreview()
         showLocalPreview()
         previewControls.visibility = View.VISIBLE
@@ -1102,7 +1099,8 @@ class NativeCallActivity : Activity(),
         previewControls.visibility = View.GONE
         updateMediaButtons()
         refreshParticipants()
-        Toast.makeText(this, "Camera and mic on", Toast.LENGTH_SHORT).show()
+        val msg = if (micEnabled) "Camera on" else "Camera on (mic is off)"
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 
     private fun cancelPreview() {
@@ -1110,10 +1108,7 @@ class NativeCallActivity : Activity(),
         rtc?.cancelCameraPreview()
         hideLocalRenderer()
         cameraEnabled = false
-        if (!micEnabledBeforePreview && micEnabled) {
-            micEnabled = false
-            rtc?.setMicEnabled(false)
-        }
+        // Mic is independent of camera preview — don't restore/disable it here.
         previewControls.visibility = View.GONE
         updateMediaButtons()
         refreshParticipants()

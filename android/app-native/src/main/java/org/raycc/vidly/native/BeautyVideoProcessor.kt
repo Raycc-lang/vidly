@@ -49,6 +49,40 @@ class BeautyVideoProcessor : VideoProcessor {
             field = value.coerceIn(0f, 1f)
         }
 
+    // Whether to horizontally flip the SENDER side of the frame. The front
+    // camera's sensor produces a mirrored frame; the local preview re-mirrors
+    // it via SurfaceViewRenderer.setMirror(true) to look natural, but the
+    // frames handed to the encoder/stream are still mirrored. Flipping here
+    // (before the sink) corrects the encoded/remote orientation, while the
+    // local renderer's setMirror undoes it again for display. Toggled per
+    // front/back camera by NativeWebRtcClient.
+    @Volatile
+    var flipHorizontally: Boolean = false
+
+    // Reused scratch matrix for the horizontal flip. Lives in normalized [0,1]
+    // texture-coordinate space as expected by TextureBuffer.applyTransformMatrix.
+    // Reused per-frame; only reset+populated on the camera thread.
+    private val flipMatrix = Matrix()
+    // Reused scratch matrix that reflects across the texture-space vertical axis
+    // (flip t). Needed when the frame's rotation is 90/270 because the flip is
+    // applied BEFORE rotation, and a 90/270 rotation swaps the axes — so to get
+    // a horizontal mirror in display space we must flip the perpendicular axis
+    // in texture space.
+    private val flipMatrixRotated = Matrix()
+
+    init {
+        // Pre-build the two flip variants once. applyTransformMatrix concats
+        // our matrix with the buffer's existing transform, so each just needs
+        // to express "mirror" in normalized [0,1] coords; we pick which to use
+        // per-frame based on frame.rotation.
+        flipMatrix.reset()
+        flipMatrix.preScale(-1f, 1f)      // mirror across vertical axis (s)
+        flipMatrix.postTranslate(1f, 0f)  // remap back into [0,1]
+        flipMatrixRotated.reset()
+        flipMatrixRotated.preScale(1f, -1f)     // mirror across horizontal axis (t)
+        flipMatrixRotated.postTranslate(0f, 1f) // remap back into [0,1]
+    }
+
     private var sink: VideoSink? = null
 
     // GL / EGL state. All of these are touched only on the render thread
@@ -91,7 +125,46 @@ class BeautyVideoProcessor : VideoProcessor {
 
     override fun onFrameCaptured(frame: VideoFrame) {
         val out = sink ?: return
-        val buffer = frame.buffer
+
+        // Sender-side de-mirror for the front camera.
+        //
+        // WHY: the front camera sensor produces a horizontally-mirrored frame,
+        // and that mirroring survives through encoding unchanged (rotation does
+        // not change handedness). So the remote peer decodes a mirrored frame.
+        // To make the remote see the correct orientation we must un-mirror the
+        // frame BEFORE it reaches the encoder.
+        //
+        // WHICH AXIS: applyTransformMatrix operates in normalized [0,1] texture
+        // space, and the flip is applied BEFORE the capturer's rotation. When
+        // rotation is 90° or 270°, the texture-space axes are swapped relative
+        // to display space, so flipping the texture-space V axis (t) produces a
+        // HORIZONTAL flip in the final displayed frame. For 0°/180° the axes
+        // are not swapped, so we flip the U axis (s). (Empirically verified:
+        // flipping only the S axis on a 270°-rotated front-cam frame produced a
+        // vertical flip on the receiver.)
+        //
+        // OWNERSHIP: applyTransformMatrix retains the source buffer and returns
+        // a fresh self-owned buffer. We wrap it in a VideoFrame and release it
+        // after delivery (the sink retains synchronously, matching the beauty
+        // pass contract below). The incoming `frame` is loaned by VideoSource
+        // and is NOT released here.
+        val flipped = if (!flipHorizontally || frame.buffer !is VideoFrame.TextureBuffer) {
+            null
+        } else {
+            // Pick the flip variant by rotation. Front cams report 270° and
+            // back cams 90° (both fall into the rotated branch); a screen
+            // share at 0°/180° would take the s-axis branch — but the processor
+            // only runs on the camera path, so this is mostly belt-and-suspenders.
+            val matrix = when (((frame.rotation % 360) + 360) % 360) {
+                90, 270 -> flipMatrixRotated
+                else -> flipMatrix
+            }
+            val tb = frame.buffer as VideoFrame.TextureBuffer
+            val newBuf = tb.applyTransformMatrix(matrix, tb.width, tb.height)
+            VideoFrame(newBuf, frame.rotation, frame.timestampNs)
+        }
+        val workingFrame = flipped ?: frame
+        val buffer = workingFrame.buffer
 
         if (disposed ||
             !enabled ||
@@ -99,14 +172,16 @@ class BeautyVideoProcessor : VideoProcessor {
             buffer !is VideoFrame.TextureBuffer ||
             buffer.type != VideoFrame.TextureBuffer.Type.OES
         ) {
-            out.onFrame(frame)
+            out.onFrame(workingFrame)
+            flipped?.release()
             return
         }
 
         try {
             ensureInitialized()
         } catch (t: Throwable) {
-            out.onFrame(frame)
+            out.onFrame(workingFrame)
+            flipped?.release()
             return
         }
 
@@ -118,7 +193,8 @@ class BeautyVideoProcessor : VideoProcessor {
 
         if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
             // Couldn't activate our context -- pass the frame through.
-            out.onFrame(frame)
+            out.onFrame(workingFrame)
+            flipped?.release()
             return
         }
 
@@ -146,14 +222,14 @@ class BeautyVideoProcessor : VideoProcessor {
                 Runnable { deleteTextureOnRenderThread(capturedTexture) }
             )
 
-            val processed = VideoFrame(outBuffer, frame.rotation, frame.timestampNs)
+            val processed = VideoFrame(outBuffer, workingFrame.rotation, workingFrame.timestampNs)
             out.onFrame(processed)
             processed.release()
             delivered = true
             outputTexture = 0
         } catch (t: Throwable) {
             // Don't drop the frame on a transient GL error.
-            if (!delivered) out.onFrame(frame)
+            if (!delivered) out.onFrame(workingFrame)
         } finally {
             if (outputTexture != 0) {
                 val tex = intArrayOf(outputTexture)
@@ -170,6 +246,9 @@ class BeautyVideoProcessor : VideoProcessor {
                     EGL14.EGL_NO_CONTEXT
                 )
             }
+            // We held an extra ref on the (flipped) buffer for the duration of
+            // this pass; balance the applyTransformMatrix retain now.
+            flipped?.release()
         }
     }
 

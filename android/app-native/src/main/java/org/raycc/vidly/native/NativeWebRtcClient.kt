@@ -1,6 +1,8 @@
 package org.raycc.vidly.native
 
 import android.content.Context
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.media.AudioDeviceInfo
 import android.os.Handler
 import android.os.Looper
@@ -94,6 +96,17 @@ class NativeWebRtcClient(
     // Logical state — does the local user want camera/mic to be sending?
     private var cameraLive = false
     private var micLive = false
+    // Which physical camera is active. The initial capturer prefers the
+    // front-facing camera (see createCameraCapturer), so we default to true.
+    // Drives beautyProcessor.flipHorizontally — front sensor mirrors, so the
+    // processor un-mirrors; back sensor does not, so the processor passes through.
+    private var isFrontCamera = true
+    // The two device names we cycle between on switchCamera(). Picked once at
+    // capture start: the front camera and the "main" back camera (standard
+    // focal length, skipping redundant wide/tele back cams). Null when only
+    // one facing exists.
+    private var frontDeviceName: String? = null
+    private var backDeviceName: String? = null
 
     fun start() {
         if (started) return
@@ -107,6 +120,19 @@ class NativeWebRtcClient(
         localRenderer.init(eglBase.eglBaseContext, null)
         remoteRenderer.init(eglBase.eglBaseContext, null)
         cameraRenderer?.init(eglBase.eglBaseContext, null)
+        // Mirroring strategy — single source of truth is the VideoProcessor:
+        //   sensor(mirrored for front) → BeautyVideoProcessor(un-mirror for front)
+        //     → processed frame (CORRECT orientation for both front and back)
+        //        ├→ encoder/remote: correct orientation ✓ (no renderer mirror needed)
+        //        └→ localRenderer:  correct orientation ✓ (no renderer mirror needed)
+        //  - ALL renderers stay at setMirror(false). The processor is the only
+        //    place mirroring is corrected, and it feeds both the encoder and the
+        //    local preview from the same already-correct frame.
+        //  - Back camera: no sensor mirror, processor passes through, all renderers
+        //    still setMirror(false). State is re-synced on capture start and switch.
+        localRenderer.setMirror(false)
+        remoteRenderer.setMirror(false)
+        cameraRenderer?.setMirror(false)
         // setAudioTrackStateCallback fires AFTER the ADM creates its internal
         // AudioTrack and calls play() — the earliest reliable moment to pin the
         // output device. Before this, audioOutput.audioTrack is null, so the
@@ -306,15 +332,28 @@ class NativeWebRtcClient(
             status("Camera is off")
             return
         }
-        activeCapturer.switchCamera(object : CameraVideoCapturer.CameraSwitchHandler {
+        // Cycle strictly between the front and main-back device. We don't use
+        // the no-arg switchCamera() because on multi-camera devices it cycles
+        // through every back lens (wide/tele/...), which all look the same and
+        // confuse users. If we somehow have only one device (or the names
+        // weren't resolved), fall back to the no-arg switch.
+        val target = if (isFrontCamera) backDeviceName else frontDeviceName
+        val handler = object : CameraVideoCapturer.CameraSwitchHandler {
             override fun onCameraSwitchDone(isFrontCamera: Boolean) {
+                this@NativeWebRtcClient.isFrontCamera = isFrontCamera
+                applyLocalMirror()
                 status(if (isFrontCamera) "Front camera" else "Back camera")
             }
 
             override fun onCameraSwitchError(error: String) {
                 status("Camera switch failed: $error")
             }
-        })
+        }
+        if (target != null) {
+            activeCapturer.switchCamera(handler, target)
+        } else {
+            activeCapturer.switchCamera(handler)
+        }
     }
 
     fun close() {
@@ -438,11 +477,17 @@ class NativeWebRtcClient(
     private fun ensureVideoTrack() {
         if (localVideoTrack != null) return
         val enumerator = Camera2Enumerator(context)
-        capturer = createCameraCapturer(enumerator)
+        val (chosen, frontFacing) = createCameraCapturer(enumerator)
+        capturer = chosen
         if (capturer == null) {
             status("No camera available")
             return
         }
+        // Reflect the actual device we ended up with (createCameraCapturer
+        // falls back to the first available camera if no front-facing one
+        // exists), then keep the local preview mirror in sync.
+        isFrontCamera = frontFacing
+        applyLocalMirror()
         surfaceHelper = SurfaceTextureHelper.create("VidlyCameraThread", eglBase.eglBaseContext)
         videoSource = factory.createVideoSource(false).apply {
             setVideoProcessor(beautyProcessor)
@@ -633,14 +678,67 @@ class NativeWebRtcClient(
         audioSource = null
     }
 
-    private fun createCameraCapturer(enumerator: CameraEnumerator): CameraVideoCapturer? {
-        enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }?.let {
-            return enumerator.createCapturer(it, null)
+    // Returns the capturer plus whether it is front-facing. The fallback
+    // (non-front) branch is marked frontFacing=false so the caller can keep
+    // the local mirror in sync.
+    // Enumerates cameras, picks the front + main-back pair to cycle between,
+    // and creates a capturer for the front (preferred initial device). Also
+    // populates frontDeviceName/backDeviceName for switchCamera(). Returns the
+    // capturer and whether it is front-facing.
+    //
+    // "main" back camera: devices with multiple back lenses (main/wide/tele)
+    // expose several back-facing IDs that all look similar on a video call.
+    // We pick the back camera whose focal length is closest to a standard
+    // phone main lens (~4mm) — this skips ultrawide (~2mm or less) and tele
+    // (~6mm+). Falls back to the first back camera if focal-length data is
+    // unavailable. Fully device-agnostic; no hardcoded device IDs.
+    private fun createCameraCapturer(enumerator: CameraEnumerator): Pair<CameraVideoCapturer?, Boolean> {
+        val front = enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
+        val backs = enumerator.deviceNames.filter { enumerator.isBackFacing(it) }
+        val mainBack = backs.firstOrNull()?.let { pickMainBackCamera(backs) } ?: backs.firstOrNull()
+        frontDeviceName = front
+        backDeviceName = mainBack
+
+        val chosen = front ?: mainBack
+        if (chosen == null) return null to false
+        return enumerator.createCapturer(chosen, null) to (chosen == front)
+    }
+
+    // Among a set of back-facing device names, returns the one most likely to
+    // be the standard "main" rear lens. Strategy:
+    //   1. Read focal lengths via Camera2 CameraCharacteristics for each name.
+    //      (Camera2Enumerator uses the cameraId as the device name, which maps
+    //      directly to CameraManager.getCameraCharacteristics.)
+    //   2. Score by distance of the (first) focal length from ~4mm; pick min.
+    //   3. If no device yields focal-length data (non-Camera2 enumerator,
+    //      permissions, etc.), fall back to the first back device.
+    private fun pickMainBackCamera(backs: List<String>): String {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: return backs.first()
+        val candidates = mutableListOf<Pair<String, Float>>() // name -> |focal - 4.0|
+        for (name in backs) {
+            val focal = runCatching {
+                manager.getCameraCharacteristics(name)
+                    .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    ?.firstOrNull()
+            }.getOrNull()
+            if (focal != null && focal > 0f) {
+                candidates.add(name to kotlin.math.abs(focal - 4.0f))
+            }
         }
-        enumerator.deviceNames.firstOrNull()?.let {
-            return enumerator.createCapturer(it, null)
-        }
-        return null
+        return candidates.minByOrNull { it.second }?.first ?: backs.first()
+    }
+
+    // Keeps the sender-side flip in sync with the active camera. Called at
+    // capture start and after every camera switch.
+    //
+    // All renderers stay at setMirror(false) — the processor is the single
+    // source of truth for orientation. Front camera: processor un-mirrors the
+    // sensor frame, so both the encoded stream and the local preview (which
+    // share the processor's output) see the correct orientation. Back camera:
+    // processor passes through, still correct everywhere.
+    private fun applyLocalMirror() {
+        beautyProcessor.flipHorizontally = isFrontCamera
     }
 
     private fun ensurePeer(peerId: String, polite: Boolean): Peer {
