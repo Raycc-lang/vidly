@@ -57,6 +57,7 @@ import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
@@ -150,6 +151,7 @@ class NativeCallActivity : Activity(),
     private var currentRoom = ""
     private var currentUsername = ""
     private var loadingHistory = false
+    private var lastChatTs = 0L
     private var hasRemoteVideo = false
     private var hasRemoteCamera = false
     private var headerStatus = "Native Vidly"
@@ -394,26 +396,33 @@ class NativeCallActivity : Activity(),
             when (msg.optString("type")) {
                 "chat" -> {
                     val body = msg.optString("body")
-                    appendChatText(senderName, body, incoming = true)
+                    val ts = msg.optLong("ts")
+                    appendChatText(senderName, body, incoming = true, ts = ts)
                     saveChatMsg(JSONObject()
                         .put("type", "chat").put("kind", "other")
-                        .put("body", body).put("ts", msg.optLong("ts"))
+                        .put("body", body).put("ts", ts)
                         .put("senderName", senderName))
+                }
+                "chat-edit" -> {
+                    val originalTs = msg.optLong("originalTs")
+                    val body = msg.optString("body")
+                    applyChatEdit(originalTs, body)
                 }
                 "reaction" -> {
                     val emoji = msg.optString("emoji")
                     if (emoji.isNotBlank()) {
-                        appendChatText(senderName, emoji, incoming = true)
+                        val ts = msg.optLong("ts")
+                        appendChatText(senderName, emoji, incoming = true, ts = ts)
                         saveChatMsg(JSONObject()
                             .put("type", "reaction").put("kind", "other")
-                            .put("emoji", emoji).put("ts", msg.optLong("ts"))
+                            .put("emoji", emoji).put("ts", ts)
                             .put("senderName", senderName))
                     }
                 }
                 "media" -> {
                     val url = msg.optString("url")
                     val mediaKind = msg.optString("kind")
-                    appendChatMedia(senderName, url, mediaKind, incoming = true)
+                    appendChatMedia(senderName, url, mediaKind, incoming = true, ts = msg.optLong("ts"))
                     saveChatMsg(JSONObject()
                         .put("type", "media").put("kind", "other")
                         .put("url", url).put("mediaKind", mediaKind)
@@ -1019,6 +1028,7 @@ class NativeCallActivity : Activity(),
         resetLocalPreviewPosition()
         refreshParticipants()
         chatList.removeAllViews()
+        lastChatTs = 0L
         loadChatHistory()
         outgoingFiles.clear()
         incomingFiles.clear()
@@ -1562,7 +1572,7 @@ class NativeCallActivity : Activity(),
             .put("ts", ts)
             .put("username", currentUsername)
         rtc?.sendChatJson(msg)
-        appendChatText(currentUsername.ifBlank { "You" }, body, incoming = false)
+        appendChatText(currentUsername.ifBlank { "You" }, body, incoming = false, ts = ts, editable = true)
         saveChatMsg(JSONObject()
             .put("type", "chat").put("kind", "own")
             .put("body", body).put("ts", ts)
@@ -1578,7 +1588,7 @@ class NativeCallActivity : Activity(),
             .put("ts", ts)
             .put("username", currentUsername)
         rtc?.sendChatJson(msg)
-        appendChatText(currentUsername.ifBlank { "You" }, emoji, incoming = false)
+        appendChatText(currentUsername.ifBlank { "You" }, emoji, incoming = false, ts = ts)
         saveChatMsg(JSONObject()
             .put("type", "reaction").put("kind", "own")
             .put("emoji", emoji).put("ts", ts)
@@ -1594,7 +1604,7 @@ class NativeCallActivity : Activity(),
             .put("ts", ts)
             .put("username", currentUsername)
         rtc?.sendChatJson(msg)
-        appendChatMedia(currentUsername.ifBlank { "You" }, url, kind, incoming = false)
+        appendChatMedia(currentUsername.ifBlank { "You" }, url, kind, incoming = false, ts = ts)
         saveChatMsg(JSONObject()
             .put("type", "media").put("kind", "own")
             .put("url", url).put("mediaKind", kind).put("ts", ts)
@@ -1630,12 +1640,13 @@ class NativeCallActivity : Activity(),
                 val incoming = m.optString("kind") == "other"
                 val sender = if (incoming) m.optString("senderName", "Peer")
                              else currentUsername.ifBlank { "You" }
+                val ts = m.optLong("ts")
                 when (m.optString("type")) {
-                    "chat" -> appendChatText(sender, m.optString("body"), incoming)
-                    "reaction" -> appendChatText(sender, m.optString("emoji"), incoming)
+                    "chat" -> appendChatText(sender, m.optString("body"), incoming, ts = ts, editable = !incoming)
+                    "reaction" -> appendChatText(sender, m.optString("emoji"), incoming, ts = ts)
                     "media" -> {
                         val mediaKind = m.optString("mediaKind", m.optString("kind"))
-                        appendChatMedia(sender, m.optString("url"), mediaKind, incoming)
+                        appendChatMedia(sender, m.optString("url"), mediaKind, incoming, ts = ts)
                     }
                 }
             }
@@ -1645,15 +1656,164 @@ class NativeCallActivity : Activity(),
 
     // ─── Chat rendering ───────────────────────────────────────
 
-    private fun appendChatText(sender: String, body: String, incoming: Boolean) {
+    private fun appendChatText(
+        sender: String,
+        body: String,
+        incoming: Boolean,
+        ts: Long = System.currentTimeMillis(),
+        editable: Boolean = false
+    ) {
         val item = makeMessageContainer(sender, incoming)
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fillTextRow(item, row, body, ts, editable)
+        item.addView(row)
+        addMessageItem(item, ts)
+    }
+
+    /** (Re)populate a horizontal message row with a selectable text view and,
+     *  for own messages, a trailing ⋯ menu button (Edit / Delete). */
+    private fun fillTextRow(item: LinearLayout, row: LinearLayout, body: String, ts: Long, editable: Boolean) {
+        row.removeAllViews()
         val text = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 14f
             setChatMessageText(body)
+            setTextIsSelectable(true)
         }
-        item.addView(text)
-        addMessageItem(item, "$sender: $body")
+        row.addView(text, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (editable) {
+            val menuBtn = TextView(this).apply {
+                this.text = "⋯"
+                setTextColor(Color.rgb(150, 156, 170))
+                textSize = 20f
+                setPadding(dp(10), 0, dp(4), 0)
+                gravity = Gravity.CENTER_VERTICAL
+                setOnClickListener { showMessageMenu(item, row, ts, this) }
+            }
+            row.addView(menuBtn)
+        }
+    }
+
+    private fun showMessageMenu(item: LinearLayout, row: LinearLayout, ts: Long, anchor: View) {
+        val popup = PopupMenu(this, anchor)
+        popup.menu.add(0, 1, 0, "Edit")
+        popup.menu.add(0, 2, 1, "Delete")
+        popup.setOnMenuItemClickListener { mi ->
+            when (mi.itemId) {
+                1 -> { startInlineEdit(item, row, ts); true }
+                2 -> { deleteMessage(item, ts); true }
+                else -> false
+            }
+        }
+        popup.show()
+    }
+
+    private fun startInlineEdit(item: LinearLayout, row: LinearLayout, ts: Long) {
+        val oldBody = (row.getChildAt(0) as? TextView)?.text?.toString() ?: return
+        row.removeAllViews()
+        val edit = EditText(this).apply {
+            setText(oldBody)
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.rgb(120, 126, 140))
+            textSize = 14f
+            setSelection(oldBody.length)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        }
+        val confirm = TextView(this).apply {
+            text = "✓"
+            setTextColor(Color.rgb(120, 200, 160))
+            textSize = 18f
+            setPadding(dp(10), 0, dp(6), 0)
+            gravity = Gravity.CENTER_VERTICAL
+            setOnClickListener {
+                val newBody = edit.text.toString().trim()
+                if (newBody.isBlank()) {
+                    fillTextRow(item, row, oldBody, ts, true)
+                    return@setOnClickListener
+                }
+                if (newBody != oldBody) {
+                    val newTs = System.currentTimeMillis()
+                    rtc?.sendChatJson(JSONObject()
+                        .put("type", "chat-edit")
+                        .put("originalTs", ts)
+                        .put("body", newBody)
+                        .put("ts", newTs)
+                        .put("username", currentUsername))
+                    updateChatHistoryBody(ts, newBody)
+                }
+                fillTextRow(item, row, newBody, ts, true)
+                hideKeyboard()
+            }
+        }
+        val cancel = TextView(this).apply {
+            text = "✕"
+            setTextColor(Color.rgb(200, 120, 120))
+            textSize = 18f
+            setPadding(dp(6), 0, dp(4), 0)
+            gravity = Gravity.CENTER_VERTICAL
+            setOnClickListener {
+                fillTextRow(item, row, oldBody, ts, true)
+                hideKeyboard()
+            }
+        }
+        row.addView(edit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(confirm)
+        row.addView(cancel)
+        edit.requestFocus()
+    }
+
+    private fun deleteMessage(item: LinearLayout, ts: Long) {
+        chatList.removeView(item)
+        deleteChatHistory(ts)
+    }
+
+    /** Apply an incoming chat-edit: update the matching message view + history. */
+    private fun applyChatEdit(originalTs: Long, newBody: String) {
+        if (originalTs == 0L) return
+        for (i in 0 until chatList.childCount) {
+            val child = chatList.getChildAt(i)
+            if ((child.tag as? Long) == originalTs && child is LinearLayout) {
+                val row = child.getChildAt(child.childCount - 1) as? LinearLayout
+                (row?.getChildAt(0) as? TextView)?.apply {
+                    setChatMessageText(newBody)
+                    setTextIsSelectable(true)
+                }
+                break
+            }
+        }
+        updateChatHistoryBody(originalTs, newBody)
+    }
+
+    private fun updateChatHistoryBody(originalTs: Long, newBody: String) {
+        if (currentRoom.isBlank()) return
+        try {
+            val prefs = getSharedPreferences("vidly_prefs", MODE_PRIVATE)
+            val arr = JSONArray(prefs.getString(chatKey(), "[]"))
+            var changed = false
+            for (i in 0 until arr.length()) {
+                val m = arr.getJSONObject(i)
+                if (m.optString("type") == "chat" && m.optLong("ts") == originalTs) {
+                    m.put("body", newBody)
+                    changed = true
+                }
+            }
+            if (changed) prefs.edit().putString(chatKey(), arr.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun deleteChatHistory(ts: Long) {
+        if (currentRoom.isBlank()) return
+        try {
+            val prefs = getSharedPreferences("vidly_prefs", MODE_PRIVATE)
+            val arr = JSONArray(prefs.getString(chatKey(), "[]"))
+            val out = JSONArray()
+            for (i in 0 until arr.length()) {
+                val m = arr.getJSONObject(i)
+                if (m.optLong("ts") == ts) continue
+                out.put(m)
+            }
+            prefs.edit().putString(chatKey(), out.toString()).apply()
+        } catch (_: Exception) {}
     }
 
     private fun TextView.setChatMessageText(body: String) {
@@ -1729,7 +1889,7 @@ class NativeCallActivity : Activity(),
         Toast.makeText(this, "Link copied", Toast.LENGTH_SHORT).show()
     }
 
-    private fun appendChatMedia(sender: String, url: String, kind: String, incoming: Boolean) {
+    private fun appendChatMedia(sender: String, url: String, kind: String, incoming: Boolean, ts: Long = System.currentTimeMillis()) {
         val item = makeMessageContainer(sender, incoming)
         val image = ImageView(this).apply {
             adjustViewBounds = true
@@ -1743,10 +1903,10 @@ class NativeCallActivity : Activity(),
         }
         item.addView(image, LinearLayout.LayoutParams(dp(220), -2).apply { topMargin = dp(4) })
         loadImageInto(image, url)
-        addMessageItem(item, "$sender: 🖼️ $kind")
+        addMessageItem(item, ts)
     }
 
-    private fun appendChatFileImage(sender: String, name: String, bitmap: Bitmap, incoming: Boolean, bytes: ByteArray? = null, mimeType: String = "image/png") {
+    private fun appendChatFileImage(sender: String, name: String, bitmap: Bitmap, incoming: Boolean, bytes: ByteArray? = null, mimeType: String = "image/png", ts: Long = System.currentTimeMillis()) {
         val item = makeMessageContainer(sender, incoming)
         val nameView = TextView(this).apply {
             text = "📎 $name"
@@ -1771,7 +1931,7 @@ class NativeCallActivity : Activity(),
             }
         }
         item.addView(image, LinearLayout.LayoutParams(dp(220), -2).apply { topMargin = dp(4) })
-        addMessageItem(item, "$sender: 📎 $name (image)")
+        addMessageItem(item, ts)
     }
 
     private fun showFullscreenImage(url: String) {
@@ -1903,9 +2063,35 @@ class NativeCallActivity : Activity(),
         return container
     }
 
-    private fun addMessageItem(item: LinearLayout, compact: String) {
+    private fun addMessageItem(item: LinearLayout, ts: Long) {
+        maybeAddTimeDivider(ts)
+        item.tag = ts
         chatList.addView(item)
         chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    /** Insert a centered HH:MM divider when the gap from the previous
+     *  message exceeds 5 minutes (and always before the first message). */
+    private fun maybeAddTimeDivider(ts: Long) {
+        if (ts <= 0L) return
+        if (lastChatTs == 0L || ts - lastChatTs > 5 * 60 * 1000L) {
+            chatList.addView(makeTimeDivider(ts))
+        }
+        lastChatTs = ts
+    }
+
+    private fun makeTimeDivider(ts: Long): TextView {
+        return TextView(this).apply {
+            text = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(ts))
+            setTextColor(Color.rgb(120, 126, 140))
+            textSize = 11f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(6), 0, dp(2))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
     }
 
     private fun sendChatJsonTo(peerId: String, payload: JSONObject) {

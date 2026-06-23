@@ -2312,6 +2312,8 @@ function attachDataChannel(peer, dc) {
         if (msg.username) peer.username = msg.username;
         if (msg.type === 'chat') {
             addMessage('other', msg.body, msg.ts, msg.username);
+        } else if (msg.type === 'chat-edit') {
+            applyChatEdit(msg.originalTs, msg.body);
         } else if (msg.type === 'media') {
             addMediaMessage('other', msg.url, msg.kind, msg.ts, msg.username);
         } else if (msg.type === 'reaction') {
@@ -2783,6 +2785,7 @@ function loadChatHistory() {
 function addMessage(kind, body, ts, senderName) {
     const el = document.createElement('div');
     el.className = 'msg ' + kind;
+    if (ts) el.dataset.ts = ts;
     // Show sender name for incoming messages
     if (kind === 'other' && senderName) {
         const nameEl = document.createElement('div');
@@ -2794,6 +2797,7 @@ function addMessage(kind, body, ts, senderName) {
         el.appendChild(nameEl);
     }
     const bodyEl = document.createElement('span');
+    bodyEl.className = 'msg-body';
     bodyEl.textContent = body;
     el.appendChild(bodyEl);
     if (ts) {
@@ -2810,6 +2814,23 @@ function addMessage(kind, body, ts, senderName) {
         updateChatCompact();
         saveChatMsg({ type: 'chat', kind, body, ts, senderName });
     }
+}
+
+function applyChatEdit(originalTs, body) {
+    if (!originalTs) return;
+    const el = messagesEl.querySelector('.msg[data-ts="' + originalTs + '"]');
+    if (el) {
+        const bodyEl = el.querySelector('.msg-body');
+        if (bodyEl) bodyEl.textContent = body;
+    }
+    try {
+        const arr = JSON.parse(localStorage.getItem(chatKey()) || '[]');
+        let changed = false;
+        for (const m of arr) {
+            if (m.type === 'chat' && m.ts === originalTs) { m.body = body; changed = true; }
+        }
+        if (changed) localStorage.setItem(chatKey(), JSON.stringify(arr));
+    } catch {}
 }
 
 function appendSenderName(el, kind, senderName) {
