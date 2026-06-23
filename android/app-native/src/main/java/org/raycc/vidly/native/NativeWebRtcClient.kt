@@ -934,16 +934,12 @@ class NativeWebRtcClient(
                 if (json.optString("type") == "media-state") {
                     peer.remoteCameraLive = json.optBoolean("cam", false)
                     peer.remoteScreenLive = json.optBoolean("screen", false)
+                    // Always sync pause state — media-state can arrive before
+                    // onTrack sets remoteVideoPeerId, and we must not lose the
+                    // pause state. Rendering ops still need the peer-id guard.
+                    remoteCameraPaused = !peer.remoteCameraLive
+                    remoteScreenPaused = !peer.remoteScreenLive
                     if (remoteVideoPeerId == peer.id) {
-                        // A media-state toggle is a PAUSE, not a track teardown:
-                        // the remote keeps its RtpSender (no renegotiation), so
-                        // the cached VideoTrack stays LIVE and frames will flow
-                        // again when it resumes. Only stop/start rendering; never
-                        // null the track here (that's what onRemoveTrack /
-                        // peer-left are for). pc.onTrack will not refire on
-                        // resume because the remote reuses its RtpSender.
-                        remoteCameraPaused = !peer.remoteCameraLive
-                        remoteScreenPaused = !peer.remoteScreenLive
                         // Force re-attach on resume: updateRendered* short-circuits
                         // when renderedTrack === track (same LIVE object reused
                         // through a pause), so detach first to ensure a fresh
