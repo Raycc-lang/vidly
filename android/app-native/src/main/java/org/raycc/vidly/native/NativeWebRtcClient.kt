@@ -671,6 +671,30 @@ class NativeWebRtcClient(
         updateRenderedRemoteCamera()
     }
 
+    // Re-attach the renderer for a remote video track when the remote resumes
+    // sending. Called from RtpReceiver.Observer.onFirstPacketReceived — the
+    // Android equivalent of the browser's track.onunmute (which the web client
+    // also uses, index.html ~line 1921). The remote keeps its RtpSender through
+    // a camera off→on, so the cached VideoTrack stays LIVE (no onRemoveTrack,
+    // no pc.onTrack refire); onFirstPacketReceived is the reliable "frames are
+    // flowing again" signal that lets us recover the display.
+    //
+    // Idempotent: if the track is already being rendered (the media-state
+    // cam:true handler already re-attached), this is a no-op. It only matters
+    // when the media-state message is lost (DataChannel is reliable but this is
+    // a cheap safety net).
+    private fun onRemoteVideoFirstPacket(track: VideoTrack) {
+        if (remoteCameraTrack === track) {
+            if (remoteCameraPaused) return
+            if (renderedRemoteCameraTrack === track) return
+            updateRenderedRemoteCamera()
+        } else if (remoteScreenTrack === track) {
+            if (remoteScreenPaused) return
+            if (renderedRemoteVideoTrack === track) return
+            updateRenderedRemoteVideo()
+        }
+    }
+
     private fun stopAudio() {
         localAudioTrack?.dispose()
         localAudioTrack = null
@@ -913,13 +937,19 @@ class NativeWebRtcClient(
                     if (remoteVideoPeerId == peer.id) {
                         // A media-state toggle is a PAUSE, not a track teardown:
                         // the remote keeps its RtpSender (no renegotiation), so
-                        // the cached VideoTrack stays valid and frames will flow
+                        // the cached VideoTrack stays LIVE and frames will flow
                         // again when it resumes. Only stop/start rendering; never
                         // null the track here (that's what onRemoveTrack /
-                        // peer-left are for). Otherwise camera off→on would never
-                        // re-render because pc.onTrack does not refire.
+                        // peer-left are for). pc.onTrack will not refire on
+                        // resume because the remote reuses its RtpSender.
                         remoteCameraPaused = !peer.remoteCameraLive
                         remoteScreenPaused = !peer.remoteScreenLive
+                        // Force re-attach on resume: updateRendered* short-circuits
+                        // when renderedTrack === track (same LIVE object reused
+                        // through a pause), so detach first to ensure a fresh
+                        // addSink and resume rendering.
+                        if (peer.remoteCameraLive) detachRenderedRemoteCamera()
+                        if (peer.remoteScreenLive) detachRenderedRemoteVideo()
                         updateRenderedRemoteCamera()
                         updateRenderedRemoteVideo()
                     }
@@ -976,6 +1006,18 @@ class NativeWebRtcClient(
                 if (activePeerId != null && activePeerId != peer.id) return
                 remoteVideoPeerId = peer.id
                 assignRemoteVideoTrack(peer, track)
+                // Register a receiver observer so that when the remote resumes
+                // sending after a camera off→on (track stays LIVE but goes
+                // muted — no onRemoveTrack, pc.onTrack does not refire), we get
+                // onFirstPacketReceived as the "unmute" signal and can recover
+                // the display. Web clients get this via track.onunmute; the
+                // Android WebRTC API exposes it as RtpReceiver.Observer instead.
+                transceiver.receiver?.SetObserver(object : RtpReceiver.Observer {
+                    override fun onFirstPacketReceived(mediaType: MediaStreamTrack.MediaType) {
+                        if (mediaType != MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) return
+                        onRemoteVideoFirstPacket(track)
+                    }
+                })
             }
         }
 

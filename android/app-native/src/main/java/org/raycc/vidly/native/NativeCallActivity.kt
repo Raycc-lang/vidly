@@ -425,9 +425,6 @@ class NativeCallActivity : Activity(),
                     val cam = msg.optBoolean("cam", false)
                     val screen = msg.optBoolean("screen", false)
                     peerMediaStates[fromPeerId] = PeerMediaState(mic, cam, screen)
-                    if (msg.has("video") && !msg.optBoolean("video", false)) {
-                        rtc?.onPeerVideoInactive(fromPeerId)
-                    }
                     refreshParticipants()
                     updateProximitySensorState()
                 }
