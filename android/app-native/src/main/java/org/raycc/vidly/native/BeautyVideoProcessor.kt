@@ -113,6 +113,9 @@ class BeautyVideoProcessor : VideoProcessor {
     private var initialized = false
     private var disposed = false
 
+    private data class PooledTexture(val textureId: Int, val width: Int, val height: Int)
+    private val texturePool = mutableListOf<PooledTexture>()
+
     override fun setSink(sink: VideoSink?) {
         this.sink = sink
         if (sink == null) {
@@ -203,7 +206,7 @@ class BeautyVideoProcessor : VideoProcessor {
         try {
             val width = buffer.width
             val height = buffer.height
-            outputTexture = createRgbaTexture(width, height)
+            outputTexture = getOrCreateTexture(width, height)
 
             renderBeautyPass(buffer, outputTexture, width, height)
 
@@ -219,7 +222,7 @@ class BeautyVideoProcessor : VideoProcessor {
                 Matrix(), // identity -- transform was baked in during the shader pass
                 renderHandler!!,
                 yuvConverter!!,
-                Runnable { deleteTextureOnRenderThread(capturedTexture) }
+                Runnable { recycleTextureOnRenderThread(capturedTexture, width, height) }
             )
 
             val processed = VideoFrame(outBuffer, workingFrame.rotation, workingFrame.timestampNs)
@@ -371,6 +374,12 @@ class BeautyVideoProcessor : VideoProcessor {
             }
             yuvConverter?.release()
             yuvConverter = null
+            synchronized(texturePool) {
+                for (pt in texturePool) {
+                    GLES20.glDeleteTextures(1, intArrayOf(pt.textureId), 0)
+                }
+                texturePool.clear()
+            }
         } finally {
             EGL14.eglMakeCurrent(
                 eglDisplay,
@@ -392,34 +401,59 @@ class BeautyVideoProcessor : VideoProcessor {
         initialized = false
     }
 
-    private fun deleteTextureOnRenderThread(textureId: Int) {
+    private fun getOrCreateTexture(width: Int, height: Int): Int {
+        synchronized(texturePool) {
+            val iterator = texturePool.iterator()
+            while (iterator.hasNext()) {
+                val pt = iterator.next()
+                if (pt.width == width && pt.height == height) {
+                    iterator.remove()
+                    return pt.textureId
+                }
+            }
+        }
+        return createRgbaTexture(width, height)
+    }
+
+    private fun recycleTextureOnRenderThread(textureId: Int, width: Int, height: Int) {
         val handler = renderHandler ?: return
         handler.post {
-            if (eglDisplay == EGL14.EGL_NO_DISPLAY || eglContext == EGL14.EGL_NO_CONTEXT) return@post
-            // Only switch contexts if needed. The release callback usually fires
-            // off the render thread's frame loop, where no context is current.
-            val priorContext = EGL14.eglGetCurrentContext()
-            val needSwitch = priorContext != eglContext
-            val priorDisplay = EGL14.eglGetCurrentDisplay()
-            val priorDraw = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
-            val priorRead = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
-            if (needSwitch) {
-                EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+            if (disposed || eglDisplay == EGL14.EGL_NO_DISPLAY || eglContext == EGL14.EGL_NO_CONTEXT) {
+                deleteTextureDirect(textureId)
+                return@post
             }
-            try {
-                GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
-            } finally {
-                if (needSwitch) {
-                    if (priorDisplay != EGL14.EGL_NO_DISPLAY && priorContext != EGL14.EGL_NO_CONTEXT) {
-                        EGL14.eglMakeCurrent(priorDisplay, priorDraw, priorRead, priorContext)
-                    } else {
-                        EGL14.eglMakeCurrent(
-                            eglDisplay,
-                            EGL14.EGL_NO_SURFACE,
-                            EGL14.EGL_NO_SURFACE,
-                            EGL14.EGL_NO_CONTEXT
-                        )
-                    }
+            synchronized(texturePool) {
+                if (texturePool.size < 5) {
+                    texturePool.add(PooledTexture(textureId, width, height))
+                } else {
+                    deleteTextureDirect(textureId)
+                }
+            }
+        }
+    }
+
+    private fun deleteTextureDirect(textureId: Int) {
+        val priorContext = EGL14.eglGetCurrentContext()
+        val needSwitch = priorContext != eglContext
+        val priorDisplay = EGL14.eglGetCurrentDisplay()
+        val priorDraw = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        val priorRead = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
+        if (needSwitch) {
+            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        }
+        try {
+            GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+        } finally {
+            if (needSwitch) {
+                if (priorDisplay != EGL14.EGL_NO_DISPLAY && priorContext != EGL14.EGL_NO_CONTEXT) {
+                    EGL14.eglMakeCurrent(priorDisplay, priorDraw, priorRead, priorContext)
+                } else {
+                    EGL14.eglMakeCurrent(
+                        eglDisplay,
+                        EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_CONTEXT
+                    )
                 }
             }
         }

@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Vidly"
-include(":app-webview", ":app-native")
+include(":app-native")

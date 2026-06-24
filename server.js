@@ -199,7 +199,7 @@ const server = http.createServer((req, res) => {
     // Strip query string for routing
     const urlPath = (req.url || '/').split('?')[0];
 
-    if ((urlPath === '/turn-credentials' || urlPath === '/config') && req.method === 'GET') {
+    if (urlPath === '/turn-credentials' && req.method === 'GET') {
         sendTurnCredentials(res);
         return;
     }

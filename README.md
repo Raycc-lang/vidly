@@ -66,7 +66,7 @@ server {
 
 - `GET /` — landing page (create / join a room)
 - `GET /room/<id>` — call page, auto-joins the room
-- `GET /config` — `{ "turnUrl": "..." }` for client-side ICE config
+- `GET /turn-credentials` — time-limited TURN ICE config: `{ urls, username, credential, ttl, expires }`
 - `GET /<file>` — static asset from `public/`
 - `WS /*` — signaling (any path; nginx upgrade above covers it)
 
