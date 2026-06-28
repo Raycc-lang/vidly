@@ -858,11 +858,8 @@ let lastWsMessageAt = 0;
 let intentionalClose = false;
 let wakeLock = null;
 let iceServers = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
-    { urls: 'stun:global.stun.twilio.com:3478' },
+    { urls: 'stun:stun.cloudflare.com:53' },
 ];
 
 // ─── DOM refs ─────────────────────────────────────────────
@@ -1024,16 +1021,30 @@ window.addEventListener('popstate', () => location.reload());
 async function loadConfig() {
     try {
         const cfg = await (await fetch('/turn-credentials', { cache: 'no-store' })).json();
-        if (cfg.urls && cfg.username && cfg.credential) {
+        // Cloudflare format: { iceServers: [{ urls: [...], username: "...", credential: "..." }] }
+        // Legacy format:     { urls: [...], username: "...", credential: "..." }
+        const list = cfg.iceServers || [cfg];
+        if (Array.isArray(list) && list.length > 0) {
+            // Remove existing TURN entries
             iceServers = iceServers.filter(server => {
                 const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
                 return !urls.some(url => typeof url === 'string' && url.startsWith('turn:'));
             });
-            iceServers.push({
-                urls: cfg.urls,
-                username: cfg.username,
-                credential: cfg.credential
-            });
+            for (const entry of list) {
+                if (entry.urls && entry.username && entry.credential) {
+                    iceServers.push({
+                        urls: entry.urls,
+                        username: entry.username,
+                        credential: entry.credential,
+                    });
+                } else if (entry.urls) {
+                    // STUN-only entry: add URLs individually
+                    const urls = Array.isArray(entry.urls) ? entry.urls : [entry.urls];
+                    for (const url of urls) {
+                        iceServers.push({ urls: url });
+                    }
+                }
+            }
         }
     } catch (e) {
         console.warn('Failed to fetch /turn-credentials', e);
@@ -1646,8 +1657,15 @@ $('switchCamBtn').onclick = async () => {
 // ─── WebSocket signaling ──────────────────────────────────
 function connectWebSocket() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = location.hostname === 'localhost' || location.hostname === '192.168.1.13'
+        ? proto + '//' + location.host + '/ws'  // local testing: use VPS
+        : proto + '//' + location.host + '/ws';  // production: keep using VPS initially
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-    ws = new WebSocket(proto + '//' + location.host + '/ws');
+
+    // In production, use the Cloudflare Worker for signaling:
+    // ws = new WebSocket('wss://vidly-signal.iceui2016.workers.dev/signal?roomId=' + encodeURIComponent(roomId));
+    // For now, keep using the VPS-based signaling (until both clients are updated):
+    ws = new WebSocket(host);
     setWsDot('connecting');
 
     ws.onopen = () => {

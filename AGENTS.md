@@ -36,5 +36,16 @@ adb connect 192.168.1.13:5555 && adb install -r android/app-native/build/outputs
 - **TURN URLs**: pass array (UDP + TCP). Fetch synchronously before `signaling.connect()`.
 - **AGENTS.md**: This file. Auto-loaded when workdir=~/video-call/.
 
-## Skills
+## Infrastructure
+
+- **Signaling**: Cloudflare Worker `vidly-signal.iceui2016.workers.dev` + Durable Object `RoomDO` (migrated 2026-06-27)
+- **TURN**: Cloudflare Calls (`turn.cloudflare.com`) — 1000GB/mo free tier
+- **Web client**: VPS at `voice.raycc.org`
+- **Android SIGNALING_URL**: `wss://vidly-signal.iceui2016.workers.dev/signal?roomId=<id>`
+
+## Project Skills (`.qoder/skills/`)
+- `vidly-context` — user preferences, device info, project memory, infra details
+- `vidly-feature-specs` — write implementation specs for coding agents (design-first workflow)
+- `cloudflare-webrtc-signaling` — Cloudflare Workers + Durable Objects + Calls TURN setup
+- `webrtc-video-call` — WebRTC mesh architecture, signaling protocol, reconnection, ICE debugging
 - `vidly-release` — bump version, build APK, deploy to VPS, restart systemd service

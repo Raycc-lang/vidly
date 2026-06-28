@@ -1,0 +1,6 @@
+name = "vidly-pop-test"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+# workers.dev subdomain — works out of the box
+workers_dev = true
