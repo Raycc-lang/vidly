@@ -67,6 +67,7 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import android.text.style.URLSpan
+import android.util.Log
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.OkHttpClient
@@ -112,6 +113,8 @@ class NativeCallActivity : Activity(),
     private lateinit var headerStatusLabel: TextView
     private lateinit var participantsScroll: HorizontalScrollView
     private lateinit var participantsRow: LinearLayout
+    private var debugLogText: TextView? = null
+    private var debugOverlayVisible = false
 
     // Bottom container (controls + chat)
     private lateinit var bottomContainer: LinearLayout
@@ -164,7 +167,22 @@ class NativeCallActivity : Activity(),
     private var fullscreen = false
 
     // State
-    private val signaling = NativeSignalingClient(this, this)
+    private val signaling by lazy {
+        NativeSignalingClient(this, this, onDebugLog = { msg ->
+            runOnUiThread {
+                val tv = debugLogText ?: return@runOnUiThread
+                // Skip high-frequency poll logs to avoid flooding
+                if (msg.startsWith("poll ") && !msg.contains("failure") && !msg.contains("error")) return@runOnUiThread
+                if (msg.startsWith("poll response") && msg.contains("messages=0,")) return@runOnUiThread
+                val text = tv.text.toString()
+                val lines = text.split("\n")
+                val keep = lines.takeLast(40).toMutableList()
+                keep.add(msg)
+                tv.text = keep.joinToString("\n")
+                tv.scrollTo(0, tv.height)
+            }
+        })
+    }
     private val http = OkHttpClient()
     private var rtc: NativeWebRtcClient? = null
     private var micEnabled = false
@@ -522,6 +540,23 @@ class NativeCallActivity : Activity(),
         }
         root.addView(callStack, FrameLayout.LayoutParams(-1, -1))
 
+        // Debug log overlay (hidden by default, toggle with long-press on status)
+        debugLogText = TextView(this).apply {
+            visibility = View.GONE
+            setBackgroundColor(Color.argb(200, 11, 17, 32))
+            setTextColor(Color.rgb(180, 200, 220))
+            textSize = 9f
+            typeface = android.graphics.Typeface.MONOSPACE
+            isClickable = false
+            isFocusable = false
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setOnClickListener { visibility = View.GONE; debugOverlayVisible = false }
+        }
+        root.addView(debugLogText, FrameLayout.LayoutParams(-1, -1).apply {
+            gravity = Gravity.BOTTOM
+            bottomMargin = dp(48)  // above bottom controls
+        })
+
         buildHeaderBar()
 
         normalVideoHeight = resources.displayMetrics.widthPixels * 9 / 16
@@ -685,6 +720,11 @@ class NativeCallActivity : Activity(),
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             text = headerStatus
+            setOnLongClickListener {
+                debugOverlayVisible = !debugOverlayVisible
+                debugLogText?.visibility = if (debugOverlayVisible) View.VISIBLE else View.GONE
+                true
+            }
         }
         row.addView(headerStatusLabel, LinearLayout.LayoutParams(0, -2, 1f))
 
@@ -2876,20 +2916,20 @@ class NativeCallActivity : Activity(),
             val resp = http.newCall(req).execute()
             resp.use {
                 if (!it.isSuccessful) return emptyList()
-                val json = JSONObject(it.body?.string().orEmpty())
-                val rawUrls = json.opt("urls")
-                val urls = when (rawUrls) {
-                    is JSONArray -> rawUrls
-                    is String -> JSONArray().put(rawUrls)  // 兼容旧 string 格式
-                    else -> return emptyList()
-                }
-                val username = json.optString("username")
-                val credential = json.optString("credential")
-                if (username.isBlank() || credential.isBlank()) return emptyList()
+                val body = JSONObject(it.body?.string().orEmpty())
+                val iceServers = body.optJSONArray("iceServers") ?: return emptyList()
                 val result = mutableListOf<TurnServerInfo>()
-                for (i in 0 until urls.length()) {
-                    val url = urls.optString(i, "").trim()
-                    if (url.isNotBlank()) result.add(TurnServerInfo(url, username, credential))
+                for (i in 0 until iceServers.length()) {
+                    val entry = iceServers.optJSONObject(i) ?: continue
+                    val urls = entry.optJSONArray("urls") ?: continue
+                    val username = entry.optString("username", "")
+                    val credential = entry.optString("credential", "")
+                    for (j in 0 until urls.length()) {
+                        val url = urls.optString(j, "").trim()
+                        if (url.isNotBlank()) {
+                            result.add(TurnServerInfo(url, username, credential))
+                        }
+                    }
                 }
                 result
             }
