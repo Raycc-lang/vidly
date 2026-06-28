@@ -1,13 +1,18 @@
 package org.raycc.vidly.native
 
 import android.content.Context
+import android.content.Intent
+import android.graphics.Point
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioDeviceInfo
+import android.media.projection.MediaProjection
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.WindowManager
 import org.json.JSONObject
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
@@ -26,6 +31,7 @@ import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
 import org.webrtc.RtpSender
+import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
@@ -50,7 +56,11 @@ class NativeWebRtcClient(
     // (setCommunicationDevice / preferredDevice) — replaces the fixed-delay
     // retries that raced with AudioTrack creation. Fires on the WebRTC
     // AudioTrack thread; callers must marshal to the main thread.
-    private val onAudioOutputStarted: () -> Unit = {}
+    private val onAudioOutputStarted: () -> Unit = {},
+    // Fired when screen sharing is stopped externally (system "Stop sharing"
+    // button or MediaProjection revocation). Always dispatched on the main
+    // thread so the Activity can reset UI + demote the FGS safely.
+    private val onScreenShareStopped: () -> Unit = {}
 ) {
     interface DataListener {
         fun onChatMessage(fromPeerId: String, fromUsername: String?, msg: JSONObject)
@@ -63,9 +73,7 @@ class NativeWebRtcClient(
     private val eglBase = EglBase.create()
     private val beautyProcessor = BeautyVideoProcessor()
     private val peers = LinkedHashMap<String, Peer>()
-    private val iceServers = mutableListOf(
-        PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-    )
+    private val iceServers = mutableListOf<PeerConnection.IceServer>()
 
     private lateinit var factory: PeerConnectionFactory
     private var surfaceHelper: SurfaceTextureHelper? = null
@@ -86,6 +94,14 @@ class NativeWebRtcClient(
     // pc.onTrack does NOT refire; we must re-attach the existing track ourselves.
     private var remoteCameraPaused = false
     private var remoteScreenPaused = false
+    // The remote video track that most recently produced a frame
+    // (RtpReceiver.Observer.onFirstPacketReceived). Used by
+    // reclassifyRemoteVideoTracks to tell an actively-producing track (e.g. a
+    // screen track) apart from a muted/stale camera receiver — both are LIVE
+    // (the sender keeps its RtpSender through a camera off), but only a
+    // producing track fires onFirstPacketReceived. Android WebRTC exposes no
+    // track-muted event, so this is the one reliable "alive" signal.
+    private var activeVideoTrack: VideoTrack? = null
     @Volatile private var remoteVideoFrameTimestampMs: Long = 0L
     private val remoteVideoFrameSink = VideoSink {
         remoteVideoFrameTimestampMs = SystemClock.elapsedRealtime()
@@ -96,6 +112,14 @@ class NativeWebRtcClient(
     // Logical state — does the local user want camera/mic to be sending?
     private var cameraLive = false
     private var micLive = false
+    // Logical state — is the local user sharing their screen? Mirrors the
+    // cameraLive/micLive pattern: plain var touched from the main thread
+    // (setScreenEnabled) plus the capture callback thread via stopScreen().
+    private var screenLive = false
+    private var screenCapturer: ScreenCapturerAndroid? = null
+    private var screenSurfaceHelper: SurfaceTextureHelper? = null
+    private var screenSource: VideoSource? = null
+    private var localScreenTrack: VideoTrack? = null
     // Which physical camera is active. The initial capturer prefers the
     // front-facing camera (see createCameraCapturer), so we default to true.
     // Drives beautyProcessor.flipHorizontally — front sensor mirrors, so the
@@ -326,6 +350,140 @@ class NativeWebRtcClient(
         beautyProcessor.intensity = value
     }
 
+    // ─── Screen share ─────────────────────────────────────────
+
+    /**
+     * Start or stop sharing the local screen. Mirrors [setCameraEnabled]
+     * but the capture pipeline is fully torn down on disable because the
+     * MediaProjection token is single-use — a paused screen sender would hold
+     * a dead projection, so we use [PeerConnection.removeTrack] (which
+     * renegotiates) instead of pausing the track.
+     *
+     * @param resultData the Intent returned by MediaProjectionManager consent
+     *                  dialog; required and only read when [enabled] is true.
+     */
+    fun setScreenEnabled(enabled: Boolean, resultData: Intent? = null) {
+        if (enabled) {
+            ensureScreenTrack(resultData ?: return)
+            val track = localScreenTrack ?: run {
+                Log.e("VidlyScreen", "setScreenEnabled: localScreenTrack is null after ensureScreenTrack")
+                return
+            }
+            Log.i("VidlyScreen", "setScreenEnabled(true): adding screen track to ${peers.size} peers")
+            peers.values.forEach { peer ->
+                if (peer.screenSender == null) {
+                    peer.screenSender = peer.pc.addTrack(track, listOf(LOCAL_STREAM_ID))
+                    Log.i("VidlyScreen", "  added screenSender to peer ${peer.id}, renegotiation should fire")
+                }
+            }
+            screenLive = true
+            status("Screen share on")
+        } else {
+            Log.i("VidlyScreen", "setScreenEnabled(false): stopping screen")
+            stopScreen()
+            screenLive = false
+            peers.values.forEach { peer ->
+                peer.screenSender?.let { runCatching { peer.pc.removeTrack(it) } }
+                peer.screenSender = null
+            }
+            status("Screen share off")
+        }
+        broadcastMediaState()
+    }
+
+    fun isScreenLive() = screenLive
+
+    /**
+     * Build the screen capture pipeline: ScreenCapturerAndroid →
+     * createVideoSource(isScreencast=true) → VideoTrack "vidly-screen".
+     * Captures at the display's real resolution scaled to long-edge ≤ 1280,
+     * rounded to even dimensions (encoder-friendly). No beauty filter and no
+     * local renderer sink — the screen is the remote's to view.
+     */
+    private fun ensureScreenTrack(resultData: Intent) {
+        if (localScreenTrack != null) return
+        val (width, height) = computeScreenCaptureSize()
+        Log.i("VidlyScreen", "ensureScreenTrack: capture size ${width}x${height}")
+        screenSurfaceHelper = SurfaceTextureHelper.create("VidlyScreenThread", eglBase.eglBaseContext)
+        // MediaProjection.Callback.onStop fires on the capture/SurfaceTexture
+        // helper thread, so marshal to main before touching UI / calling
+        // stopScreen — matches how the camera path mutates capture objects.
+        screenCapturer = ScreenCapturerAndroid(resultData, object : MediaProjection.Callback() {
+            override fun onStop() {
+                Log.w("VidlyScreen", "MediaProjection.Callback.onStop — projection revoked/stopped")
+                Handler(Looper.getMainLooper()).post {
+                    stopScreen()
+                    screenLive = false
+                    peers.values.forEach { peer ->
+                        peer.screenSender?.let { runCatching { peer.pc.removeTrack(it) } }
+                        peer.screenSender = null
+                    }
+                    broadcastMediaState()
+                    onScreenShareStopped()
+                }
+            }
+        })
+        screenSource = factory.createVideoSource(true)
+        screenCapturer?.initialize(screenSurfaceHelper, context, screenSource!!.capturerObserver)
+        runCatching { screenCapturer?.startCapture(width, height, 15) }
+            .onFailure {
+                Log.e("VidlyScreen", "startCapture FAILED", it)
+                status("Screen capture failed: ${it.localizedMessage ?: "unknown error"}")
+            }
+            .onSuccess { Log.i("VidlyScreen", "startCapture OK") }
+        localScreenTrack = factory.createVideoTrack(LOCAL_SCREEN_TRACK_ID, screenSource).apply {
+            setEnabled(true)
+        }
+        Log.i("VidlyScreen", "ensureScreenTrack: track created, capturer started=${screenCapturer != null}")
+    }
+
+    /**
+     * Read the physical display size and scale to long-edge ≤ 1280 preserving
+     * aspect ratio, rounding both dimensions to even numbers.
+     */
+    private fun computeScreenCaptureSize(): Pair<Int, Int> {
+        val point = Point()
+        val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        if (wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            point.set(wm.currentWindowMetrics.bounds.width(), wm.currentWindowMetrics.bounds.height())
+        } else {
+            @Suppress("DEPRECATION")
+            wm?.defaultDisplay?.getRealSize(point)
+        }
+        var w = point.x.coerceAtLeast(1)
+        var h = point.y.coerceAtLeast(1)
+        val longEdge = maxOf(w, h)
+        val cap = 1280
+        if (longEdge > cap) {
+            val scale = cap.toFloat() / longEdge
+            w = (w * scale).toInt()
+            h = (h * scale).toInt()
+        }
+        // Even dimensions (encoder-friendly).
+        w -= w % 2
+        h -= h % 2
+        if (w < 2) w = 2
+        if (h < 2) h = 2
+        return w to h
+    }
+
+    /**
+     * Tear down the screen capture pipeline. Safe to call when not set up.
+     * [ScreenCapturerAndroid.stopCapture] releases the VirtualDisplay and the
+     * MediaProjection token internally.
+     */
+    private fun stopScreen() {
+        runCatching { screenCapturer?.stopCapture() }
+        screenCapturer?.dispose()
+        screenCapturer = null
+        localScreenTrack?.dispose()
+        localScreenTrack = null
+        screenSource?.dispose()
+        screenSource = null
+        screenSurfaceHelper?.dispose()
+        screenSurfaceHelper = null
+    }
+
     fun switchCamera() {
         val activeCapturer = capturer
         if (activeCapturer == null || localVideoTrack == null) {
@@ -361,14 +519,17 @@ class NativeWebRtcClient(
         peers.clear()
         stopVideo()
         stopAudio()
+        stopScreen()
         cameraLive = false
         micLive = false
+        screenLive = false
         clearRemoteVideo()
     }
 
     fun dispose() {
         close()
         surfaceHelper?.dispose()
+        screenSurfaceHelper?.dispose()
         localRenderer.release()
         remoteRenderer.release()
         cameraRenderer?.release()
@@ -418,13 +579,14 @@ class NativeWebRtcClient(
         }.getOrDefault(false)
     }
 
-    /** Broadcast our current mic/camera live state so peers can show status indicators. */
+    /** Broadcast our current mic/camera/screen live state so peers can show status indicators. */
     fun broadcastMediaState() {
         val payload = JSONObject()
             .put("type", "media-state")
             .put("mic", micLive)
             .put("cam", cameraLive)
             .put("video", cameraLive)
+            .put("screen", screenLive)
         sendChatJson(payload)
     }
 
@@ -588,6 +750,7 @@ class NativeWebRtcClient(
         remoteScreenTrack = null
         remoteCameraPaused = false
         remoteScreenPaused = false
+        activeVideoTrack = null
         remoteVideoPeerId = null
         remoteVideoFrameTimestampMs = 0L
         remoteRenderer.clearImage()
@@ -654,6 +817,7 @@ class NativeWebRtcClient(
             remoteScreenPaused = false
             screenChanged = true
         }
+        if (activeVideoTrack === track) activeVideoTrack = null
         if (screenChanged) updateRenderedRemoteVideo()
         if (cameraChanged) updateRenderedRemoteCamera()
     }
@@ -671,6 +835,71 @@ class NativeWebRtcClient(
         updateRenderedRemoteCamera()
     }
 
+    //
+    // Re-bind remote video tracks to the correct role when media-state arrives
+    // after onTrack. In Unified Plan the remote track id() is regenerated by
+    // the receiver and CANNOT be used to classify (W3C PSA, w3c/webrtc-pc#1718),
+    // so we mirror the web client (index.html ~L2344-2364): use the media-state
+    // booleans as the authoritative signal and reassign the live video
+    // receiver tracks accordingly.
+    //
+    // Critical for the case where screen is shared with the camera OFF: the
+    // single screen track arrives before media-state, assignRemoteVideoTrack
+    // defaults it to remoteCameraTrack (arrival-order), and it would render in
+    // the tiny PiP tile forever. This re-binds it to remoteScreenTrack once the
+    // screen=true media-state arrives. Symmetric for the camera role.
+    private fun reclassifyRemoteVideoTracks(peer: Peer) {
+        if (remoteVideoPeerId != peer.id) return
+        val wantCamera = peer.remoteCameraLive
+        val wantScreen = peer.remoteScreenLive
+
+        // Only MOVE a track that is already bound to the wrong role — never grab
+        // an arbitrary live receiver. A muted/stale camera receiver is still
+        // LIVE (the sender keeps its RtpSender through a camera off→on), so
+        // "first live receiver" could mis-bind that stale camera to the screen
+        // role in a camera-on→off→screen-share flow. The move is therefore
+        // gated by [activeVideoTrack]: the real screen track reliably fires
+        // onFirstPacketReceived (which sets activeVideoTrack), so the move only
+        // fires once frames actually flow — a muted stale camera never does.
+        //
+        // The §3g case (single screen track, camera off, onTrack before
+        // media-state mis-binds it to remoteCameraTrack) is fixed here once the
+        // screen's first packet sets activeVideoTrack === remoteCameraTrack.
+        if (wantScreen && !wantCamera && remoteScreenTrack == null && remoteCameraTrack != null
+            && activeVideoTrack === remoteCameraTrack) {
+            moveTrackToScreenRole(remoteCameraTrack!!)
+        } else if (wantCamera && !wantScreen && remoteCameraTrack == null && remoteScreenTrack != null
+            && activeVideoTrack === remoteScreenTrack) {
+            moveTrackToCameraRole(remoteScreenTrack!!)
+        }
+        // When both roles are wanted but tracks are swapped we cannot
+        // disambiguate without track ids (regenerated in Unified Plan), so we
+        // leave the arrival-order binding — matching the web client.
+    }
+
+    private fun moveTrackToScreenRole(track: VideoTrack) {
+        if (renderedRemoteCameraTrack === track) detachRenderedRemoteCamera()
+        detachTrackFully(track)
+        remoteCameraTrack = null
+        remoteScreenTrack = track
+    }
+
+    private fun moveTrackToCameraRole(track: VideoTrack) {
+        if (renderedRemoteVideoTrack === track) detachRenderedRemoteVideo()
+        detachTrackFully(track)
+        remoteScreenTrack = null
+        remoteCameraTrack = track
+    }
+
+    // Remove every sink this client attaches to a remote video track (frame
+    // watchdog, main renderer, PiP camera renderer). Used when a track moves
+    // between roles so the next updateRendered* starts from a clean slate.
+    private fun detachTrackFully(track: VideoTrack?) {
+        track?.removeSink(remoteVideoFrameSink)
+        track?.removeSink(remoteRenderer)
+        cameraRenderer?.let { track?.removeSink(it) }
+    }
+
     // Re-attach the renderer for a remote video track when the remote resumes
     // sending. Called from RtpReceiver.Observer.onFirstPacketReceived — the
     // Android equivalent of the browser's track.onunmute (which the web client
@@ -679,20 +908,16 @@ class NativeWebRtcClient(
     // no pc.onTrack refire); onFirstPacketReceived is the reliable "frames are
     // flowing again" signal that lets us recover the display.
     //
-    // Idempotent: if the track is already being rendered (the media-state
-    // cam:true handler already re-attached), this is a no-op. It only matters
-    // when the media-state message is lost (DataChannel is reliable but this is
-    // a cheap safety net).
-    private fun onRemoteVideoFirstPacket(track: VideoTrack) {
-        if (remoteCameraTrack === track) {
-            if (remoteCameraPaused) return
-            if (renderedRemoteCameraTrack === track) return
-            updateRenderedRemoteCamera()
-        } else if (remoteScreenTrack === track) {
-            if (remoteScreenPaused) return
-            if (renderedRemoteVideoTrack === track) return
-            updateRenderedRemoteVideo()
-        }
+    // It ALSO drives role reclassification: a track producing frames is the
+    // authoritative "alive" signal, so we record it as [activeVideoTrack] and
+    // let reclassifyRemoteVideoTracks move it to the correct role if media-state
+    // says it was mis-bound (the §3g screen-share-with-camera-off case).
+    private fun onRemoteVideoFirstPacket(track: VideoTrack, peer: Peer) {
+        if (remoteVideoPeerId != peer.id) return
+        activeVideoTrack = track
+        reclassifyRemoteVideoTracks(peer)
+        updateRenderedRemoteCamera()
+        updateRenderedRemoteVideo()
     }
 
     private fun stopAudio() {
@@ -783,6 +1008,9 @@ class NativeWebRtcClient(
         }
         if (localVideoTrack != null && cameraLive) {
             peer.videoSender = pc.addTrack(localVideoTrack, listOf(LOCAL_STREAM_ID))
+        }
+        if (localScreenTrack != null && screenLive) {
+            peer.screenSender = pc.addTrack(localScreenTrack, listOf(LOCAL_STREAM_ID))
         }
         peers[peerId] = peer
         return peer
@@ -917,6 +1145,7 @@ class NativeWebRtcClient(
                         .put("mic", micLive)
                         .put("cam", cameraLive)
                         .put("video", cameraLive)
+                        .put("screen", screenLive)
                     runCatching {
                         val data = payload.toString().toByteArray(Charsets.UTF_8)
                         dc.send(DataChannel.Buffer(ByteBuffer.wrap(data), false))
@@ -939,7 +1168,14 @@ class NativeWebRtcClient(
                     // pause state. Rendering ops still need the peer-id guard.
                     remoteCameraPaused = !peer.remoteCameraLive
                     remoteScreenPaused = !peer.remoteScreenLive
+                    // A role going false mutes its receiver (kept cached, no
+                    // frames). Drop it from the active-track cache so a later
+                    // reclassify never treats the muted (but still LIVE)
+                    // receiver as the screen candidate.
+                    if (!peer.remoteCameraLive && activeVideoTrack === remoteCameraTrack) activeVideoTrack = null
+                    if (!peer.remoteScreenLive && activeVideoTrack === remoteScreenTrack) activeVideoTrack = null
                     if (remoteVideoPeerId == peer.id) {
+                        reclassifyRemoteVideoTracks(peer)
                         // Force re-attach on resume: updateRendered* short-circuits
                         // when renderedTrack === track (same LIVE object reused
                         // through a pause), so detach first to ensure a fresh
@@ -997,6 +1233,7 @@ class NativeWebRtcClient(
 
         override fun onTrack(transceiver: org.webrtc.RtpTransceiver?) {
             val track = transceiver?.receiver?.track()
+            Log.i("VidlyScreen", "onTrack: peer=${peer.id} trackKind=${track?.kind()} trackId=${track?.id()} trackState=${(track as? VideoTrack)?.state()}")
             if (track is VideoTrack) {
                 val activePeerId = remoteVideoPeerId
                 if (activePeerId != null && activePeerId != peer.id) return
@@ -1011,7 +1248,7 @@ class NativeWebRtcClient(
                 transceiver.receiver?.SetObserver(object : RtpReceiver.Observer {
                     override fun onFirstPacketReceived(mediaType: MediaStreamTrack.MediaType) {
                         if (mediaType != MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) return
-                        onRemoteVideoFirstPacket(track)
+                        onRemoteVideoFirstPacket(track, peer)
                     }
                 })
             }
@@ -1025,6 +1262,7 @@ class NativeWebRtcClient(
         }
 
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+            Log.i("VidlyScreen", "onIceConnectionChange: peer=${peer.id} state=$state")
             when (state) {
                 PeerConnection.IceConnectionState.CONNECTED,
                 PeerConnection.IceConnectionState.COMPLETED -> {
@@ -1063,6 +1301,7 @@ class NativeWebRtcClient(
         }
 
         override fun onRenegotiationNeeded() {
+            Log.i("VidlyScreen", "onRenegotiationNeeded: peer=${peer.id} sigState=${peer.pc.signalingState()}")
             // Perfect-negotiation pattern: any side may need to renegotiate when
             // tracks are added/removed. Glare is handled in handleDescription.
             makeOffer(peer)
@@ -1086,6 +1325,7 @@ class NativeWebRtcClient(
         var ignoreOffer = false
         var audioSender: RtpSender? = null
         var videoSender: RtpSender? = null
+        var screenSender: RtpSender? = null
         var remoteCameraLive = false
         var remoteScreenLive = false
         var chatChannel: DataChannel? = null
@@ -1105,6 +1345,7 @@ class NativeWebRtcClient(
 
     private companion object {
         const val LOCAL_STREAM_ID = "vidly-native"
+        const val LOCAL_SCREEN_TRACK_ID = "vidly-screen"
         const val ICE_RESTART_DELAY_MS = 8_000L
     }
 }

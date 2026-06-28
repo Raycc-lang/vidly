@@ -1259,7 +1259,11 @@ function hideStallOverlay(tileEl) {
 }
 
 function isPeerMediaVideoOn(peer) {
-    return !peer.mediaState || peer.mediaState.video !== false;
+    // A peer is "sending video" if its camera OR screen is live. The screen
+    // track is sent with cam=false / video=false, so checking only `video`
+    // would clear the screen track whenever a screen-share starts with the
+    // camera off.
+    return !peer.mediaState || peer.mediaState.video !== false || peer.mediaState.screen;
 }
 
 function isPeerConnectionAlive(peer) {
@@ -2344,7 +2348,10 @@ function attachDataChannel(peer, dc) {
                 screen: !!msg.screen
             };
             updatePeerStatusIndicator(peer.id, peer.mediaState.mic, peer.mediaState.cam, peer.mediaState.screen);
-            if (!peer.mediaState.video) {
+            // Clear all remote video only when NEITHER camera nor screen is
+            // live. Screen-share runs with cam=false / video=false, so the old
+            // `!video` check alone would wipe the screen track on every share.
+            if (!peer.mediaState.video && !peer.mediaState.screen) {
                 clearAllRemoteVideo(peer);
             } else {
                 if (!peer.mediaState.cam && peer.remoteCameraTrack) {

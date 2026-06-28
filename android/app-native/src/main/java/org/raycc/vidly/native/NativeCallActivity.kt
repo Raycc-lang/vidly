@@ -8,7 +8,10 @@ import android.app.PictureInPictureParams
 import android.content.ContentProvider
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.ContentValues
+import android.content.Context
+import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -24,6 +27,7 @@ import android.graphics.drawable.GradientDrawable
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -132,7 +136,27 @@ class NativeCallActivity : Activity(),
     private var micButton: Button? = null
     private var cameraButton: Button? = null
     private var speakerButton: Button? = null
+    private var screenButton: Button? = null
     private var hangupButton: Button? = null
+
+    // Screen share
+    private var screenSharing = false
+    // Bound connection to NativeCallService so the Activity can synchronously
+    // promote the FGS to mediaProjection type BEFORE obtaining the projection
+    // token (Android 14 enforces this ordering, else SecurityException).
+    private var boundService: NativeCallService? = null
+    private var serviceBound = false
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: android.os.IBinder?) {
+            boundService = (service as? NativeCallService.LocalBinder)?.getService()
+        }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            boundService = null
+        }
+    }
+    private val mediaProjectionManager: MediaProjectionManager? by lazy {
+        getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
+    }
 
     // PiP / proximity
     private var proximityWakeLock: PowerManager.WakeLock? = null
@@ -290,6 +314,14 @@ class NativeCallActivity : Activity(),
         rtc?.dispose()
         rtc = null
         resetCallAudioRouting()
+        if (screenSharing) {
+            screenSharing = false
+        }
+        if (serviceBound) {
+            unbindService(serviceConnection)
+            serviceBound = false
+            boundService = null
+        }
         if (callActive) {
             NativeCallService.stop(this)
             callActive = false
@@ -815,6 +847,18 @@ class NativeCallActivity : Activity(),
         cameraButton = cam
         controlsRow.addView(cam, LinearLayout.LayoutParams(ctrlW, ctrlH).apply { marginStart = ctrlGap })
 
+        val screen = compactIconButton("🖥️", Color.WHITE, Color.rgb(42, 45, 53)).apply {
+            setOnClickListener {
+                if (screenSharing) {
+                    stopScreenShare()
+                } else {
+                    startScreenShareConsent()
+                }
+            }
+        }
+        screenButton = screen
+        controlsRow.addView(screen, LinearLayout.LayoutParams(ctrlW, ctrlH).apply { marginStart = ctrlGap })
+
         val speaker = compactIconButton("🔈", Color.WHITE, Color.rgb(42, 45, 53)).apply {
             setOnClickListener {
                 if (!canToggleAudioRoute()) {
@@ -1020,6 +1064,7 @@ class NativeCallActivity : Activity(),
         cameraEnabled = false
         inPreview = false
         fullscreen = false
+        screenSharing = false
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         updateVideoContainerLayout()
         remoteRenderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
@@ -1062,7 +1107,16 @@ class NativeCallActivity : Activity(),
                     // Fires once WebRTC's AudioTrack actually starts playing — the
                     // deterministic moment to pin the output device. Replaces the
                     // old 300/800/1500ms fixed-delay retries that raced with it.
-                    { runOnUiThread { applyAudioRoute() } }
+                    { runOnUiThread { applyAudioRoute() } },
+                    // Fired when screen sharing is stopped externally (system
+                    // "Stop sharing" notification or MediaProjection revocation).
+                    // Already on the main thread; reset UI + demote the FGS.
+                    {
+                        screenSharing = false
+                        boundService?.demoteToDataSync()
+                        updateMediaButtons()
+                        updateProximitySensorState()
+                    }
                 ).also {
                     it.dataListener = this
                     for (ts in turnServers) it.addTurnServer(ts.urls, ts.username, ts.credential)
@@ -1078,6 +1132,7 @@ class NativeCallActivity : Activity(),
         userRequestedLeave = true
         signaling.leave()
         rtc?.close()
+        screenSharing = false
         resetCallAudioRouting()
         hasRemoteVideo = false
         hasRemoteCamera = false
@@ -1119,6 +1174,35 @@ class NativeCallActivity : Activity(),
         previewControls.visibility = View.GONE
         updateMediaButtons()
         refreshParticipants()
+    }
+
+    // ─── Screen share ─────────────────────────────────────────
+
+    /** Kick off the system MediaProjection consent dialog. */
+    private fun startScreenShareConsent() {
+        if (!callActive) {
+            Toast.makeText(this, "Join a call first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val mpm = mediaProjectionManager
+        if (mpm == null) {
+            Toast.makeText(this, "Screen capture not available", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            startActivityForResult(mpm.createScreenCaptureIntent(), SCREEN_CAPTURE_REQUEST)
+        } catch (_: Throwable) {
+            Toast.makeText(this, "Screen capture not available", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** Stop sharing: tears down capture + senders, demotes the FGS. */
+    private fun stopScreenShare() {
+        rtc?.setScreenEnabled(false)
+        screenSharing = false
+        boundService?.demoteToDataSync()
+        updateMediaButtons()
+        updateProximitySensorState()
     }
 
     private fun toggleChatExpanded() {
@@ -1276,6 +1360,15 @@ class NativeCallActivity : Activity(),
 
     private fun checkFrameHealth() {
         if (!callActive) {
+            setVideoStalled(false)
+            return
+        }
+        // A static screencast legitimately produces no new frames, which would
+        // trip the frame-age watchdog and cause a false ICE-restart loop. While
+        // the remote is sharing screen, skip both the stall action and the
+        // "stalled" overlay — the ICE observer (DISCONNECTED/FAILED) remains
+        // the primary recovery path (see AGENTS.md).
+        if (peerMediaStates.values.any { it.screen }) {
             setVideoStalled(false)
             return
         }
@@ -2117,6 +2210,29 @@ class NativeCallActivity : Activity(),
         if (requestCode == FILE_PICK_REQUEST && resultCode == RESULT_OK) {
             val uri = data?.data ?: return
             sendFile(uri)
+            return
+        }
+        if (requestCode == SCREEN_CAPTURE_REQUEST) {
+            if (resultCode != RESULT_OK || data == null) {
+                Toast.makeText(this, "Screen share permission denied", Toast.LENGTH_SHORT).show()
+                return
+            }
+            // Android 14 ordering: the FGS must already be in the foreground with
+            // the mediaProjection type BEFORE the projection token is obtained.
+            // The bound service lets us do this synchronously.
+            val service = boundService
+            if (service == null) {
+                Log.e("VidlyScreen", "onActivityResult: boundService is null!")
+                Toast.makeText(this, "Call service not ready", Toast.LENGTH_SHORT).show()
+                return
+            }
+            Log.i("VidlyScreen", "onActivityResult: promoting FGS to mediaProjection")
+            service.promoteToMediaProjection()
+            Log.i("VidlyScreen", "onActivityResult: calling setScreenEnabled(true)")
+            rtc?.setScreenEnabled(true, data)
+            screenSharing = true
+            updateMediaButtons()
+            updateProximitySensorState()
         }
     }
 
@@ -2498,11 +2614,31 @@ class NativeCallActivity : Activity(),
         if (active) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             NativeCallService.start(this)
+            // Bind so the Activity can synchronously promote the FGS to
+            // mediaProjection before starting screen capture (Android 14).
+            if (!serviceBound) {
+                bindService(
+                    Intent(this, NativeCallService::class.java),
+                    serviceConnection,
+                    Context.BIND_AUTO_CREATE
+                )
+                serviceBound = true
+            }
             NativeIncomingCallListener.configure(this, currentRoom, currentUsername)
             updateProximitySensorState()
             startFrameHealthMonitor()
         } else {
             stopFrameHealthMonitor()
+            // Stop any in-progress screen share before tearing down the FGS.
+            if (screenSharing) {
+                rtc?.setScreenEnabled(false)
+                screenSharing = false
+            }
+            if (serviceBound) {
+                unbindService(serviceConnection)
+                serviceBound = false
+                boundService = null
+            }
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             NativeCallService.stop(this)
             updateProximitySensorState()
@@ -2560,6 +2696,10 @@ class NativeCallActivity : Activity(),
         cameraButton?.apply {
             text = "📷"
             applyToggleState(this, cameraEnabled || inPreview)
+        }
+        screenButton?.apply {
+            text = "🖥️"
+            applyToggleState(this, screenSharing)
         }
         updateAudioRouteButton()
     }
@@ -2787,7 +2927,9 @@ class NativeCallActivity : Activity(),
     private fun updateProximitySensorState() {
         val lock = proximityWakeLock ?: return
         val isAnyRemoteSharingScreen = peerMediaStates.values.any { it.screen }
-        val shouldHold = callActive && !isAnyRemoteSharingScreen
+        // Release the proximity lock while the LOCAL user is sharing screen so
+        // their face doesn't black out the display mid-interaction.
+        val shouldHold = callActive && !isAnyRemoteSharingScreen && !screenSharing
         if (shouldHold && !lock.isHeld) lock.acquire()
         else if (!shouldHold && lock.isHeld) lock.release()
     }
@@ -2800,6 +2942,7 @@ class NativeCallActivity : Activity(),
         const val EXTRA_AUTO_JOIN = "autoJoin"
         private const val PERMISSIONS_REQUEST = 5101
         private const val FILE_PICK_REQUEST = 5102
+        private const val SCREEN_CAPTURE_REQUEST = 5103
         private const val STATE_ROOM = "stateRoom"
         private const val STATE_USERNAME = "stateUsername"
         // File transfer tuning. CHUNK_SIZE and BUFFER_HIGH are coupled: effective
