@@ -12,3 +12,8 @@ crash-logs/
 spikes/
 android-shell-prompt.md
 .qoder/
+.evolver/
+vidly-game-docs/
+vidly-logs/
+implementation_plan.md
+*.rej
