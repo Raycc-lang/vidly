@@ -107,7 +107,13 @@ class NativeWebRtcClient(
         remoteVideoFrameTimestampMs = SystemClock.elapsedRealtime()
     }
     private var started = false
-    private val iceRestartHandler = Handler(Looper.getMainLooper())
+    // Single handler that owns ALL negotiation state (makingOffer/ignoreOffer,
+    // senders, the peers map, remote track roles). WebRTC fires its observer
+    // and SDP callbacks on internal threads; every callback that touches this
+    // state is marshalled here so the perfect-negotiation flags are never read
+    // and written from two threads at once. Peer-scoped delayed work (ICE
+    // restarts) is posted with the Peer as token so close() cancels it all.
+    private val main = Handler(Looper.getMainLooper())
 
     // Logical state — does the local user want camera/mic to be sending?
     private var cameraLive = false
@@ -187,6 +193,21 @@ class NativeWebRtcClient(
 
     fun onJoined(existingPeers: List<NativeSignalingClient.PeerInfo>) {
         status("Joined. Peers: ${existingPeers.size}")
+        // A (re)join starts a fresh signaling session. The server announced us
+        // as left the moment our old socket dropped, so remote sides already
+        // tore their PC down (and rebuild on peer-resumed). Reusing a PC from
+        // the previous session while the remote starts fresh desyncs DTLS/ICE
+        // — their new answer never matches our old session and SRD fails.
+        // Tear everything down and renegotiate from scratch. This also reaps
+        // zombie peers left over after a signaling-server restart.
+        if (peers.isNotEmpty()) {
+            peers.values.forEach { peer ->
+                peer.close(main)
+                dataListener?.onPeerConnectionStateChanged(peer.id, false)
+            }
+            peers.clear()
+            clearRemoteVideo()
+        }
         existingPeers.forEach { peerInfo ->
             val peer = ensurePeer(peerInfo.peerId, polite = false)
             if (peerInfo.username != null) peer.username = peerInfo.username
@@ -205,12 +226,21 @@ class NativeWebRtcClient(
 
     fun onPeerJoined(peerInfo: NativeSignalingClient.PeerInfo) {
         status("${peerInfo.username ?: "Peer"} joined")
+        // peer-resumed (mapped here) and a re-announced peer-joined both mean
+        // the remote rebuilt its side after a signaling gap. If we still hold
+        // a PC for this id it belongs to the dead session — rebuild ours too
+        // so the pair negotiates a fresh session symmetrically.
+        peers.remove(peerInfo.peerId)?.let { stale ->
+            stale.close(main)
+            dataListener?.onPeerConnectionStateChanged(peerInfo.peerId, false)
+            if (remoteVideoPeerId == peerInfo.peerId) clearRemoteVideo()
+        }
         val peer = ensurePeer(peerInfo.peerId, polite = true)
         if (peerInfo.username != null) peer.username = peerInfo.username
     }
 
     fun onPeerLeft(peerId: String) {
-        peers.remove(peerId)?.close(iceRestartHandler)
+        peers.remove(peerId)?.close(main)
         if (remoteVideoPeerId == peerId) {
             clearRemoteVideo()
         } else if (peers.isEmpty()) {
@@ -224,14 +254,10 @@ class NativeWebRtcClient(
     }
 
     fun getRemoteVideoFrameAgeMs(): Long {
-        if (renderedRemoteVideoTrack == null) return Long.MAX_VALUE
+        if (renderedRemoteVideoTrack == null && renderedRemoteCameraTrack == null) return Long.MAX_VALUE
         val lastFrameAt = remoteVideoFrameTimestampMs
         if (lastFrameAt == 0L) return Long.MAX_VALUE
         return SystemClock.elapsedRealtime() - lastFrameAt
-    }
-
-    fun restartIce() {
-        peers.values.forEach { restartIce(it) }
     }
 
     fun onSignal(from: String, payload: JSONObject) {
@@ -515,7 +541,7 @@ class NativeWebRtcClient(
     }
 
     fun close() {
-        peers.values.forEach { it.close(iceRestartHandler) }
+        peers.values.forEach { it.close(main) }
         peers.clear()
         stopVideo()
         stopAudio()
@@ -766,6 +792,7 @@ class NativeWebRtcClient(
     }
 
     private fun detachRenderedRemoteCamera() {
+        renderedRemoteCameraTrack?.removeSink(remoteVideoFrameSink)
         cameraRenderer?.let { renderedRemoteCameraTrack?.removeSink(it) }
         renderedRemoteCameraTrack = null
     }
@@ -774,7 +801,6 @@ class NativeWebRtcClient(
         val track = if (remoteScreenPaused) null else remoteScreenTrack
         if (renderedRemoteVideoTrack === track) return
         detachRenderedRemoteVideo()
-        remoteVideoFrameTimestampMs = 0L
         renderedRemoteVideoTrack = track
         if (track == null) {
             remoteRenderer.clearImage()
@@ -783,6 +809,9 @@ class NativeWebRtcClient(
             return
         }
         track.addSink(remoteVideoFrameSink)
+        // Start the frame-age clock at attach time: 0 would read as "stalled
+        // forever" and flash the poor-network overlay before the first frame.
+        remoteVideoFrameTimestampMs = SystemClock.elapsedRealtime()
         track.addSink(remoteRenderer)
         onRemoteVideo(true)
         status("Remote screen connected")
@@ -799,6 +828,11 @@ class NativeWebRtcClient(
             if (remoteCameraTrack == null && remoteScreenTrack == null) remoteVideoPeerId = null
             return
         }
+        // The frame watchdog sink rides on the camera track too — this is what
+        // feeds the "Paused - poor network" overlay for ordinary camera video
+        // (the screen role is exempted from stall checks in checkFrameHealth).
+        track.addSink(remoteVideoFrameSink)
+        remoteVideoFrameTimestampMs = SystemClock.elapsedRealtime()
         cameraRenderer?.let { track.addSink(it) }
         onRemoteCamera(true)
         status("Remote camera connected")
@@ -1023,17 +1057,21 @@ class NativeWebRtcClient(
         peer.makingOffer = true
         peer.pc.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription) {
-                if (!peer.makingOffer) return
-                if (peer.pc.signalingState() != PeerConnection.SignalingState.STABLE) {
-                    peer.makingOffer = false
-                    return
+                main.post {
+                    if (!peer.makingOffer) return@post
+                    if (peer.pc.signalingState() != PeerConnection.SignalingState.STABLE) {
+                        peer.makingOffer = false
+                        return@post
+                    }
+                    setLocalAndSend(peer, desc)
                 }
-                setLocalAndSend(peer, desc)
             }
 
             override fun onCreateFailure(error: String) {
-                peer.makingOffer = false
-                status("Offer failed: $error")
+                main.post {
+                    peer.makingOffer = false
+                    status("Offer failed: $error")
+                }
             }
         }, MediaConstraints())
     }
@@ -1044,28 +1082,63 @@ class NativeWebRtcClient(
     }
 
     private fun scheduleIceRestart(peer: Peer, delayMs: Long) {
-        iceRestartHandler.removeCallbacksAndMessages(peer)
+        main.removeCallbacksAndMessages(peer)
         val runnable = Runnable {
             if (peer.pc.iceConnectionState() == PeerConnection.IceConnectionState.DISCONNECTED ||
                 peer.pc.iceConnectionState() == PeerConnection.IceConnectionState.FAILED) {
                 restartIce(peer)
             }
         }
-        iceRestartHandler.postDelayed(runnable, peer, delayMs)
+        // postAtTime: the token overload of postDelayed needs API 28, minSdk is 26.
+        main.postAtTime(runnable, peer, SystemClock.uptimeMillis() + delayMs)
     }
 
     private fun cancelPendingIceRestart(peer: Peer) {
-        iceRestartHandler.removeCallbacksAndMessages(peer)
+        main.removeCallbacksAndMessages(peer)
+    }
+
+    // ─── Stuck-offer watchdog ─────────────────────────────────
+    //
+    // Signaling messages can be lost without either side noticing: the WS may
+    // be silently dead (send() buffers into a dying TCP connection) or down
+    // entirely while WebRTC emits an offer (e.g. the ICE-restart path). A lost
+    // offer strands us in HAVE_LOCAL_OFFER — and an impolite peer in that
+    // state ignores every incoming offer, deadlocking negotiation until the
+    // call is torn down. If the state hasn't resolved in OFFER_TIMEOUT_MS,
+    // roll back to STABLE and offer again. Cancelled on any successful
+    // setRemoteDescription (answer applied / offer accepted).
+
+    private fun scheduleOfferTimeout(peer: Peer) {
+        cancelOfferTimeout(peer)
+        val runnable = Runnable {
+            peer.offerTimeout = null
+            if (peers[peer.id] !== peer) return@Runnable
+            if (peer.pc.signalingState() != PeerConnection.SignalingState.HAVE_LOCAL_OFFER) return@Runnable
+            status("Renegotiating...")
+            peer.makingOffer = false
+            peer.pc.setLocalDescription(object : SimpleSdpObserver() {
+                override fun onSetSuccess() {
+                    main.post { makeOffer(peer) }
+                }
+            }, SessionDescription(SessionDescription.Type.ROLLBACK, ""))
+        }
+        peer.offerTimeout = runnable
+        main.postDelayed(runnable, OFFER_TIMEOUT_MS)
+    }
+
+    private fun cancelOfferTimeout(peer: Peer) {
+        peer.offerTimeout?.let { main.removeCallbacks(it) }
+        peer.offerTimeout = null
     }
 
     private fun makeAnswer(peer: Peer) {
         peer.pc.createAnswer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription) {
-                setLocalAndSend(peer, desc)
+                main.post { setLocalAndSend(peer, desc) }
             }
 
             override fun onCreateFailure(error: String) {
-                status("Answer failed: $error")
+                main.post { status("Answer failed: $error") }
             }
         }, MediaConstraints())
     }
@@ -1073,13 +1146,18 @@ class NativeWebRtcClient(
     private fun setLocalAndSend(peer: Peer, desc: SessionDescription) {
         peer.pc.setLocalDescription(object : SimpleSdpObserver() {
             override fun onSetSuccess() {
-                peer.makingOffer = false
-                signaling.sendSignal(peer.id, JSONObject().put("description", desc.toJson()))
+                main.post {
+                    peer.makingOffer = false
+                    signaling.sendSignal(peer.id, JSONObject().put("description", desc.toJson()))
+                    if (desc.type == SessionDescription.Type.OFFER) scheduleOfferTimeout(peer)
+                }
             }
 
             override fun onSetFailure(error: String) {
-                peer.makingOffer = false
-                status("Local SDP failed: $error")
+                main.post {
+                    peer.makingOffer = false
+                    status("Local SDP failed: $error")
+                }
             }
         }, desc)
     }
@@ -1095,13 +1173,14 @@ class NativeWebRtcClient(
         if (type == SessionDescription.Type.OFFER && offerCollision) {
             peer.makingOffer = false
             if (peer.pc.signalingState() != PeerConnection.SignalingState.STABLE) {
+                cancelOfferTimeout(peer)
                 peer.pc.setLocalDescription(object : SimpleSdpObserver() {
                     override fun onSetSuccess() {
-                        setRemoteDescription(peer, desc, type)
+                        main.post { setRemoteDescription(peer, desc, type) }
                     }
 
                     override fun onSetFailure(error: String) {
-                        status("Rollback failed: $error")
+                        main.post { status("Rollback failed: $error") }
                     }
                 }, SessionDescription(SessionDescription.Type.ROLLBACK, ""))
                 return
@@ -1118,11 +1197,16 @@ class NativeWebRtcClient(
     ) {
         peer.pc.setRemoteDescription(object : SimpleSdpObserver() {
             override fun onSetSuccess() {
-                if (type == SessionDescription.Type.OFFER) makeAnswer(peer)
+                main.post {
+                    // The pending-offer state resolved (their answer applied,
+                    // or their offer accepted) — the watchdog can stand down.
+                    cancelOfferTimeout(peer)
+                    if (type == SessionDescription.Type.OFFER) makeAnswer(peer)
+                }
             }
 
             override fun onSetFailure(error: String) {
-                status("Remote SDP failed: $error")
+                main.post { status("Remote SDP failed: $error") }
             }
         }, desc)
     }
@@ -1139,7 +1223,9 @@ class NativeWebRtcClient(
             override fun onBufferedAmountChange(prev: Long) = Unit
             override fun onStateChange() {
                 // When the chat channel opens, push our current media state.
-                if (dc.state() == DataChannel.State.OPEN) {
+                // Marshalled to main: the live flags are main-owned state.
+                if (dc.state() != DataChannel.State.OPEN) return
+                main.post {
                     val payload = JSONObject()
                         .put("type", "media-state")
                         .put("mic", micLive)
@@ -1154,8 +1240,15 @@ class NativeWebRtcClient(
             }
             override fun onMessage(buffer: DataChannel.Buffer) {
                 if (buffer.binary) return
+                // Copy on the DataChannel thread (the buffer is only valid for
+                // the duration of the callback), then handle on main — this
+                // block mutates peer/track-role state that main owns.
                 val bytes = ByteArray(buffer.data.remaining())
                 buffer.data.get(bytes)
+                main.post { handleChatMessage(bytes) }
+            }
+
+            private fun handleChatMessage(bytes: ByteArray) {
                 val text = String(bytes, Charsets.UTF_8)
                 val json = runCatching { JSONObject(text) }.getOrNull() ?: return
                 val sender = json.optString("username").takeIf { it.isNotBlank() }
@@ -1217,71 +1310,83 @@ class NativeWebRtcClient(
 
     // ─── Peer Observer ────────────────────────────────────────
 
+    // All callbacks are marshalled onto [main] — WebRTC invokes them on its
+    // internal signaling/worker threads, and everything they touch (negotiation
+    // flags, the peers map, remote track roles, renderers) is main-owned.
     private inner class PeerObserver(private val peer: Peer) : PeerConnection.Observer {
         override fun onIceCandidate(candidate: IceCandidate) {
-            signaling.sendSignal(
-                peer.id,
-                JSONObject().put(
-                    "candidate",
-                    JSONObject()
-                        .put("candidate", candidate.sdp)
-                        .put("sdpMid", candidate.sdpMid)
-                        .put("sdpMLineIndex", candidate.sdpMLineIndex)
+            main.post {
+                signaling.sendSignal(
+                    peer.id,
+                    JSONObject().put(
+                        "candidate",
+                        JSONObject()
+                            .put("candidate", candidate.sdp)
+                            .put("sdpMid", candidate.sdpMid)
+                            .put("sdpMLineIndex", candidate.sdpMLineIndex)
+                    )
                 )
-            )
+            }
         }
 
         override fun onTrack(transceiver: org.webrtc.RtpTransceiver?) {
-            val track = transceiver?.receiver?.track()
-            Log.i("VidlyScreen", "onTrack: peer=${peer.id} trackKind=${track?.kind()} trackId=${track?.id()} trackState=${(track as? VideoTrack)?.state()}")
+            val receiver = transceiver?.receiver ?: return
+            val track = receiver.track()
             if (track is VideoTrack) {
-                val activePeerId = remoteVideoPeerId
-                if (activePeerId != null && activePeerId != peer.id) return
-                remoteVideoPeerId = peer.id
-                assignRemoteVideoTrack(peer, track)
-                // Register a receiver observer so that when the remote resumes
-                // sending after a camera off→on (track stays LIVE but goes
-                // muted — no onRemoveTrack, pc.onTrack does not refire), we get
-                // onFirstPacketReceived as the "unmute" signal and can recover
-                // the display. Web clients get this via track.onunmute; the
-                // Android WebRTC API exposes it as RtpReceiver.Observer instead.
-                transceiver.receiver?.SetObserver(object : RtpReceiver.Observer {
-                    override fun onFirstPacketReceived(mediaType: MediaStreamTrack.MediaType) {
-                        if (mediaType != MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) return
-                        onRemoteVideoFirstPacket(track, peer)
-                    }
-                })
+                main.post {
+                    if (peers[peer.id] !== peer) return@post
+                    val activePeerId = remoteVideoPeerId
+                    if (activePeerId != null && activePeerId != peer.id) return@post
+                    remoteVideoPeerId = peer.id
+                    assignRemoteVideoTrack(peer, track)
+                    // Register a receiver observer so that when the remote resumes
+                    // sending after a camera off→on (track stays LIVE but goes
+                    // muted — no onRemoveTrack, pc.onTrack does not refire), we get
+                    // onFirstPacketReceived as the "unmute" signal and can recover
+                    // the display. Web clients get this via track.onunmute; the
+                    // Android WebRTC API exposes it as RtpReceiver.Observer instead.
+                    receiver.SetObserver(object : RtpReceiver.Observer {
+                        override fun onFirstPacketReceived(mediaType: MediaStreamTrack.MediaType) {
+                            if (mediaType != MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) return
+                            main.post { onRemoteVideoFirstPacket(track, peer) }
+                        }
+                    })
+                }
             }
         }
 
         override fun onRemoveTrack(receiver: org.webrtc.RtpReceiver?) {
             val track = receiver?.track()
-            if (track is VideoTrack && remoteVideoPeerId == peer.id) {
-                removeRemoteVideoTrack(track)
+            if (track is VideoTrack) {
+                main.post {
+                    if (remoteVideoPeerId == peer.id) removeRemoteVideoTrack(track)
+                }
             }
         }
 
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
-            Log.i("VidlyScreen", "onIceConnectionChange: peer=${peer.id} state=$state")
-            when (state) {
-                PeerConnection.IceConnectionState.CONNECTED,
-                PeerConnection.IceConnectionState.COMPLETED -> {
-                    cancelPendingIceRestart(peer)
-                    status("Connected")
-                    dataListener?.onPeerConnectionStateChanged(peer.id, true)
+            main.post {
+                if (peers[peer.id] !== peer) return@post
+                when (state) {
+                    PeerConnection.IceConnectionState.CONNECTED,
+                    PeerConnection.IceConnectionState.COMPLETED -> {
+                        cancelPendingIceRestart(peer)
+                        status("Connected")
+                        dataListener?.onPeerConnectionStateChanged(peer.id, true)
+                    }
+                    PeerConnection.IceConnectionState.DISCONNECTED -> {
+                        status("Reconnecting...")
+                        scheduleIceRestart(peer, ICE_RESTART_DELAY_MS)
+                        dataListener?.onPeerConnectionStateChanged(peer.id, false)
+                    }
+                    PeerConnection.IceConnectionState.FAILED -> {
+                        status("ICE failed")
+                        cancelPendingIceRestart(peer)
+                        restartIce(peer)
+                        dataListener?.onPeerConnectionStateChanged(peer.id, false)
+                    }
+                    else -> Unit
                 }
-                PeerConnection.IceConnectionState.DISCONNECTED -> {
-                    status("Reconnecting...")
-                    scheduleIceRestart(peer, ICE_RESTART_DELAY_MS)
-                    dataListener?.onPeerConnectionStateChanged(peer.id, false)
-                }
-                PeerConnection.IceConnectionState.FAILED -> {
-                    status("ICE failed")
-                    cancelPendingIceRestart(peer)
-                    restartIce(peer)
-                    dataListener?.onPeerConnectionStateChanged(peer.id, false)
-                }
-                else -> Unit
             }
         }
 
@@ -1294,17 +1399,20 @@ class NativeWebRtcClient(
 
         override fun onDataChannel(channel: DataChannel?) {
             val dc = channel ?: return
-            when (dc.label()) {
-                "file" -> attachFileChannel(peer, dc)
-                else -> attachChatChannel(peer, dc)
+            main.post {
+                when (dc.label()) {
+                    "file" -> attachFileChannel(peer, dc)
+                    else -> attachChatChannel(peer, dc)
+                }
             }
         }
 
         override fun onRenegotiationNeeded() {
-            Log.i("VidlyScreen", "onRenegotiationNeeded: peer=${peer.id} sigState=${peer.pc.signalingState()}")
             // Perfect-negotiation pattern: any side may need to renegotiate when
             // tracks are added/removed. Glare is handled in handleDescription.
-            makeOffer(peer)
+            main.post {
+                if (peers[peer.id] === peer) makeOffer(peer)
+            }
         }
 
         override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) = Unit
@@ -1330,13 +1438,17 @@ class NativeWebRtcClient(
         var remoteScreenLive = false
         var chatChannel: DataChannel? = null
         var fileChannel: DataChannel? = null
+        // Pending stuck-offer watchdog (see scheduleOfferTimeout).
+        var offerTimeout: Runnable? = null
         // Monitor for event-driven backpressure on the file channel. Woken by
         // DataChannel.Observer.onBufferedAmountChange so the sender thread doesn't
         // have to poll bufferedAmount() with Thread.sleep().
         val fileChannelLock: java.lang.Object = java.lang.Object()
 
-        fun close(iceRestartHandler: Handler) {
-            iceRestartHandler.removeCallbacksAndMessages(this)
+        fun close(main: Handler) {
+            main.removeCallbacksAndMessages(this)
+            offerTimeout?.let { main.removeCallbacks(it) }
+            offerTimeout = null
             runCatching { chatChannel?.close() }
             runCatching { fileChannel?.close() }
             runCatching { pc.close() }
@@ -1347,5 +1459,10 @@ class NativeWebRtcClient(
         const val LOCAL_STREAM_ID = "vidly-native"
         const val LOCAL_SCREEN_TRACK_ID = "vidly-screen"
         const val ICE_RESTART_DELAY_MS = 8_000L
+        // How long a sent offer may sit unanswered (HAVE_LOCAL_OFFER) before
+        // the stuck-offer watchdog rolls back and re-offers. Generous enough
+        // for weak-network RTTs + SDP processing; short enough to unstick a
+        // deadlocked negotiation within one "why is this call dead" moment.
+        const val OFFER_TIMEOUT_MS = 10_000L
     }
 }

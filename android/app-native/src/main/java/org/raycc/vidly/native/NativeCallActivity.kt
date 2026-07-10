@@ -113,9 +113,6 @@ class NativeCallActivity : Activity(),
     private lateinit var headerStatusLabel: TextView
     private lateinit var participantsScroll: HorizontalScrollView
     private lateinit var participantsRow: LinearLayout
-    private var debugLogText: TextView? = null
-    private var debugOverlayVisible = false
-
     // Bottom container (controls + chat)
     private lateinit var bottomContainer: LinearLayout
     private lateinit var controlsRow: LinearLayout
@@ -167,22 +164,7 @@ class NativeCallActivity : Activity(),
     private var fullscreen = false
 
     // State
-    private val signaling by lazy {
-        NativeSignalingClient(this, this, onDebugLog = { msg ->
-            runOnUiThread {
-                val tv = debugLogText ?: return@runOnUiThread
-                // Skip high-frequency poll logs to avoid flooding
-                if (msg.startsWith("poll ") && !msg.contains("failure") && !msg.contains("error")) return@runOnUiThread
-                if (msg.startsWith("poll response") && msg.contains("messages=0,")) return@runOnUiThread
-                val text = tv.text.toString()
-                val lines = text.split("\n")
-                val keep = lines.takeLast(40).toMutableList()
-                keep.add(msg)
-                tv.text = keep.joinToString("\n")
-                tv.scrollTo(0, tv.height)
-            }
-        })
-    }
+    private val signaling = NativeSignalingClient(this, this)
     private val http = OkHttpClient()
     private var rtc: NativeWebRtcClient? = null
     private var micEnabled = false
@@ -198,7 +180,6 @@ class NativeCallActivity : Activity(),
     private var hasRemoteCamera = false
     private var headerStatus = "Native Vidly"
     private var videoStalled = false
-    private var lastIceRestartAtMs = 0L
     private val connectedPeerIds = HashSet<String>()
     private val frameHealthHandler = Handler(Looper.getMainLooper())
     private val frameHealthRunnable = object : Runnable {
@@ -261,7 +242,8 @@ class NativeCallActivity : Activity(),
         val chunks: MutableList<ByteArray> = mutableListOf(),
         var received: Long = 0,
         var lastProgressSent: Long = 0,
-        val startedAt: Long = SystemClock.elapsedRealtime()
+        val startedAt: Long = SystemClock.elapsedRealtime(),
+        var lastChunkAt: Long = SystemClock.elapsedRealtime()
     )
     private val outgoingFiles = HashMap<String, OutgoingFile>()
     private val incomingFiles = HashMap<String, IncomingFile>()
@@ -410,6 +392,22 @@ class NativeCallActivity : Activity(),
         participants.remove(peerId)
         peerMediaStates.remove(peerId)
         connectedPeerIds.remove(peerId)
+        // Abort transfers tied to this peer. A dangling activeIncomingByPeer
+        // entry would keep us "busy" forever and auto-decline every offer the
+        // peer makes after rejoining.
+        activeIncomingByPeer.remove(peerId)
+        incomingFiles.entries.removeAll { it.value.fromPeerId == peerId }
+        val outgoingIter = outgoingFiles.values.iterator()
+        while (outgoingIter.hasNext()) {
+            val outgoing = outgoingIter.next()
+            outgoing.targetPeerIds.remove(peerId)
+            outgoing.acceptedBy.remove(peerId)
+            outgoing.completedBy.remove(peerId)
+            if (outgoing.targetPeerIds.isEmpty() ||
+                outgoing.completedBy.size >= outgoing.targetPeerIds.size) {
+                outgoingIter.remove()
+            }
+        }
         if (participants.isEmpty()) {
             hasRemoteVideo = false
             hasRemoteCamera = false
@@ -506,6 +504,7 @@ class NativeCallActivity : Activity(),
             val transfer = incomingFiles[fileId] ?: return@runOnUiThread
             transfer.chunks.add(bytes)
             transfer.received += bytes.size
+            transfer.lastChunkAt = SystemClock.elapsedRealtime()
             val now = System.currentTimeMillis()
             if (now - transfer.lastProgressSent > 250 || transfer.received >= transfer.size) {
                 transfer.lastProgressSent = now
@@ -539,23 +538,6 @@ class NativeCallActivity : Activity(),
             setBackgroundColor(Color.BLACK)
         }
         root.addView(callStack, FrameLayout.LayoutParams(-1, -1))
-
-        // Debug log overlay (hidden by default, toggle with long-press on status)
-        debugLogText = TextView(this).apply {
-            visibility = View.GONE
-            setBackgroundColor(Color.argb(200, 11, 17, 32))
-            setTextColor(Color.rgb(180, 200, 220))
-            textSize = 9f
-            typeface = android.graphics.Typeface.MONOSPACE
-            isClickable = false
-            isFocusable = false
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            setOnClickListener { visibility = View.GONE; debugOverlayVisible = false }
-        }
-        root.addView(debugLogText, FrameLayout.LayoutParams(-1, -1).apply {
-            gravity = Gravity.BOTTOM
-            bottomMargin = dp(48)  // above bottom controls
-        })
 
         buildHeaderBar()
 
@@ -720,11 +702,6 @@ class NativeCallActivity : Activity(),
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             text = headerStatus
-            setOnLongClickListener {
-                debugOverlayVisible = !debugOverlayVisible
-                debugLogText?.visibility = if (debugOverlayVisible) View.VISIBLE else View.GONE
-                true
-            }
         }
         row.addView(headerStatusLabel, LinearLayout.LayoutParams(0, -2, 1f))
 
@@ -1099,7 +1076,6 @@ class NativeCallActivity : Activity(),
         hasRemoteVideo = false
         hasRemoteCamera = false
         videoStalled = false
-        lastIceRestartAtMs = 0L
         micEnabled = false
         cameraEnabled = false
         inPreview = false
@@ -1403,25 +1379,21 @@ class NativeCallActivity : Activity(),
             setVideoStalled(false)
             return
         }
-        // A static screencast legitimately produces no new frames, which would
-        // trip the frame-age watchdog and cause a false ICE-restart loop. While
-        // the remote is sharing screen, skip both the stall action and the
-        // "stalled" overlay — the ICE observer (DISCONNECTED/FAILED) remains
-        // the primary recovery path (see AGENTS.md).
+        // A static screencast legitimately produces no new frames, so while the
+        // remote is sharing screen, skip the "stalled" overlay entirely.
+        //
+        // UI feedback ONLY — this watchdog must never touch ICE. The ICE
+        // observer in NativeWebRtcClient (DISCONNECTED → delayed restart,
+        // FAILED → immediate) is the single restart path; a second trigger
+        // here raced it, restarting ICE on connections the observer considered
+        // healthy (see AGENTS.md).
         if (peerMediaStates.values.any { it.screen }) {
             setVideoStalled(false)
             return
         }
         val remoteConnectionAlive = connectedPeerIds.isNotEmpty()
         val frameAgeMs = rtc?.getRemoteVideoFrameAgeMs() ?: Long.MAX_VALUE
-        val stalled = hasRemoteVideo && remoteConnectionAlive && frameAgeMs > FRAME_STALL_MS
-        if (stalled && !videoStalled) {
-            val now = SystemClock.elapsedRealtime()
-            if (lastIceRestartAtMs == 0L || now - lastIceRestartAtMs >= ICE_RESTART_COOLDOWN_MS) {
-                lastIceRestartAtMs = now
-                rtc?.restartIce()
-            }
-        }
+        val stalled = (hasRemoteVideo || hasRemoteCamera) && remoteConnectionAlive && frameAgeMs > FRAME_STALL_MS
         setVideoStalled(stalled)
     }
 
@@ -2262,13 +2234,10 @@ class NativeCallActivity : Activity(),
             // The bound service lets us do this synchronously.
             val service = boundService
             if (service == null) {
-                Log.e("VidlyScreen", "onActivityResult: boundService is null!")
                 Toast.makeText(this, "Call service not ready", Toast.LENGTH_SHORT).show()
                 return
             }
-            Log.i("VidlyScreen", "onActivityResult: promoting FGS to mediaProjection")
             service.promoteToMediaProjection()
-            Log.i("VidlyScreen", "onActivityResult: calling setScreenEnabled(true)")
             rtc?.setScreenEnabled(true, data)
             screenSharing = true
             updateMediaButtons()
@@ -2333,16 +2302,26 @@ class NativeCallActivity : Activity(),
         val id = file.optString("id")
         if (id.isBlank() || incomingFiles.containsKey(id)) return
         val name = file.optString("name", "file")
+        // One transfer per peer at a time — but only reject for a transfer
+        // that is actually making progress. A transfer whose chunks stopped
+        // (sender crashed, channel died mid-file) would otherwise pin the
+        // "busy" state forever and auto-decline every future offer.
+        val activeId = activeIncomingByPeer[fromPeerId]
+        val active = activeId?.let { incomingFiles[it] }
+        if (active != null) {
+            if (SystemClock.elapsedRealtime() - active.lastChunkAt < FILE_STALL_TIMEOUT_MS) {
+                sendChatJsonTo(fromPeerId, JSONObject().put("type", "file-reject").put("id", id))
+                appendChatText("System", "Busy receiving another file; declined $name", incoming = true)
+                return
+            }
+            incomingFiles.remove(active.id)
+            appendChatText("System", "Transfer of ${active.name} timed out", incoming = true)
+        }
+        activeIncomingByPeer.remove(fromPeerId)
         val type = file.optString("type", "application/octet-stream")
         val size = file.optLong("size", 0)
         val incoming = IncomingFile(id, name, type, size, fromPeerId, fromUsername)
         incomingFiles[id] = incoming
-        if (activeIncomingByPeer.containsKey(fromPeerId)) {
-            incomingFiles.remove(id)
-            sendChatJsonTo(fromPeerId, JSONObject().put("type", "file-reject").put("id", id))
-            appendChatText("System", "Busy receiving another file; declined $name", incoming = true)
-            return
-        }
         activeIncomingByPeer[fromPeerId] = id
         appendChatText(fromUsername ?: "Peer", "📎 Receiving: $name (${formatBytes(size)})", incoming = true)
         sendChatJsonTo(fromPeerId, JSONObject().put("type", "file-accept").put("id", id))
@@ -2916,20 +2895,20 @@ class NativeCallActivity : Activity(),
             val resp = http.newCall(req).execute()
             resp.use {
                 if (!it.isSuccessful) return emptyList()
-                val body = JSONObject(it.body?.string().orEmpty())
-                val iceServers = body.optJSONArray("iceServers") ?: return emptyList()
+                val json = JSONObject(it.body?.string().orEmpty())
+                val rawUrls = json.opt("urls")
+                val urls = when (rawUrls) {
+                    is JSONArray -> rawUrls
+                    is String -> JSONArray().put(rawUrls)
+                    else -> return emptyList()
+                }
+                val username = json.optString("username")
+                val credential = json.optString("credential")
+                if (username.isBlank() || credential.isBlank()) return emptyList()
                 val result = mutableListOf<TurnServerInfo>()
-                for (i in 0 until iceServers.length()) {
-                    val entry = iceServers.optJSONObject(i) ?: continue
-                    val urls = entry.optJSONArray("urls") ?: continue
-                    val username = entry.optString("username", "")
-                    val credential = entry.optString("credential", "")
-                    for (j in 0 until urls.length()) {
-                        val url = urls.optString(j, "").trim()
-                        if (url.isNotBlank()) {
-                            result.add(TurnServerInfo(url, username, credential))
-                        }
-                    }
+                for (i in 0 until urls.length()) {
+                    val url = urls.optString(i, "").trim()
+                    if (url.isNotBlank()) result.add(TurnServerInfo(url, username, credential))
                 }
                 result
             }
@@ -2995,7 +2974,9 @@ class NativeCallActivity : Activity(),
         private const val APK_CACHE_DIR = "updates"
         private const val FRAME_STALL_MS = 5000L
         private const val FRAME_HEALTH_CHECK_MS = 3000L
-        private const val ICE_RESTART_COOLDOWN_MS = 30_000L
+        // An incoming transfer with no chunk for this long is considered dead;
+        // a new file-offer from the same peer may abandon it and take over.
+        private const val FILE_STALL_TIMEOUT_MS = 30_000L
         private const val CHAT_MAX = 200
         private val REACTIONS = listOf("❤️", "😂", "🎉", "😮", "👏", "🤗")
     }

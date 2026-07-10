@@ -34,9 +34,11 @@ import java.nio.FloatBuffer
  *      it as a [TextureBufferImpl] which is delivered to the downstream sink.
  *
  * EGL/GL state is created lazily on the first frame so that we can share
- * resources with the camera thread's already-current context, and is released
- * via [setSink] (with null) which is the only cleanup hook the surrounding
- * client invokes.
+ * resources with the camera thread's already-current context. [setSink] with
+ * null (fired by VideoSource.dispose) detaches the current GL generation and
+ * destroys it on its own render thread; the processor instance stays usable —
+ * the client reuses it across camera pipeline rebuilds, and the next frame on
+ * the NEW SurfaceTextureHelper thread lazily creates a fresh generation.
  */
 class BeautyVideoProcessor : VideoProcessor {
 
@@ -85,36 +87,47 @@ class BeautyVideoProcessor : VideoProcessor {
 
     private var sink: VideoSink? = null
 
-    // GL / EGL state. All of these are touched only on the render thread
-    // (the SurfaceTextureHelper thread that delivers frames to us).
-    private var renderHandler: Handler? = null
-    private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
-    private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
-    private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+    private data class PooledTexture(val textureId: Int, val width: Int, val height: Int)
 
-    private var program: Int = 0
-    private var aPositionLoc: Int = -1
-    private var aTexCoordLoc: Int = -1
-    private var uTexMatrixLoc: Int = -1
-    private var uTextureLoc: Int = -1
-    private var uTexelSizeLoc: Int = -1
-    private var uIntensityLoc: Int = -1
-    private var uBrightnessLoc: Int = -1
-    private var uContrastLoc: Int = -1
-    private var uSaturationLoc: Int = -1
+    // One GL "generation": everything created on (and owned by) one
+    // SurfaceTextureHelper render thread. Grouped so that a capture-pipeline
+    // rebuild can hand the old generation to its own (old) thread for
+    // destruction while a fresh generation is created lazily on the new
+    // thread — the two never share fields, so they cannot race.
+    private class Gl(val handler: Handler) {
+        var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
+        var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
+        var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
 
-    private var fbo: Int = 0
-    private var vertexBuffer: FloatBuffer? = null
-    private var texCoordBuffer: FloatBuffer? = null
+        var program: Int = 0
+        var aPositionLoc: Int = -1
+        var aTexCoordLoc: Int = -1
+        var uTexMatrixLoc: Int = -1
+        var uTextureLoc: Int = -1
+        var uTexelSizeLoc: Int = -1
+        var uIntensityLoc: Int = -1
+        var uBrightnessLoc: Int = -1
+        var uContrastLoc: Int = -1
+        var uSaturationLoc: Int = -1
+
+        var fbo: Int = 0
+        var vertexBuffer: FloatBuffer? = null
+        var texCoordBuffer: FloatBuffer? = null
+        var yuvConverter: YuvConverter? = null
+        // Set on the render thread once release() ran; late texture-recycle
+        // posts check it so they never touch the destroyed context.
+        var released = false
+        val texturePool = mutableListOf<PooledTexture>()
+    }
+
+    // Written on the render thread (lazy init) and on whatever thread calls
+    // setSink(null); frame code snapshots it into a local before use.
+    @Volatile
+    private var gl: Gl? = null
+
+    // Per-frame scratch, only touched by the active generation's render thread.
     private val texMatrix4 = FloatArray(16)
     private val androidMatrix3 = FloatArray(9)
-
-    private var yuvConverter: YuvConverter? = null
-    private var initialized = false
-    private var disposed = false
-
-    private data class PooledTexture(val textureId: Int, val width: Int, val height: Int)
-    private val texturePool = mutableListOf<PooledTexture>()
 
     override fun setSink(sink: VideoSink?) {
         this.sink = sink
@@ -169,8 +182,7 @@ class BeautyVideoProcessor : VideoProcessor {
         val workingFrame = flipped ?: frame
         val buffer = workingFrame.buffer
 
-        if (disposed ||
-            !enabled ||
+        if (!enabled ||
             intensity <= 0.01f ||
             buffer !is VideoFrame.TextureBuffer ||
             buffer.type != VideoFrame.TextureBuffer.Type.OES
@@ -180,9 +192,7 @@ class BeautyVideoProcessor : VideoProcessor {
             return
         }
 
-        try {
-            ensureInitialized()
-        } catch (t: Throwable) {
+        val g = currentGlOrInit() ?: run {
             out.onFrame(workingFrame)
             flipped?.release()
             return
@@ -194,7 +204,7 @@ class BeautyVideoProcessor : VideoProcessor {
         val priorDrawSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
         val priorReadSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
 
-        if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+        if (!EGL14.eglMakeCurrent(g.eglDisplay, g.eglSurface, g.eglSurface, g.eglContext)) {
             // Couldn't activate our context -- pass the frame through.
             out.onFrame(workingFrame)
             flipped?.release()
@@ -206,9 +216,9 @@ class BeautyVideoProcessor : VideoProcessor {
         try {
             val width = buffer.width
             val height = buffer.height
-            outputTexture = getOrCreateTexture(width, height)
+            outputTexture = getOrCreateTexture(g, width, height)
 
-            renderBeautyPass(buffer, outputTexture, width, height)
+            renderBeautyPass(g, buffer, outputTexture, width, height)
 
             // Force the GPU to finish writing before the encoder/renderer can sample it.
             GLES20.glFinish()
@@ -220,9 +230,9 @@ class BeautyVideoProcessor : VideoProcessor {
                 VideoFrame.TextureBuffer.Type.RGB,
                 capturedTexture,
                 Matrix(), // identity -- transform was baked in during the shader pass
-                renderHandler!!,
-                yuvConverter!!,
-                Runnable { recycleTextureOnRenderThread(capturedTexture, width, height) }
+                g.handler,
+                g.yuvConverter!!,
+                Runnable { recycleTexture(g, capturedTexture, width, height) }
             )
 
             val processed = VideoFrame(outBuffer, workingFrame.rotation, workingFrame.timestampNs)
@@ -243,7 +253,7 @@ class BeautyVideoProcessor : VideoProcessor {
                 EGL14.eglMakeCurrent(priorDisplay, priorDrawSurface, priorReadSurface, priorContext)
             } else {
                 EGL14.eglMakeCurrent(
-                    eglDisplay,
+                    g.eglDisplay,
                     EGL14.EGL_NO_SURFACE,
                     EGL14.EGL_NO_SURFACE,
                     EGL14.EGL_NO_CONTEXT
@@ -255,19 +265,49 @@ class BeautyVideoProcessor : VideoProcessor {
         }
     }
 
+    /**
+     * Return the GL generation for the calling render thread, creating it
+     * lazily. A generation left over from a PREVIOUS thread (possible only if
+     * the client re-attached without a setSink(null) in between) is retired to
+     * its own thread and replaced. Returns null when initialization fails —
+     * the caller passes the frame through untouched.
+     */
+    private fun currentGlOrInit(): Gl? {
+        val current = gl
+        if (current != null && current.handler.looper == Looper.myLooper()) return current
+        if (current != null) {
+            gl = null
+            current.handler.post { releaseGl(current) }
+        }
+        return try {
+            initGl().also { gl = it }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
     // ---- Initialization & teardown -----------------------------------------
 
-    private fun ensureInitialized() {
-        if (initialized) return
-
+    private fun initGl(): Gl {
         val looper = Looper.myLooper() ?: Looper.getMainLooper()
-        renderHandler = Handler(looper)
+        val g = Gl(Handler(looper))
+
+        // Save the camera thread's current EGL binding up front. The old code
+        // unbound the thread's context (EGL_NO_CONTEXT) when init finished,
+        // which corrupts the SurfaceTextureHelper thread's state — its
+        // SurfaceTexture.updateTexImage needs its own context current. We must
+        // RESTORE, never unbind (see AGENTS.md).
+        val priorDisplay = EGL14.eglGetCurrentDisplay()
+        val priorContext = EGL14.eglGetCurrentContext()
+        val priorDraw = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        val priorRead = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
 
         // Use the camera thread's currently-bound context as the share group
         // so we can sample the OES texture it produced.
-        val sharedContext = EGL14.eglGetCurrentContext()
-        eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        val sharedContext = priorContext
+        val eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
         if (eglDisplay == EGL14.EGL_NO_DISPLAY) error("eglGetDisplay failed")
+        g.eglDisplay = eglDisplay
         val versions = IntArray(2)
         if (!EGL14.eglInitialize(eglDisplay, versions, 0, versions, 1)) {
             error("eglInitialize failed")
@@ -292,40 +332,40 @@ class BeautyVideoProcessor : VideoProcessor {
         val config = configs[0] ?: error("No EGL config")
 
         val ctxAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
-        eglContext = EGL14.eglCreateContext(eglDisplay, config, sharedContext, ctxAttribs, 0)
-        if (eglContext == EGL14.EGL_NO_CONTEXT) error("eglCreateContext failed")
+        g.eglContext = EGL14.eglCreateContext(eglDisplay, config, sharedContext, ctxAttribs, 0)
+        if (g.eglContext == EGL14.EGL_NO_CONTEXT) error("eglCreateContext failed")
 
         val surfaceAttribs = intArrayOf(
             EGL14.EGL_WIDTH, 1280,
             EGL14.EGL_HEIGHT, 720,
             EGL14.EGL_NONE
         )
-        eglSurface = EGL14.eglCreatePbufferSurface(eglDisplay, config, surfaceAttribs, 0)
-        if (eglSurface == EGL14.EGL_NO_SURFACE) error("eglCreatePbufferSurface failed")
+        g.eglSurface = EGL14.eglCreatePbufferSurface(eglDisplay, config, surfaceAttribs, 0)
+        if (g.eglSurface == EGL14.EGL_NO_SURFACE) error("eglCreatePbufferSurface failed")
 
-        if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+        if (!EGL14.eglMakeCurrent(eglDisplay, g.eglSurface, g.eglSurface, g.eglContext)) {
             error("eglMakeCurrent failed during init")
         }
 
         try {
-            program = buildProgram()
-            aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition")
-            aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
-            uTexMatrixLoc = GLES20.glGetUniformLocation(program, "uTexMatrix")
-            uTextureLoc = GLES20.glGetUniformLocation(program, "uTexture")
-            uTexelSizeLoc = GLES20.glGetUniformLocation(program, "uTexelSize")
-            uIntensityLoc = GLES20.glGetUniformLocation(program, "uIntensity")
-            uBrightnessLoc = GLES20.glGetUniformLocation(program, "uBrightness")
-            uContrastLoc = GLES20.glGetUniformLocation(program, "uContrast")
-            uSaturationLoc = GLES20.glGetUniformLocation(program, "uSaturation")
+            g.program = buildProgram()
+            g.aPositionLoc = GLES20.glGetAttribLocation(g.program, "aPosition")
+            g.aTexCoordLoc = GLES20.glGetAttribLocation(g.program, "aTexCoord")
+            g.uTexMatrixLoc = GLES20.glGetUniformLocation(g.program, "uTexMatrix")
+            g.uTextureLoc = GLES20.glGetUniformLocation(g.program, "uTexture")
+            g.uTexelSizeLoc = GLES20.glGetUniformLocation(g.program, "uTexelSize")
+            g.uIntensityLoc = GLES20.glGetUniformLocation(g.program, "uIntensity")
+            g.uBrightnessLoc = GLES20.glGetUniformLocation(g.program, "uBrightness")
+            g.uContrastLoc = GLES20.glGetUniformLocation(g.program, "uContrast")
+            g.uSaturationLoc = GLES20.glGetUniformLocation(g.program, "uSaturation")
 
-            vertexBuffer = floatBufferOf(
+            g.vertexBuffer = floatBufferOf(
                 -1f, -1f,
                 1f, -1f,
                 -1f, 1f,
                 1f, 1f
             )
-            texCoordBuffer = floatBufferOf(
+            g.texCoordBuffer = floatBufferOf(
                 0f, 0f,
                 1f, 0f,
                 0f, 1f,
@@ -334,76 +374,92 @@ class BeautyVideoProcessor : VideoProcessor {
 
             val fbos = IntArray(1)
             GLES20.glGenFramebuffers(1, fbos, 0)
-            fbo = fbos[0]
+            g.fbo = fbos[0]
 
-            yuvConverter = YuvConverter()
+            g.yuvConverter = YuvConverter()
         } finally {
-            // Release current; per-frame code re-binds.
-            EGL14.eglMakeCurrent(
-                eglDisplay,
-                EGL14.EGL_NO_SURFACE,
-                EGL14.EGL_NO_SURFACE,
-                EGL14.EGL_NO_CONTEXT
-            )
+            // Restore the camera thread's prior binding; per-frame code
+            // re-binds our context around each pass.
+            if (priorDisplay != EGL14.EGL_NO_DISPLAY && priorContext != EGL14.EGL_NO_CONTEXT) {
+                EGL14.eglMakeCurrent(priorDisplay, priorDraw, priorRead, priorContext)
+            } else {
+                EGL14.eglMakeCurrent(
+                    eglDisplay,
+                    EGL14.EGL_NO_SURFACE,
+                    EGL14.EGL_NO_SURFACE,
+                    EGL14.EGL_NO_CONTEXT
+                )
+            }
         }
 
-        initialized = true
+        return g
     }
 
+    // Detach the current GL generation and destroy it on its own render
+    // thread. The field is cleared immediately so a later re-attach (the
+    // client reuses this processor across camera pipeline rebuilds) creates a
+    // fresh generation on the NEW SurfaceTextureHelper thread. The post
+    // serializes behind any in-flight frame on the old thread's looper.
     private fun scheduleRelease() {
-        val handler = renderHandler ?: run {
-            disposed = true
-            return
-        }
-        if (disposed) return
-        disposed = true
-        handler.post { releaseGl() }
+        val g = gl ?: return
+        gl = null
+        g.handler.post { releaseGl(g) }
     }
 
-    private fun releaseGl() {
-        if (eglDisplay == EGL14.EGL_NO_DISPLAY || eglContext == EGL14.EGL_NO_CONTEXT) return
-        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+    private fun releaseGl(g: Gl) {
+        if (g.released) return
+        g.released = true
+        if (g.eglDisplay == EGL14.EGL_NO_DISPLAY || g.eglContext == EGL14.EGL_NO_CONTEXT) return
+        // Save + restore the thread's binding — this runs on the (old)
+        // SurfaceTextureHelper thread, which still needs its own context
+        // afterwards for its own teardown.
+        val priorDisplay = EGL14.eglGetCurrentDisplay()
+        val priorContext = EGL14.eglGetCurrentContext()
+        val priorDraw = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        val priorRead = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
+        EGL14.eglMakeCurrent(g.eglDisplay, g.eglSurface, g.eglSurface, g.eglContext)
         try {
-            if (program != 0) {
-                GLES20.glDeleteProgram(program)
-                program = 0
+            if (g.program != 0) {
+                GLES20.glDeleteProgram(g.program)
+                g.program = 0
             }
-            if (fbo != 0) {
-                GLES20.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
-                fbo = 0
+            if (g.fbo != 0) {
+                GLES20.glDeleteFramebuffers(1, intArrayOf(g.fbo), 0)
+                g.fbo = 0
             }
-            yuvConverter?.release()
-            yuvConverter = null
-            synchronized(texturePool) {
-                for (pt in texturePool) {
+            g.yuvConverter?.release()
+            g.yuvConverter = null
+            synchronized(g.texturePool) {
+                for (pt in g.texturePool) {
                     GLES20.glDeleteTextures(1, intArrayOf(pt.textureId), 0)
                 }
-                texturePool.clear()
+                g.texturePool.clear()
             }
         } finally {
-            EGL14.eglMakeCurrent(
-                eglDisplay,
-                EGL14.EGL_NO_SURFACE,
-                EGL14.EGL_NO_SURFACE,
-                EGL14.EGL_NO_CONTEXT
-            )
+            if (priorDisplay != EGL14.EGL_NO_DISPLAY && priorContext != EGL14.EGL_NO_CONTEXT) {
+                EGL14.eglMakeCurrent(priorDisplay, priorDraw, priorRead, priorContext)
+            } else {
+                EGL14.eglMakeCurrent(
+                    g.eglDisplay,
+                    EGL14.EGL_NO_SURFACE,
+                    EGL14.EGL_NO_SURFACE,
+                    EGL14.EGL_NO_CONTEXT
+                )
+            }
         }
-        if (eglSurface != EGL14.EGL_NO_SURFACE) {
-            EGL14.eglDestroySurface(eglDisplay, eglSurface)
-            eglSurface = EGL14.EGL_NO_SURFACE
+        if (g.eglSurface != EGL14.EGL_NO_SURFACE) {
+            EGL14.eglDestroySurface(g.eglDisplay, g.eglSurface)
+            g.eglSurface = EGL14.EGL_NO_SURFACE
         }
-        if (eglContext != EGL14.EGL_NO_CONTEXT) {
-            EGL14.eglDestroyContext(eglDisplay, eglContext)
-            eglContext = EGL14.EGL_NO_CONTEXT
-        }
-        EGL14.eglTerminate(eglDisplay)
-        eglDisplay = EGL14.EGL_NO_DISPLAY
-        initialized = false
+        EGL14.eglDestroyContext(g.eglDisplay, g.eglContext)
+        g.eglContext = EGL14.EGL_NO_CONTEXT
+        EGL14.eglTerminate(g.eglDisplay)
+        g.eglDisplay = EGL14.EGL_NO_DISPLAY
     }
 
-    private fun getOrCreateTexture(width: Int, height: Int): Int {
-        synchronized(texturePool) {
-            val iterator = texturePool.iterator()
+    private fun getOrCreateTexture(g: Gl, width: Int, height: Int): Int {
+        synchronized(g.texturePool) {
+            val iterator = g.texturePool.iterator()
             while (iterator.hasNext()) {
                 val pt = iterator.next()
                 if (pt.width == width && pt.height == height) {
@@ -415,31 +471,29 @@ class BeautyVideoProcessor : VideoProcessor {
         return createRgbaTexture(width, height)
     }
 
-    private fun recycleTextureOnRenderThread(textureId: Int, width: Int, height: Int) {
-        val handler = renderHandler ?: return
-        handler.post {
-            if (disposed || eglDisplay == EGL14.EGL_NO_DISPLAY || eglContext == EGL14.EGL_NO_CONTEXT) {
-                deleteTextureDirect(textureId)
-                return@post
-            }
-            synchronized(texturePool) {
-                if (texturePool.size < 5) {
-                    texturePool.add(PooledTexture(textureId, width, height))
+    private fun recycleTexture(g: Gl, textureId: Int, width: Int, height: Int) {
+        g.handler.post {
+            // Once the generation is released its context is gone and the
+            // texture died with it — nothing to recycle or delete.
+            if (g.released) return@post
+            synchronized(g.texturePool) {
+                if (g.texturePool.size < 5) {
+                    g.texturePool.add(PooledTexture(textureId, width, height))
                 } else {
-                    deleteTextureDirect(textureId)
+                    deleteTextureDirect(g, textureId)
                 }
             }
         }
     }
 
-    private fun deleteTextureDirect(textureId: Int) {
+    private fun deleteTextureDirect(g: Gl, textureId: Int) {
         val priorContext = EGL14.eglGetCurrentContext()
-        val needSwitch = priorContext != eglContext
+        val needSwitch = priorContext != g.eglContext
         val priorDisplay = EGL14.eglGetCurrentDisplay()
         val priorDraw = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
         val priorRead = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
         if (needSwitch) {
-            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+            EGL14.eglMakeCurrent(g.eglDisplay, g.eglSurface, g.eglSurface, g.eglContext)
         }
         try {
             GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
@@ -449,7 +503,7 @@ class BeautyVideoProcessor : VideoProcessor {
                     EGL14.eglMakeCurrent(priorDisplay, priorDraw, priorRead, priorContext)
                 } else {
                     EGL14.eglMakeCurrent(
-                        eglDisplay,
+                        g.eglDisplay,
                         EGL14.EGL_NO_SURFACE,
                         EGL14.EGL_NO_SURFACE,
                         EGL14.EGL_NO_CONTEXT
@@ -462,13 +516,14 @@ class BeautyVideoProcessor : VideoProcessor {
     // ---- Per-frame rendering ------------------------------------------------
 
     private fun renderBeautyPass(
+        g: Gl,
         buffer: VideoFrame.TextureBuffer,
         outputTextureId: Int,
         width: Int,
         height: Int
     ) {
         // Bind the FBO with the output texture as color attachment.
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, g.fbo)
         GLES20.glFramebufferTexture2D(
             GLES20.GL_FRAMEBUFFER,
             GLES20.GL_COLOR_ATTACHMENT0,
@@ -484,7 +539,7 @@ class BeautyVideoProcessor : VideoProcessor {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-        GLES20.glUseProgram(program)
+        GLES20.glUseProgram(g.program)
 
         // Bind the camera's OES texture.
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -509,11 +564,11 @@ class BeautyVideoProcessor : VideoProcessor {
             GLES20.GL_TEXTURE_WRAP_T,
             GLES20.GL_CLAMP_TO_EDGE
         )
-        GLES20.glUniform1i(uTextureLoc, 0)
+        GLES20.glUniform1i(g.uTextureLoc, 0)
 
         // Convert the buffer's 3x3 transform matrix into a 4x4 used by GLSL.
         toGl4x4(buffer.transformMatrix, texMatrix4)
-        GLES20.glUniformMatrix4fv(uTexMatrixLoc, 1, false, texMatrix4, 0)
+        GLES20.glUniformMatrix4fv(g.uTexMatrixLoc, 1, false, texMatrix4, 0)
 
         // Beauty parameters. The shader reads luma from the OES sample directly,
         // so coefficients are in [0,1] color space.
@@ -521,25 +576,25 @@ class BeautyVideoProcessor : VideoProcessor {
         val brightness = 0.11f * intensity
         val contrast = 1f + 0.12f * intensity
         val saturation = 1f + 0.12f * intensity
-        GLES20.glUniform2f(uTexelSizeLoc, 1f / width.toFloat(), 1f / height.toFloat())
-        GLES20.glUniform1f(uIntensityLoc, smooth)
-        GLES20.glUniform1f(uBrightnessLoc, brightness)
-        GLES20.glUniform1f(uContrastLoc, contrast)
-        GLES20.glUniform1f(uSaturationLoc, saturation)
+        GLES20.glUniform2f(g.uTexelSizeLoc, 1f / width.toFloat(), 1f / height.toFloat())
+        GLES20.glUniform1f(g.uIntensityLoc, smooth)
+        GLES20.glUniform1f(g.uBrightnessLoc, brightness)
+        GLES20.glUniform1f(g.uContrastLoc, contrast)
+        GLES20.glUniform1f(g.uSaturationLoc, saturation)
 
         // Vertex attributes.
-        val vbuf = vertexBuffer!!.position(0)
-        GLES20.glEnableVertexAttribArray(aPositionLoc)
-        GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, vbuf)
+        val vbuf = g.vertexBuffer!!.position(0)
+        GLES20.glEnableVertexAttribArray(g.aPositionLoc)
+        GLES20.glVertexAttribPointer(g.aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, vbuf)
 
-        val tbuf = texCoordBuffer!!.position(0)
-        GLES20.glEnableVertexAttribArray(aTexCoordLoc)
-        GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, tbuf)
+        val tbuf = g.texCoordBuffer!!.position(0)
+        GLES20.glEnableVertexAttribArray(g.aTexCoordLoc)
+        GLES20.glVertexAttribPointer(g.aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, tbuf)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-        GLES20.glDisableVertexAttribArray(aPositionLoc)
-        GLES20.glDisableVertexAttribArray(aTexCoordLoc)
+        GLES20.glDisableVertexAttribArray(g.aPositionLoc)
+        GLES20.glDisableVertexAttribArray(g.aTexCoordLoc)
 
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)

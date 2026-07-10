@@ -12,7 +12,8 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 11
-        versionName = "2.0-cf"
+        versionName = "1.9"
+        ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
     }
 
     compileOptions {
