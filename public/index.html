@@ -179,13 +179,29 @@
     position: absolute; inset: 0; width: 100%; height: 100%;
     object-fit: contain; background: #000;
   }
-  .tile audio.remote-audio {
+  /* Remote <audio> elements live outside the tiles so they survive tile
+     teardown and can be reused (see "Remote audio playback" in the script). */
+  #remoteAudio {
     position: absolute;
     width: 0;
     height: 0;
+    overflow: hidden;
     opacity: 0;
     pointer-events: none;
   }
+  .sound-banner {
+    position: fixed; top: 64px; left: 50%;
+    transform: translateX(-50%);
+    z-index: 40;
+    display: none;
+    padding: 12px 20px;
+    border: none; border-radius: 999px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #fff; font-size: 15px; font-weight: 600;
+    box-shadow: var(--shadow);
+    cursor: pointer;
+  }
+  .sound-banner.show { display: block; animation: pop .2s ease both; }
   .tile.placeholder::after {
     content: "Waiting for video…";
     position: absolute; inset: 0;
@@ -732,6 +748,9 @@
       Room <code id="roomLabel">—</code>
       <button class="copy-btn" id="copyLink" title="Copy invite link">⧉ copy</button>
     </div>
+    <div class="top-actions">
+      <button class="copy-btn" id="reportBtn" title="Send a call-quality report to the server">⚠ report problem</button>
+    </div>
   </header>
 
   <div class="stage">
@@ -812,6 +831,8 @@
 </section>
 
 <div id="toasts"></div>
+<button id="soundBanner" class="sound-banner" type="button">🔇 Tap to enable sound</button>
+<div id="remoteAudio" aria-hidden="true"></div>
 
 <script>
 "use strict";
@@ -937,6 +958,455 @@ function toast(message, type = '') {
     }, 3800);
 }
 
+// ─── Call telemetry ───────────────────────────────────────
+// Ring buffers of lifecycle events and 5s getStats() samples, uploaded to
+// POST /call-report (server saves to call-reports/) on leave/pagehide and via
+// the topbar "report problem" button. Exists so "no sound" / "unstable" reports
+// from remote users arrive with data: relay vs direct path, RTT, loss, codec,
+// blocked play() calls, mic interruptions.
+const CALL_EVENTS_MAX = 300;
+const CALL_SAMPLES_MAX = 120;            // 10 min at 5s
+const STATS_INTERVAL_MS = 5000;
+const REPORT_KEEPALIVE_MAX = 60 * 1024;  // fetch keepalive bodies are capped at 64KB
+const callEvents = [];
+const callSamples = [];
+let statsTimer = null;
+let callReportSent = false;
+
+function logEvent(type, data) {
+    callEvents.push(Object.assign({ t: Date.now(), type }, data));
+    if (callEvents.length > CALL_EVENTS_MAX) callEvents.shift();
+}
+
+// Counter delta since the previous sample for (stat id, key); undefined on first sight.
+function statsDelta(prev, id, key, value) {
+    const k = id + ':' + key;
+    const before = prev[k];
+    prev[k] = value;
+    return typeof before === 'number' && typeof value === 'number' ? value - before : undefined;
+}
+
+async function samplePeerStats(peer) {
+    const { pc } = peer;
+    const out = { peer: peer.id.slice(0, 8), ice: pc.iceConnectionState, pc: pc.connectionState, sig: pc.signalingState };
+    let report;
+    try { report = await pc.getStats(); } catch { return out; }
+    const prev = peer.statsPrev || (peer.statsPrev = {});
+    const byId = new Map();
+    report.forEach(s => byId.set(s.id, s));
+
+    // Selected candidate pair: spec path via transport, fallback for older Safari.
+    let pair = null;
+    for (const s of byId.values()) {
+        if (s.type === 'transport' && s.selectedCandidatePairId) pair = byId.get(s.selectedCandidatePairId) || pair;
+    }
+    if (!pair) {
+        for (const s of byId.values()) {
+            if (s.type === 'candidate-pair' && (s.selected || (s.nominated && s.state === 'succeeded'))) { pair = s; break; }
+        }
+    }
+    if (pair) {
+        const local = byId.get(pair.localCandidateId);
+        const remote = byId.get(pair.remoteCandidateId);
+        out.path = (local?.candidateType || '?') + '/' + (remote?.candidateType || '?');
+        out.proto = local?.relayProtocol ? 'relay-' + local.relayProtocol : local?.protocol;
+        if (typeof pair.currentRoundTripTime === 'number') out.rttMs = Math.round(pair.currentRoundTripTime * 1000);
+        if (typeof pair.availableOutgoingBitrate === 'number') out.outKbpsAvail = Math.round(pair.availableOutgoingBitrate / 1000);
+    }
+
+    const kbps = (id, bytes) => {
+        const d = statsDelta(prev, id, 'bytes', bytes);
+        return d === undefined ? undefined : Math.round(d * 8 / STATS_INTERVAL_MS);
+    };
+    const res = (s) => s.frameWidth ? s.frameWidth + 'x' + s.frameHeight : undefined;
+    const codec = (s) => byId.get(s.codecId)?.mimeType;
+    for (const s of byId.values()) {
+        const kind = s.kind || s.mediaType;
+        if (s.type === 'inbound-rtp' && kind === 'audio') {
+            const lost = statsDelta(prev, s.id, 'lost', s.packetsLost);
+            const recv = statsDelta(prev, s.id, 'recv', s.packetsReceived);
+            const concealed = statsDelta(prev, s.id, 'concealed', s.concealedSamples);
+            const samples = statsDelta(prev, s.id, 'samples', s.totalSamplesReceived);
+            out.aIn = {
+                kbps: kbps(s.id, s.bytesReceived),
+                lossPct: lost !== undefined && recv !== undefined && lost + recv > 0 ? +(100 * lost / (lost + recv)).toFixed(1) : undefined,
+                jitterMs: typeof s.jitter === 'number' ? Math.round(s.jitter * 1000) : undefined,
+                concealPct: concealed !== undefined && samples > 0 ? +(100 * concealed / samples).toFixed(1) : undefined,
+                level: typeof s.audioLevel === 'number' ? +s.audioLevel.toFixed(3) : undefined,
+                codec: codec(s)
+            };
+        } else if (s.type === 'inbound-rtp' && kind === 'video') {
+            (out.vIn || (out.vIn = [])).push({
+                kbps: kbps(s.id, s.bytesReceived), fps: s.framesPerSecond, res: res(s),
+                dropped: statsDelta(prev, s.id, 'dropped', s.framesDropped), freezes: s.freezeCount, codec: codec(s)
+            });
+        } else if (s.type === 'outbound-rtp' && kind === 'audio') {
+            out.aOut = { kbps: kbps(s.id, s.bytesSent), codec: codec(s) };
+        } else if (s.type === 'outbound-rtp' && kind === 'video') {
+            const k = kbps(s.id, s.bytesSent);
+            if (!k && !s.frameWidth) continue; // idle sender (camera off)
+            (out.vOut || (out.vOut = [])).push({
+                kbps: k, fps: s.framesPerSecond, res: res(s), limit: s.qualityLimitationReason, codec: codec(s)
+            });
+        }
+    }
+    return out;
+}
+
+function micTrackState() {
+    if (!micEnabled) return 'off';
+    const t = currentMicTrack();
+    if (!t || t.readyState === 'ended') return 'dead';
+    return t.muted ? 'muted' : 'live';
+}
+
+function startStatsSampler() {
+    if (statsTimer) return;
+    statsTimer = setInterval(async () => {
+        if (!peers.size) return;
+        const sample = {
+            t: Date.now(),
+            vis: document.visibilityState,
+            mic: micTrackState(),
+            peers: await Promise.all(Array.from(peers.values(), samplePeerStats))
+        };
+        callSamples.push(sample);
+        if (callSamples.length > CALL_SAMPLES_MAX) callSamples.shift();
+    }, STATS_INTERVAL_MS);
+}
+
+function stopStatsSampler() {
+    if (statsTimer) clearInterval(statsTimer);
+    statsTimer = null;
+}
+
+function sendCallReport(reason, { keepalive = false } = {}) {
+    if (!roomId) return Promise.resolve(false);
+    const report = {
+        timestamp: new Date().toISOString(),
+        reason,
+        ua: navigator.userAgent,
+        roomId, username: myUsername, clientId: getClientId(), pageSessionId, peerId: myPeerId,
+        mic: micTrackState(), cam: camEnabled, sharing: isSharing,
+        iceServers: iceServers.map(s => s.urls),
+        events: callEvents.slice(),
+        samples: callSamples.slice()
+    };
+    let body = JSON.stringify(report);
+    if (keepalive) {
+        // Drop the oldest data until the body fits the keepalive limit.
+        const size = () => new TextEncoder().encode(body).length;
+        while (size() > REPORT_KEEPALIVE_MAX && (report.samples.length || report.events.length)) {
+            const list = report.samples.length ? report.samples : report.events;
+            list.splice(0, Math.ceil(list.length / 4));
+            body = JSON.stringify(report);
+        }
+    }
+    return fetch('/call-report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        keepalive
+    }).then(r => r.ok).catch(() => false);
+}
+
+// ─── Remote audio playback (Safari autoplay) ──────────────
+// Safari only starts call audio without a tap while the page is capturing
+// mic/camera, and Vidly joins with the mic off, so remote audio's play() can
+// be refused (NotAllowedError). Three layers:
+//  1. A pool of <audio> elements is play()ed inside the Join/Create tap (and
+//     every later tap), which unlocks them for later programmatic playback.
+//     Peers borrow an element and return it on teardown, so a PC rebuild after
+//     a reconnect still plays through an unlocked element.
+//  2. Any tap retries every paused remote element. iPadOS also pauses media on
+//     interruptions (Siri, notifications, other apps' audio); 'pause' and
+//     returning to the page trigger a retry too.
+//  3. If play() is still refused, the "Tap to enable sound" banner asks for that tap.
+const AUDIO_POOL_SIZE = 3; // max remote peers in a 4-person room
+const audioPool = [];
+const remoteAudioHolder = $('remoteAudio');
+const soundBanner = $('soundBanner');
+
+function createRemoteAudioEl() {
+    const el = document.createElement('audio');
+    el.autoplay = true;
+    el.addEventListener('pause', () => onRemoteAudioPaused(el));
+    remoteAudioHolder.appendChild(el);
+    return el;
+}
+
+function acquireRemoteAudioEl() {
+    const el = audioPool.pop() || createRemoteAudioEl();
+    el.dataset.owned = '1';
+    return el;
+}
+
+function releaseRemoteAudioEl(el) {
+    if (!el) return;
+    delete el.dataset.owned; // before pause() so onRemoteAudioPaused ignores it
+    clearTimeout(el._resumeTimer);
+    try { el.pause(); } catch {}
+    el.srcObject = null;
+    if (audioPool.length < AUDIO_POOL_SIZE) audioPool.push(el);
+    else el.remove();
+}
+
+// Must run synchronously inside a user gesture to count as an unlock.
+function primeRemoteAudio() {
+    while (audioPool.length < AUDIO_POOL_SIZE) audioPool.push(createRemoteAudioEl());
+    for (const el of audioPool) {
+        if (!el.srcObject) el.srcObject = new MediaStream();
+        el.play().catch(() => {});
+    }
+}
+
+function playRemoteAudio(el, why) {
+    if (!el || !el.srcObject) return;
+    el.play().then(updateSoundBanner, (err) => {
+        if (err?.name !== 'NotAllowedError') return;
+        logEvent('play-blocked', { why });
+        if (call.classList.contains('active')) soundBanner.classList.add('show');
+    });
+}
+
+function isAudioBlocked(el) {
+    return !!(el && el.paused && el.srcObject && el.srcObject.getAudioTracks().length);
+}
+
+function updateSoundBanner() {
+    const blocked = Array.from(peers.values()).some(p => isAudioBlocked(p.audioEl));
+    if (!blocked) soundBanner.classList.remove('show');
+}
+
+function retryRemotePlayback(why) {
+    for (const peer of peers.values()) {
+        if (isAudioBlocked(peer.audioEl)) playRemoteAudio(peer.audioEl, why);
+        if (peer.videoEl?.paused && peer.videoEl.srcObject) peer.videoEl.play().catch(() => {});
+    }
+    if (remoteCameraVideo.paused && remoteCameraVideo.srcObject) remoteCameraVideo.play().catch(() => {});
+    updateSoundBanner();
+}
+
+function onRemoteAudioPaused(el) {
+    if (el.dataset.owned !== '1' || !el.srcObject) return;
+    logEvent('audio-paused', { hidden: document.hidden });
+    // Hidden pages can't resume; the visibilitychange handler retries on return.
+    if (document.hidden) return;
+    clearTimeout(el._resumeTimer);
+    el._resumeTimer = setTimeout(() => {
+        if (el.dataset.owned === '1' && isAudioBlocked(el)) playRemoteAudio(el, 'resume-after-pause');
+    }, 500);
+}
+
+function onUserGesture() {
+    if (!call.classList.contains('active')) return;
+    primeRemoteAudio();
+    retryRemotePlayback('gesture');
+}
+for (const type of ['touchend', 'click', 'keydown']) {
+    document.addEventListener(type, onUserGesture, true);
+}
+
+// ─── Local capture resilience (iPadOS interruptions) ──────
+// iPadOS mutes capture tracks while Safari is backgrounded or interrupted, and
+// can end them outright (FaceTime/phone call, another app taking the mic).
+// track.stop() never fires 'ended', so an 'ended' event is always the system.
+const AUDIO_CONSTRAINTS = { echoCancellation: true, noiseSuppression: true };
+let micRecovering = false;
+
+// The live mic track, whichever stream owns it: micStream when the camera is
+// off, otherwise the camera+mic localStream from previewCamera().
+function currentMicTrack() {
+    return (micStream && micStream.getAudioTracks()[0]) ||
+        (localStream && localStream.getAudioTracks()[0]) || null;
+}
+
+function watchLocalTrack(track) {
+    if (!track || track._vidlyWatched) return;
+    track._vidlyWatched = true;
+    track.addEventListener('mute', () => logEvent('local-mute', { kind: track.kind, hidden: document.hidden }));
+    track.addEventListener('unmute', () => logEvent('local-unmute', { kind: track.kind }));
+    track.addEventListener('ended', () => {
+        logEvent('local-ended', { kind: track.kind, hidden: document.hidden });
+        if (track.kind === 'audio') {
+            if (micEnabled && currentMicTrack() === track) recoverMic('ended');
+        } else if (camEnabled && cameraStream && cameraStream.getVideoTracks()[0] === track && !previewStream) {
+            turnCameraOff();
+            toast('Camera was stopped by the system — tap 📷 to turn it back on', 'warn');
+        }
+    });
+}
+
+// Publish a (new) mic track to every peer's audio sender — or into the
+// screen-share mixer, which owns the sender while sharing.
+function publishAudioTrack(track, stream) {
+    if (audioMixer) {
+        setMixerMicTrack(track);
+        return;
+    }
+    for (const peer of peers.values()) {
+        const sender = findSenderByKind(peer.pc, 'audio');
+        if (sender) {
+            try { sender.replaceTrack(track); } catch {}
+        } else if (track) {
+            try { peer.pc.addTrack(track, stream); } catch {}
+        }
+    }
+}
+
+function setMicButtonOff() {
+    micEnabled = false;
+    $('micBtn').classList.add('muted');
+    $('micBtn').textContent = '🔇';
+}
+
+async function recoverMic(reason) {
+    if (!micEnabled || micRecovering) return;
+    // Capture can't restart in the background; visibilitychange retries.
+    if (document.hidden) { logEvent('mic-recover-deferred', { reason }); return; }
+    micRecovering = true;
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
+        const track = stream.getAudioTracks()[0];
+        if (!micEnabled) { stream.getTracks().forEach(t => t.stop()); return; } // turned off meanwhile
+        let owner;
+        if (micStream || !localStream) {
+            if (micStream) micStream.getTracks().forEach(t => t.stop());
+            micStream = owner = stream;
+        } else {
+            for (const old of localStream.getAudioTracks()) {
+                localStream.removeTrack(old);
+                try { old.stop(); } catch {}
+            }
+            localStream.addTrack(track);
+            owner = localStream;
+        }
+        watchLocalTrack(track);
+        publishAudioTrack(track, owner);
+        logEvent('mic-recovered', { reason });
+        toast('Microphone reconnected', 'success');
+    } catch (err) {
+        logEvent('mic-recover-failed', { reason, err: err.name });
+        setMicButtonOff();
+        toast('Microphone was interrupted — tap 🎙️ to turn it back on', 'warn');
+        broadcastLocalMediaState();
+    } finally {
+        micRecovering = false;
+    }
+}
+
+// Back in the foreground: iPadOS normally unmutes capture by itself; if the
+// mic is still muted or ended shortly after, replace it.
+function checkMicAfterResume() {
+    const t = currentMicTrack();
+    if (!micEnabled || !t) return;
+    if (t.readyState === 'ended') recoverMic('ended-after-resume');
+    else if (t.muted) recoverMic('muted-after-resume');
+}
+
+// ─── Encoder tuning (weak-network) ────────────────────────
+// Video bitrate caps keep audio from being starved on a weak link, and audio
+// gets top send priority where the browser supports it. H.264 is preferred on
+// every video transceiver because Apple devices encode it in hardware (VP8 is
+// software there); both sides apply the same order, so the codec no longer
+// depends on who sends the offer.
+const CAMERA_MAX_BITRATE = 800_000;
+const SCREEN_MAX_BITRATE = 1_500_000;
+let h264FirstCodecs; // computed lazily; null = no H.264 / API unsupported
+
+// Serialized per peer: overlapping get/setParameters pairs fail with a stale
+// transaction, so a second request while one runs just schedules a re-run.
+async function applySenderLimits(peer) {
+    if (peer.limitsBusy) { peer.limitsAgain = true; return; }
+    peer.limitsBusy = true;
+    try {
+        await applySenderLimitsOnce(peer);
+    } finally {
+        peer.limitsBusy = false;
+        if (peer.limitsAgain) {
+            peer.limitsAgain = false;
+            applySenderLimits(peer);
+        }
+    }
+}
+
+async function applySenderLimitsOnce(peer) {
+    for (const sender of peer.pc.getSenders()) {
+        const kind = sender.track?.kind;
+        if (!kind || sender._vidlyNoParams || typeof sender.getParameters !== 'function') continue;
+        const params = sender.getParameters();
+        const enc = params.encodings && params.encodings[0];
+        if (!enc) continue; // not negotiated yet
+        let changed = false;
+        if (kind === 'video') {
+            const max = sender === peer.screenSender ? SCREEN_MAX_BITRATE : CAMERA_MAX_BITRATE;
+            if (enc.maxBitrate !== max) { enc.maxBitrate = max; changed = true; }
+        } else if (enc.priority !== 'high' || enc.networkPriority !== 'high') {
+            enc.priority = 'high';
+            enc.networkPriority = 'high';
+            changed = true;
+        }
+        if (!changed) continue;
+        try {
+            await sender.setParameters(params);
+        } catch (e) {
+            // Audio priority unsupported (older Safari) won't start working —
+            // stop retrying it. Video failures are retried next negotiation.
+            if (kind === 'audio') sender._vidlyNoParams = true;
+            logEvent('set-params-failed', { kind, err: e.name });
+        }
+    }
+}
+
+function preferH264(pc) {
+    if (h264FirstCodecs === undefined) {
+        h264FirstCodecs = null;
+        const caps = window.RTCRtpReceiver?.getCapabilities?.('video');
+        const isH264 = (c) => /^video\/h264$/i.test(c.mimeType);
+        if (caps && caps.codecs.some(isH264)) {
+            h264FirstCodecs = [...caps.codecs.filter(isH264), ...caps.codecs.filter(c => !isH264(c))];
+        }
+    }
+    if (!h264FirstCodecs) return;
+    for (const t of pc.getTransceivers()) {
+        if (t.currentDirection === 'stopped' || typeof t.setCodecPreferences !== 'function') continue;
+        if (t.receiver?.track?.kind !== 'video') continue;
+        try { t.setCodecPreferences(h264FirstCodecs); } catch {}
+    }
+}
+
+// ─── Stuck-offer watchdog (decisions/003) ─────────────────
+// An offer that dies in a silently-dead WebSocket strands us in
+// have-local-offer; as the impolite side we would then ignore every incoming
+// offer forever (and restartPeerIce would keep rescheduling). After 10s roll
+// back to stable and re-offer. Cancelled by any successful setRemoteDescription.
+const OFFER_TIMEOUT_MS = 10000;
+
+function scheduleOfferTimeout(peer) {
+    cancelOfferTimeout(peer);
+    peer.offerTimer = setTimeout(async () => {
+        peer.offerTimer = null;
+        if (peers.get(peer.id) !== peer || peer.pc.signalingState !== 'have-local-offer') return;
+        console.warn('[WebRTC] offer unanswered for', OFFER_TIMEOUT_MS, 'ms — rolling back and re-offering');
+        logEvent('offer-timeout', { peer: peer.id.slice(0, 8) });
+        try {
+            await peer.pc.setLocalDescription({ type: 'rollback' });
+        } catch (e) {
+            console.warn('[WebRTC] rollback failed', e);
+            return;
+        }
+        const ice = peer.pc.iceConnectionState;
+        if (ice === 'failed' || ice === 'disconnected') restartPeerIce(peer, 'offer timeout');
+        else negotiatePeer(peer, 'offer timeout');
+    }, OFFER_TIMEOUT_MS);
+}
+
+function cancelOfferTimeout(peer) {
+    if (!peer?.offerTimer) return;
+    clearTimeout(peer.offerTimer);
+    peer.offerTimer = null;
+}
+
 // ─── Routing ──────────────────────────────────────────────
 function route() {
     const m = location.pathname.match(/^\/room\/([A-Za-z0-9_-]+)$/);
@@ -976,13 +1446,20 @@ async function showCall() {
     await initLocalMedia();
     connectWebSocket();
     startStallMonitor();
+    startStatsSampler();
+    logEvent('call-start', { ua: navigator.userAgent });
     // Acquire wake lock to prevent screen sleep during call
     try {
         if ('wakeLock' in navigator) {
             wakeLock = await navigator.wakeLock.request('screen');
             wakeLock.addEventListener('release', () => { wakeLock = null; });
+            logEvent('wakelock', { ok: true });
+        } else {
+            logEvent('wakelock', { ok: false, err: 'unsupported' });
         }
-    } catch {}
+    } catch (err) {
+        logEvent('wakelock', { ok: false, err: err.name });
+    }
 }
 
 // ─── Landing handlers ─────────────────────────────────────
@@ -997,6 +1474,7 @@ function randomRoomId(n = 8) {
 $('createBtn').onclick = () => {
     const name = $('usernameInput').value.trim();
     if (!name) { toast('Please enter your name', 'warn'); $('usernameInput').focus(); return; }
+    primeRemoteAudio();
     myUsername = name;
     localStorage.setItem('vidly-username', name);
     const id = randomRoomId();
@@ -1012,6 +1490,7 @@ $('joinBtn').onclick = () => {
     localStorage.setItem('vidly-username', name);
     const v = $('joinCode').value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
     if (!v) { toast('Enter a room code', 'warn'); return; }
+    primeRemoteAudio();
     localStorage.setItem('vidly-room', v);
     history.pushState({}, '', '/room/' + v);
     roomId = v;
@@ -1024,16 +1503,20 @@ window.addEventListener('popstate', () => location.reload());
 async function loadConfig() {
     try {
         const cfg = await (await fetch('/turn-credentials', { cache: 'no-store' })).json();
-        if (cfg.urls && cfg.username && cfg.credential) {
+        // New format: Cloudflare passthrough { iceServers: [...] }
+        // Legacy format: { urls, username, credential }
+        let turnServers = null;
+        if (Array.isArray(cfg.iceServers) && cfg.iceServers.length) {
+            turnServers = cfg.iceServers;
+        } else if (cfg.urls && cfg.username && cfg.credential) {
+            turnServers = [{ urls: cfg.urls, username: cfg.username, credential: cfg.credential }];
+        }
+        if (turnServers) {
             iceServers = iceServers.filter(server => {
                 const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
-                return !urls.some(url => typeof url === 'string' && url.startsWith('turn:'));
+                return !urls.some(url => typeof url === 'string' && /^turns?:/.test(url));
             });
-            iceServers.push({
-                urls: cfg.urls,
-                username: cfg.username,
-                credential: cfg.credential
-            });
+            iceServers.push(...turnServers);
         }
     } catch (e) {
         console.warn('Failed to fetch /turn-credentials', e);
@@ -1335,14 +1818,16 @@ async function previewCamera() {
             micStream.getTracks().forEach(t => t.stop());
             micStream = null;
         }
+        // 720p, not 1080p: on a weak link the encoder can't use 1080p anyway,
+        // and capturing/scaling it costs CPU (and heat) on tablets and phones.
         previewStream = await navigator.mediaDevices.getUserMedia({
             video: {
                 facingMode: facingMode,
-                width: { ideal: 1920 },
-                height: { ideal: 1080 },
-                frameRate: { ideal: 30 }
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+                frameRate: { ideal: 24, max: 30 }
             },
-            audio: { echoCancellation: true, noiseSuppression: true }
+            audio: AUDIO_CONSTRAINTS
         });
         // Show preview in local video
         localVideo.srcObject = previewStream;
@@ -1369,10 +1854,14 @@ function confirmCamera() {
     previewBtns.classList.remove('active');
     if (!previewStream) return;
 
-    // Promote preview to live
+    // Promote preview to live. A previous camera+mic stream still holds a live
+    // mic track (camera off only stops video) — stop it once the senders move
+    // to the new track below, or iOS keeps a second capture open.
+    const replacedStream = localStream !== previewStream ? localStream : null;
     cameraStream = previewStream;
     localStream = previewStream;
     previewStream = null;
+    localStream.getTracks().forEach(watchLocalTrack);
     camEnabled = true;
     micEnabled = true;
 
@@ -1409,6 +1898,7 @@ function confirmCamera() {
             }
         }
     }
+    if (replacedStream) replacedStream.getTracks().forEach(t => t.stop());
 
     toast('Camera and mic are now on', 'success');
     broadcastLocalMediaState();
@@ -1424,31 +1914,15 @@ async function cancelCamera() {
 
     // previewCamera() stopped the audio-only micStream to free the mic device.
     // If the mic was on before previewing, re-acquire it so peers keep hearing us.
-    if (micEnabled && !micStream) {
+    if (micEnabled && !getActiveAudioTrack()) {
         try {
-            micStream = await navigator.mediaDevices.getUserMedia({
-                audio: { echoCancellation: true, noiseSuppression: true }
-            });
+            micStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
             const audioTrack = micStream.getAudioTracks()[0];
-            if (audioMixer) {
-                // Mixer owns the sender's track during screen share — feed mic
-                // back into the mix instead of replacing the sender.
-                setMixerMicTrack(audioTrack);
-            } else {
-                for (const peer of peers.values()) {
-                    const sender = findSenderByKind(peer.pc, 'audio');
-                    if (sender) {
-                        try { sender.replaceTrack(audioTrack); } catch {}
-                    } else if (audioTrack) {
-                        try { peer.pc.addTrack(audioTrack, micStream); } catch {}
-                    }
-                }
-            }
+            watchLocalTrack(audioTrack);
+            publishAudioTrack(audioTrack, micStream);
         } catch (err) {
             console.error('[WebRTC] failed to restore mic after cancel', err);
-            micEnabled = false;
-            $('micBtn').classList.add('muted');
-            $('micBtn').textContent = '🔇';
+            setMicButtonOff();
             toast('Microphone was released and could not be restored', 'warn');
         }
     }
@@ -1655,6 +2129,7 @@ function connectWebSocket() {
     setWsDot('connecting');
 
     ws.onopen = () => {
+        logEvent('ws-open');
         wsBackoff = 1000;
         lastWsMessageAt = Date.now();
         setWsDot('connected');
@@ -1668,7 +2143,8 @@ function connectWebSocket() {
         handleSignaling(msg);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (e) => {
+        logEvent('ws-close', { code: e.code, hidden: document.hidden });
         setWsDot('failed');
         stopWsHeartbeat();
         if (intentionalClose) return;
@@ -1721,6 +2197,9 @@ function sendWs(obj) {
 }
 
 function handleSignaling(msg) {
+    if (msg.type !== 'signal' && msg.type !== 'pong') {
+        logEvent('sig-' + msg.type, { peer: msg.peerId?.slice(0, 8), resumed: msg.resumed });
+    }
     switch (msg.type) {
         case 'pong':
             lastWsMessageAt = Date.now();
@@ -1733,17 +2212,16 @@ function handleSignaling(msg) {
             break;
 
         case 'joined':
-            if (!msg.resumed && peers.size > 0) {
-                for (const [id] of peers) removePeer(id);
-            }
+            // decisions/001: every (re)join starts a new signaling session.
+            // Close every PeerConnection from the previous one — resumed or
+            // not — because the server has told the others we left/resumed and
+            // they are rebuilding too. A stale PC can never negotiate with a
+            // fresh one (old DTLS/ICE/SCTP state), and the server's peer list
+            // is authoritative (reaps zombies after a server restart).
+            for (const id of Array.from(peers.keys())) removePeer(id);
             if (msg.peerId) myPeerId = msg.peerId;
             // We are the joining peer — we initiate offers to existing peers.
             // Joining peer is "impolite" to avoid glare with simultaneous offers.
-            // Reconcile: remove any stale peers not in server's list.
-            const liveIds = new Set(msg.peers.map(p => p.peerId));
-            for (const [id] of peers) {
-                if (!liveIds.has(id)) removePeer(id);
-            }
             for (const p of msg.peers) {
                 const peer = ensurePeer(p.peerId, /*polite*/ false, /*createDC*/ true, p.username);
                 negotiatePeer(peer, 'joined existing peer');
@@ -1762,21 +2240,21 @@ function handleSignaling(msg) {
                     }
                 }
             }
+            // Same id still held = its previous session died without a
+            // peer-left reaching us. Rebuild (decisions/001) — the server
+            // sends this before relaying the joiner's offer, so nothing is lost.
+            removePeer(msg.peerId);
             ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false, msg.username);
             toast((msg.username || 'Someone') + ' joined the call', 'success');
             updateEmptyState();
             break;
 
         case 'peer-resumed':
-            // Same page-session reconnect: keep the existing WebRTC/DataChannel
-            // alive. Hard refreshes are announced as peer-left + peer-joined so
-            // both sides rebuild stale peer connections only when needed.
-            if (peers.has(msg.peerId)) {
-                const peer = peers.get(msg.peerId);
-                if (msg.username) peer.username = msg.username;
-            } else {
-                ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false, msg.username);
-            }
+            // The peer reconnected its socket and, on 'joined', closes all its
+            // PCs and offers from fresh ones. Rebuild ours to match
+            // (decisions/001) — keeping it would pair a stale PC with a fresh one.
+            removePeer(msg.peerId);
+            ensurePeer(msg.peerId, /*polite*/ true, /*createDC*/ false, msg.username);
             updateEmptyState();
             break;
 
@@ -1810,7 +2288,8 @@ function ensurePeer(peerId, polite, createDC, username) {
     const pc = new RTCPeerConnection({ iceServers });
     const remoteStream = new MediaStream();
     const remoteAudioStream = new MediaStream();
-    const { tileEl, videoEl, audioEl, dot } = createTile(peerId, username);
+    const { tileEl, videoEl, dot } = createTile(peerId, username);
+    const audioEl = acquireRemoteAudioEl();
     videoEl.srcObject = remoteStream;
     audioEl.srcObject = remoteAudioStream;
 
@@ -1820,6 +2299,8 @@ function ensurePeer(peerId, polite, createDC, username) {
         makingOffer: false, ignoreOffer: false,
         cameraSender: null, screenSender: null,
         iceRestartTimer: null,
+        offerTimer: null,
+        statsPrev: null,
         videoEl, audioEl, tileEl, remoteStream, remoteAudioStream, remoteCameraStream: null, dot,
         username: username || null,
         lastVideoFrameTime: null,
@@ -1899,7 +2380,7 @@ function ensurePeer(peerId, polite, createDC, username) {
                 peer.remoteAudioStream.addTrack(track);
             }
             audioEl.srcObject = peer.remoteAudioStream;
-            audioEl.play().catch(() => {});
+            playRemoteAudio(audioEl, 'ontrack');
         }
 
         if (track.kind === 'video') {
@@ -1950,6 +2431,7 @@ function ensurePeer(peerId, polite, createDC, username) {
     // Update connection-status dot in the tile label.
     pc.onconnectionstatechange = () => {
         const s = pc.connectionState;
+        logEvent('pc-state', { peer: peerId.slice(0, 8), state: s });
         if (s === 'connected') {
             dot.className = 'status-dot connected';
         } else if (s === 'connecting' || s === 'new') {
@@ -1964,6 +2446,7 @@ function ensurePeer(peerId, polite, createDC, username) {
     // network changes, so only restart if it persists long enough to matter.
     pc.oniceconnectionstatechange = async () => {
         const state = pc.iceConnectionState;
+        logEvent('ice-state', { peer: peerId.slice(0, 8), state });
         if (state === 'failed') {
             restartPeerIce(peer, 'failed');
         } else if (state === 'disconnected') {
@@ -1981,6 +2464,12 @@ function ensurePeer(peerId, polite, createDC, username) {
      */
     pc.onnegotiationneeded = async () => {
         negotiatePeer(peer, 'negotiationneeded');
+    };
+
+    // Encodings only exist once negotiated; (re)apply bitrate caps and audio
+    // priority each time a negotiation settles (covers newly added senders).
+    pc.onsignalingstatechange = () => {
+        if (pc.signalingState === 'stable') applySenderLimits(peer);
     };
 
     // DataChannel — created by the offerer (joining peer), received by answerer.
@@ -2014,7 +2503,9 @@ async function onPeerSignal(fromId, payload) {
             if (peer.ignoreOffer) return;
 
             await pc.setRemoteDescription(desc);
+            cancelOfferTimeout(peer); // negotiation is moving (decisions/003)
             if (desc.type === 'offer') {
+                preferH264(pc);
                 await pc.setLocalDescription();
                 sendSignal(fromId, { description: pc.localDescription });
             }
@@ -2038,8 +2529,10 @@ async function negotiatePeer(peer, reason) {
     if (!peer || peer.makingOffer || peer.pc.signalingState !== 'stable') return;
     try {
         peer.makingOffer = true;
+        preferH264(peer.pc);
         await peer.pc.setLocalDescription();
         sendSignal(peer.id, { description: peer.pc.localDescription });
+        scheduleOfferTimeout(peer);
     } catch (err) {
         console.error('negotiation failed:', reason, err);
     } finally {
@@ -2201,11 +2694,14 @@ async function restartPeerIce(peer, reason) {
         return;
     }
     console.warn('[WebRTC] ICE', reason, '- restarting');
+    logEvent('ice-restart', { peer: peer.id.slice(0, 8), reason });
     try { pc.restartIce(); } catch {}
     try {
         peer.makingOffer = true;
+        preferH264(pc);
         await pc.setLocalDescription();
         sendSignal(peer.id, { description: pc.localDescription });
+        scheduleOfferTimeout(peer);
     } catch (e) {
         console.warn('[WebRTC] ICE restart negotiation failed', e);
     } finally {
@@ -2217,6 +2713,7 @@ function removePeer(peerId) {
     const peer = peers.get(peerId);
     if (!peer) return;
     cancelPeerIceRestart(peer);
+    cancelOfferTimeout(peer);
     for (const [fileId, transfer] of incomingFiles) {
         if (transfer.peer === peer) incomingFiles.delete(fileId);
     }
@@ -2226,14 +2723,12 @@ function removePeer(peerId) {
     }
     if (activeRemoteCameraPeerId === peerId) clearRemoteCameraVideo(peer);
     hideStallOverlay(peer.tileEl);
-    if (peer.audioEl) {
-        try { peer.audioEl.pause(); } catch {}
-        peer.audioEl.srcObject = null;
-    }
+    releaseRemoteAudioEl(peer.audioEl);
     try { peer.pc.close(); } catch {}
     if (peer.tileEl && peer.tileEl.parentNode) peer.tileEl.parentNode.removeChild(peer.tileEl);
     peers.delete(peerId);
     layoutGrid();
+    updateSoundBanner();
 }
 
 function sendDataMessage(msg) {
@@ -2261,16 +2756,14 @@ function createTile(peerId, username) {
     tile.className = 'tile placeholder';
     tile.dataset.peerId = peerId;
 
+    // Remote audio plays through a pooled <audio> (see acquireRemoteAudioEl);
+    // this element only ever carries video, so mute it — muted media is always
+    // allowed to autoplay on Safari.
     const video = document.createElement('video');
     video.autoplay = true;
     video.playsInline = true;
+    video.muted = true;
     tile.appendChild(video);
-
-    const audio = document.createElement('audio');
-    audio.className = 'remote-audio';
-    audio.autoplay = true;
-    audio.playsInline = true;
-    tile.appendChild(audio);
 
     const label = document.createElement('div');
     label.className = 'tile-label';
@@ -2284,7 +2777,7 @@ function createTile(peerId, username) {
 
     grid.appendChild(tile);
     layoutGrid();
-    return { tileEl: tile, videoEl: video, audioEl: audio, dot };
+    return { tileEl: tile, videoEl: video, dot };
 }
 
 function layoutGrid() {
@@ -3268,25 +3761,11 @@ $('micBtn').onclick = async () => {
         // Turn mic on — camera is off, so request audio-only stream
         if (!camEnabled) {
             try {
-                micStream = await navigator.mediaDevices.getUserMedia({
-                    audio: { echoCancellation: true, noiseSuppression: true }
-                });
+                micStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
                 micEnabled = true;
                 const audioTrack = micStream.getAudioTracks()[0];
-                if (audioMixer) {
-                    // Mixer owns the sender's track during screen share.
-                    // Add the new mic into the mix; do NOT replace the sender's track.
-                    setMixerMicTrack(audioTrack);
-                } else {
-                    for (const peer of peers.values()) {
-                        const sender = findSenderByKind(peer.pc, 'audio');
-                        if (sender) {
-                            try { sender.replaceTrack(audioTrack); } catch {}
-                        } else if (audioTrack) {
-                            try { peer.pc.addTrack(audioTrack, micStream); } catch {}
-                        }
-                    }
-                }
+                watchLocalTrack(audioTrack);
+                publishAudioTrack(audioTrack, micStream);
             } catch (err) {
                 console.error('[WebRTC] mic getUserMedia failed', err);
                 toast('Could not access microphone: ' + (err.message || err.name), 'error');
@@ -3309,30 +3788,23 @@ $('micBtn').onclick = async () => {
     }
     broadcastLocalMediaState();
 };
-$('camBtn').onclick = () => {
-    if (!camEnabled) {
-        previewCamera();
-    } else {
-        // Turn camera off
-        camEnabled = false;
-        // Stop camera tracks
-        if (cameraStream && cameraStream !== localStream) {
-            // cameraStream is separate from localStream only in edge cases
-        }
-        if (localStream) localStream.getVideoTracks().forEach(t => t.stop());
-        // Stop sending video without renegotiating.
-        for (const peer of peers.values()) {
-            if (peer.cameraSender) try { peer.cameraSender.replaceTrack(null); } catch {}
-        }
-        // Keep audio if mic is on
-        if (micEnabled && micStream) {
-            // micStream has the audio; it's already published
-        }
-        hideLocalVideoTile();
-        $('camBtn').classList.add('muted');
-        $('camBtn').textContent = '📵';
-        broadcastLocalMediaState();
+function turnCameraOff() {
+    camEnabled = false;
+    // Stop camera tracks; the mic track in localStream stays live if mic is on.
+    if (localStream) localStream.getVideoTracks().forEach(t => t.stop());
+    // Stop sending video without renegotiating.
+    for (const peer of peers.values()) {
+        if (peer.cameraSender) try { peer.cameraSender.replaceTrack(null); } catch {}
     }
+    hideLocalVideoTile();
+    $('camBtn').classList.add('muted');
+    $('camBtn').textContent = '📵';
+    broadcastLocalMediaState();
+}
+
+$('camBtn').onclick = () => {
+    if (!camEnabled) previewCamera();
+    else turnCameraOff();
 };
 
 $('camOnBtn').onclick = previewCamera;
@@ -3495,6 +3967,12 @@ $('leaveBtn').onclick = leaveCall;
 
 function leaveCall() {
     intentionalClose = true;
+    logEvent('leave');
+    stopStatsSampler();
+    if (!callReportSent) {
+        callReportSent = true;
+        sendCallReport('leave', { keepalive: true });
+    }
     stopWsHeartbeat();
     stopStallMonitor();
     if (screenTrackCheck) { clearInterval(screenTrackCheck); screenTrackCheck = null; }
@@ -3520,10 +3998,23 @@ window.addEventListener('beforeunload', () => {
     if (ws) try { ws.close(); } catch {}
 });
 
+// Safari on iOS doesn't reliably fire beforeunload; pagehide covers tab
+// close / navigation away mid-call.
+window.addEventListener('pagehide', () => {
+    if (!roomId || callReportSent || !call.classList.contains('active')) return;
+    callReportSent = true;
+    logEvent('pagehide');
+    sendCallReport('pagehide', { keepalive: true });
+});
+
 // Re-acquire wake lock when page becomes visible (browser may release it)
 document.addEventListener('visibilitychange', async () => {
+    logEvent('visibility', { state: document.visibilityState });
     if (document.visibilityState === 'visible') {
         checkWebSocketHealth();
+        // iPadOS pauses media / mutes capture while Safari is in the background.
+        retryRemotePlayback('visible');
+        setTimeout(checkMicAfterResume, 1500);
     }
     if (document.visibilityState === 'visible' && roomId && !wakeLock) {
         try {
@@ -3561,6 +4052,13 @@ $('chat').addEventListener('click', (e) => {
         toggleChat();
     }
 });
+
+// ─── Report problem ───────────────────────────────────────
+$('reportBtn').onclick = async () => {
+    logEvent('user-report');
+    const ok = await sendCallReport('user');
+    toast(ok ? 'Report sent — thanks' : 'Could not send the report', ok ? 'success' : 'error');
+};
 
 // ─── Copy invite link ─────────────────────────────────────
 $('copyLink').onclick = async () => {
