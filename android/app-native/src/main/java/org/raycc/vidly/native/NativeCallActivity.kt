@@ -2887,7 +2887,7 @@ class NativeCallActivity : Activity(),
             type == AudioDeviceInfo.TYPE_USB_DEVICE
     }
 
-    private data class TurnServerInfo(val urls: String, val username: String, val credential: String)
+    private data class TurnServerInfo(val urls: List<String>, val username: String, val credential: String)
 
     private fun fetchTurnServersSync(): List<TurnServerInfo> {
         return try {
@@ -2896,19 +2896,30 @@ class NativeCallActivity : Activity(),
             resp.use {
                 if (!it.isSuccessful) return emptyList()
                 val json = JSONObject(it.body?.string().orEmpty())
-                val rawUrls = json.opt("urls")
-                val urls = when (rawUrls) {
-                    is JSONArray -> rawUrls
-                    is String -> JSONArray().put(rawUrls)
-                    else -> return emptyList()
-                }
-                val username = json.optString("username")
-                val credential = json.optString("credential")
-                if (username.isBlank() || credential.isBlank()) return emptyList()
                 val result = mutableListOf<TurnServerInfo>()
-                for (i in 0 until urls.length()) {
-                    val url = urls.optString(i, "").trim()
-                    if (url.isNotBlank()) result.add(TurnServerInfo(url, username, credential))
+
+                fun addEntry(urlsObj: Any?, username: String, credential: String) {
+                    if (username.isBlank() || credential.isBlank()) return
+                    val urlList = mutableListOf<String>()
+                    when (urlsObj) {
+                        is JSONArray -> for (i in 0 until urlsObj.length()) {
+                            urlsObj.optString(i, "").trim().takeIf(String::isNotBlank)?.let(urlList::add)
+                        }
+                        is String -> urlsObj.trim().takeIf(String::isNotBlank)?.let(urlList::add)
+                    }
+                    if (urlList.isNotEmpty()) result.add(TurnServerInfo(urlList, username, credential))
+                }
+
+                // New format: Cloudflare passthrough { iceServers: [...] }
+                val iceServersArr = json.optJSONArray("iceServers")
+                if (iceServersArr != null && iceServersArr.length() > 0) {
+                    for (i in 0 until iceServersArr.length()) {
+                        val entry = iceServersArr.optJSONObject(i) ?: continue
+                        addEntry(entry.opt("urls"), entry.optString("username"), entry.optString("credential"))
+                    }
+                } else {
+                    // Legacy format: { urls, username, credential }
+                    addEntry(json.opt("urls"), json.optString("username"), json.optString("credential"))
                 }
                 result
             }

@@ -191,6 +191,17 @@ class NativeWebRtcClient(
             .createIceServer()
     }
 
+    // Cloudflare returns one IceServer entry with several urls sharing the
+    // same username/credential — add them all as one RTCConfiguration entry.
+    fun addTurnServer(urls: List<String>, username: String?, credential: String?) {
+        val clean = urls.filter { it.isNotBlank() }
+        if (clean.isEmpty()) return
+        iceServers += PeerConnection.IceServer.builder(clean)
+            .setUsername(username.orEmpty())
+            .setPassword(credential.orEmpty())
+            .createIceServer()
+    }
+
     fun onJoined(existingPeers: List<NativeSignalingClient.PeerInfo>) {
         status("Joined. Peers: ${existingPeers.size}")
         // A (re)join starts a fresh signaling session. The server announced us

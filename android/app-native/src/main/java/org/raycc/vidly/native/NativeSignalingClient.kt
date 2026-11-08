@@ -182,7 +182,7 @@ class NativeSignalingClient(
     }
 
     companion object {
-        const val SIGNALING_URL = "wss://voice.raycc.org"
+        const val SIGNALING_URL = "wss://voice.raycc.org/ws"
         private const val PREFS_NAME = "vidly_prefs"
         private const val KEY_CLIENT_ID = "client_id"
         private const val INITIAL_RECONNECT_MS = 1_000L
