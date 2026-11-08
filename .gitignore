@@ -9,6 +9,7 @@ prompts
 android/.kotlin/
 public/vidly-native.apk
 crash-logs/
+call-reports/
 spikes/
 android-shell-prompt.md
 .qoder/
