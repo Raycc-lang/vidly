@@ -10,9 +10,12 @@ const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const TURN_SERVER_URL = process.env.TURN_SERVER_URL || 'turn:xray.raycc.org:3478';
-const TURN_SECRET = process.env.TURN_SECRET || 'TURN_SECRET_PLACEHOLDER';
-const TURN_CREDENTIAL_TTL_SECONDS = parseInt(process.env.TURN_CREDENTIAL_TTL_SECONDS || '3600', 10);
+// Cloudflare TURN (Calls/Realtime). Long-term key secret stays server-side;
+// /turn-credentials mints short-lived creds via the rtc.live API on each request.
+const TURN_KEY_ID = process.env.TURN_KEY_ID || '';
+const TURN_KEY_SECRET = process.env.TURN_KEY_SECRET || '';
+const TURN_CREDENTIAL_TTL_SECONDS = parseInt(process.env.TURN_CREDENTIAL_TTL_SECONDS || '86400', 10);
+const TURN_API_TIMEOUT_MS = parseInt(process.env.TURN_API_TIMEOUT_MS || '8000', 10);
 const ANDROID_VERSION_CODE = parseInt(process.env.ANDROID_VERSION_CODE || '1', 10);
 const ANDROID_VERSION_NAME = process.env.ANDROID_VERSION_NAME || '1.0';
 const ANDROID_APK_URL = process.env.ANDROID_APK_URL || 'https://voice.raycc.org/vidly-native.apk';
@@ -25,6 +28,8 @@ const GIPHY_TIMEOUT_MS = parseInt(process.env.GIPHY_TIMEOUT_MS || '8000', 10);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const CRASH_LOGS_DIR = path.join(__dirname, 'crash-logs');
 const CRASH_MAX_BYTES = 512 * 1024; // cap per report — keep the 1GB VPS safe
+// Web client call-quality reports (getStats samples + lifecycle events), POST /call-report.
+const CALL_REPORTS_DIR = path.join(__dirname, 'call-reports');
 const WS_REJOIN_GRACE_MS = parseInt(process.env.WS_REJOIN_GRACE_MS || '180000', 10);
 const WS_PING_INTERVAL_MS = parseInt(process.env.WS_PING_INTERVAL_MS || '25000', 10);
 
@@ -84,26 +89,55 @@ function sendFile(res, filePath, statusCode = 200) {
     });
 }
 
-function createTurnCredentials() {
+// Ask Cloudflare for short-lived TURN credentials and pass the full
+// { iceServers: [...] } payload straight through to clients (web + Android).
+// Failures return 503 so clients fall back to STUN-only.
+function sendTurnCredentials(res) {
+    if (!TURN_KEY_ID || !TURN_KEY_SECRET) {
+        res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'turn_not_configured' }));
+        return;
+    }
     const ttl = Number.isFinite(TURN_CREDENTIAL_TTL_SECONDS) && TURN_CREDENTIAL_TTL_SECONDS > 0
         ? TURN_CREDENTIAL_TTL_SECONDS
-        : 3600;
-    const expires = Math.floor(Date.now() / 1000) + ttl;
-    const username = `${expires}:vidly`;
-    const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
-    return {
-        urls: [TURN_SERVER_URL, TURN_SERVER_URL + "?transport=tcp"],
-        username,
-        credential,
-        ttl,
-        expires,
-    };
-}
-
-function sendTurnCredentials(res) {
-    const credentials = createTurnCredentials();
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify(credentials));
+        : 86400;
+    const body = JSON.stringify({ ttl });
+    const req = https.request({
+        hostname: 'rtc.live.cloudflare.com',
+        path: `/v1/turn/keys/${TURN_KEY_ID}/credentials/generate-ice-servers`,
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${TURN_KEY_SECRET}`,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: TURN_API_TIMEOUT_MS,
+    }, (upRes) => {
+        const chunks = [];
+        upRes.on('data', (c) => chunks.push(c));
+        upRes.on('end', () => {
+            const respBody = Buffer.concat(chunks);
+            if (upRes.statusCode < 200 || upRes.statusCode >= 300) {
+                console.error(`TURN credential mint failed: ${upRes.statusCode} ${respBody.toString('utf8').slice(0, 200)}`);
+                if (!res.headersSent) {
+                    res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+                    res.end(JSON.stringify({ error: 'turn_upstream_error' }));
+                }
+                return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+            res.end(respBody);
+        });
+    });
+    req.on('timeout', () => req.destroy(new Error('TURN API timeout')));
+    req.on('error', (err) => {
+        console.error('TURN API error:', err.message);
+        if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: 'turn_unreachable' }));
+        }
+    });
+    req.end(body);
 }
 
 // Proxy GIPHY trending/search. Clients behind networks that block api.giphy.com
@@ -140,7 +174,19 @@ function proxyGiphy(req, res) {
     });
 }
 
-function saveCrashReport(req, res) {
+const crashReportName = (report) => {
+    const model = String(report.deviceModel || 'unknown').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64);
+    return model;
+};
+const callReportName = (report) => {
+    const room = String(report.roomId || 'noroom').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32);
+    const reason = String(report.reason || 'report').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 24);
+    return `${room}_${reason}`;
+};
+
+// Shared by /crash (Android) and /call-report (web): size-capped JSON body →
+// <dir>/<timestamp>_<label>_<rand>.json
+function saveJsonReport(req, res, dir, labelOf) {
     let size = 0;
     const chunks = [];
     let aborted = false;
@@ -165,23 +211,27 @@ function saveCrashReport(req, res) {
             res.end('Invalid JSON');
             return;
         }
-        const ts = (report.timestamp || new Date().toISOString()).replace(/[:.]/g, '-');
-        const model = String(report.deviceModel || 'unknown').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64);
+        if (!report || typeof report !== 'object') {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('Invalid JSON');
+            return;
+        }
+        const ts = String(report.timestamp || new Date().toISOString()).replace(/[^0-9A-Za-z-]/g, '-').slice(0, 40);
         const rand = crypto.randomBytes(3).toString('hex');
-        const fileName = `${ts}_${model}_${rand}.json`;
-        fs.mkdir(CRASH_LOGS_DIR, { recursive: true }, (mkErr) => {
+        const fileName = `${ts}_${labelOf(report)}_${rand}.json`;
+        fs.mkdir(dir, { recursive: true }, (mkErr) => {
             if (mkErr) {
                 res.writeHead(500, { 'Content-Type': 'text/plain' });
                 res.end('Could not store crash report');
                 return;
             }
-            fs.writeFile(path.join(CRASH_LOGS_DIR, fileName), JSON.stringify(report, null, 2), (writeErr) => {
+            fs.writeFile(path.join(dir, fileName), JSON.stringify(report, null, 2), (writeErr) => {
                 if (writeErr) {
                     res.writeHead(500, { 'Content-Type': 'text/plain' });
                     res.end('Could not store crash report');
                     return;
                 }
-                console.log(`Crash report saved: ${fileName}`);
+                console.log(`Report saved: ${path.basename(dir)}/${fileName}`);
                 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
                 res.end(JSON.stringify({ ok: true }));
             });
@@ -205,7 +255,12 @@ const server = http.createServer((req, res) => {
     }
 
     if (urlPath === '/crash' && req.method === 'POST') {
-        saveCrashReport(req, res);
+        saveJsonReport(req, res, CRASH_LOGS_DIR, crashReportName);
+        return;
+    }
+
+    if (urlPath === '/call-report' && req.method === 'POST') {
+        saveJsonReport(req, res, CALL_REPORTS_DIR, callReportName);
         return;
     }
 
@@ -489,5 +544,5 @@ heartbeatTimer.unref?.();
 
 server.listen(PORT, () => {
     console.log(`Server listening on http://localhost:${PORT}`);
-    if (TURN_SERVER_URL && TURN_SECRET) console.log('TURN configured');
+    if (TURN_KEY_ID && TURN_KEY_SECRET) console.log('TURN configured (Cloudflare)');
 });
