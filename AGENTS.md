@@ -2,14 +2,18 @@
 
 ## What it is
 
-Vidly is a P2P WebRTC voice/video call app (native Android client + web client + tiny Node.js signaling server) built for **one specific job**: reliable voice calls with a friend abroad over a weak, unstable network. Everything unusual about this codebase — aggressive reconnection, TURN-first thinking, a watchdog for lost signaling messages — exists because of that weak-network constraint. Rooms technically hold up to 4 peers (mesh), but the app is designed, tested, and optimized as **1:1** (single remote video peer).
+Vidly is a P2P WebRTC voice/video call app (native Android client + web client + tiny Node.js signaling server) for **personal 1:1 voice and video calls**. Rooms technically hold up to 4 peers (mesh), but the app is designed, tested and optimized as **1:1** (single remote video peer).
+
+The real deployment it is tuned for: **Ray in mainland China calling a friend in the United States**, with the signaling server on a Los Angeles VPS. That makes it a **long-haul link**: ~145 ms China↔LA one-way-ish RTT on the Ray side plus ~1 ms LA↔US on the friend's side, and it crosses the GFW on Ray's leg. The unusual parts of this codebase — aggressive reconnection, a watchdog for lost signaling messages, TURN that is expected to be used rather than a rare fallback — exist because a long-haul NANOG-style path plus a censoring middlebox drops and stalls things that a LAN call would never notice.
+
+Do not assume a legacy assumption still holds: earlier versions of this app were tuned for a **Saudi user on a quota-metered mobile carrier**. That user is gone and that case is archived in `docs/historical/2026-01-saudi-carrier-saga.md` — read it for the generic lessons, not for the network model.
 
 ## How a call works, end to end
 
-1. **Join**: client opens a WebSocket to `wss://voice.raycc.org` (`NativeSignalingClient`), sends `join {roomId, username, clientId, pageSessionId}`. Before that it **synchronously** fetches TURN credentials from `/turn-credentials` (async fetch used to race peer arrival → ICE failed).
+1. **Join**: client opens a WebSocket to `wss://voice.raycc.org/ws` (`NativeSignalingClient` — the `/ws` path matters, nginx only upgrades there), sends `join {roomId, username, clientId, pageSessionId}`. Before that it **synchronously** fetches TURN credentials from `/turn-credentials` (async fetch used to race peer arrival → ICE failed).
 2. **Server** (`server.js`) replies `joined` with the existing peer list; existing peers get `peer-joined`.
 3. **Negotiation**: the joiner offers to each existing peer (it treats them as *impolite*; they treat the newcomer as *polite*). Offer/answer/ICE candidates relay through the server as `signal` messages. Perfect Negotiation handles glare (see decisions/004).
-4. **Media**: ICE connects (STUN, falling back to TURN on `turn:voice.raycc.org:3478` / TURNS 443). Tracks are added lazily via `addTrack` only when mic/camera/screen actually turn on — `onRenegotiationNeeded` drives the SDP updates.
+4. **Media**: ICE connects (STUN + Cloudflare Realtime TURN; on this long-haul link the call **usually** relays, see decisions/008). Tracks are added lazily via `addTrack` only when mic/camera/screen actually turn on — `onRenegotiationNeeded` drives the SDP updates.
 5. **Data**: two DataChannels per peer, created by the offerer: `chat` (JSON: chat messages, `media-state` role announcements, file-transfer control) and `file` (binary chunks).
 6. **Disconnection**: if a client's socket drops, the server announces `peer-left` immediately but keeps the slot for a **180s grace period** keyed by `clientId`. Rejoin within grace → `peer-resumed` (or `peer-joined` if the departure was announced); either way **both sides tear down and rebuild their PeerConnections** (decisions/001).
 
@@ -25,7 +29,7 @@ Each one is a decision record in `decisions/`; read it before touching the area.
 6. **Camera off→on keeps the same track and sender** — pause capture + disable track, don't dispose. Replacing the track would not re-fire `pc.onTrack` on the receiver and the remote video never resumes.
 7. **Audio routing pins the output in `onWebRtcAudioTrackStart`** (decisions/006), not on fixed delays. Set the WebRTC track's preferred device (reflection) **before** `setCommunicationDevice`. Pre-Android-12 Bluetooth is a known gap.
 8. **BeautyVideoProcessor** (decisions/005): GL state lives in per-generation `Gl` objects so the processor survives camera pipeline rebuilds. Every `eglMakeCurrent` must **save and restore** the thread's prior EGL binding — never unbind; unbinding corrupts the SurfaceTextureHelper thread.
-9. **TURN URLs**: pass the array (UDP + TCP variants). Fetch synchronously **before** `signaling.connect()`.
+9. **TURN URLs**: pass the array. Credentials come from `/turn-credentials` as a Cloudflare `{iceServers:[...]}` passthrough and must be fetched synchronously **before** `signaling.connect()`. The set already includes UDP, TCP/80 and TLS/443 fallbacks — do not prune them, the China leg needs them.
 
 ## Code map
 
@@ -81,7 +85,7 @@ The in-app **header status label** is the primary runtime observable (`Connected
 
 | Symptom | First place to look |
 |---|---|
-| Call never connects cross-network | `curl https://voice.raycc.org/turn-credentials`; coturn status on VPS |
+| Call never connects cross-network | `curl https://voice.raycc.org/turn-credentials` (503 = keys unset, 502 = Cloudflare error) |
 | Call dies after a network blip and never recovers | ICE observer + watchdog in `NativeWebRtcClient`; scenarios 1–3, 10 in test-protocol.md |
 | One side reconnects, other side frozen | Symmetric rebuild (decisions/001) — check `onJoined`/`onPeerJoined` teardown |
 | Remote camera never resumes after off→on | `onFirstPacketReceived` path (decisions/007); scenario 4 |
@@ -94,7 +98,8 @@ The in-app **header status label** is the primary runtime observable (`Connected
 
 - File transfers hold the whole file in RAM on both ends — no streaming to disk yet.
 - Pre-Android-12 Bluetooth audio is broken (no `startBluetoothSco`; A2DP mis-selected).
-- `/turn-credentials` is unauthenticated (anyone can mint TURN creds).
+- `/turn-credentials` is unauthenticated (anyone can mint TURN creds, i.e. burn the shared 1 TB/month Cloudflare allowance).
+- A relayed 1:1 call costs roughly 2× the media bitrate for the whole duration — check `call-reports/` sample `path` values before assuming direct P2P is happening.
 
 ## Project skills
 

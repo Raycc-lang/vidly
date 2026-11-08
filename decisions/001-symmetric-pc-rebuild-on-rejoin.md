@@ -25,9 +25,9 @@ This also reaps zombie peers after a signaling-server restart: the fresh `joined
 
 ## Trade-offs and failure modes
 
-- Every signaling reconnect causes a brief media gap (~1–3s of renegotiation) even when the P2P media path was healthy the whole time. For the target use case (weak network, where signaling and media usually die together) this is acceptable.
+- Every signaling reconnect causes a brief media gap (~1–3s of renegotiation) even when the P2P media path was healthy the whole time. For the target use case (a long-haul China↔US link where signaling and media usually die together — see 008) this is acceptable.
 - DataChannels (chat, file transfer) are torn down with the PC. In-flight file transfers abort; `activeIncomingByPeer` is cleaned on peer-left so a new transfer can start.
-- More offer traffic on flappy networks; bounded by the reconnect backoff (1s→10s).
+- More offer traffic on a flappy long-haul link; bounded by the reconnect backoff (1s→10s).
 
 ## Revisit if
 

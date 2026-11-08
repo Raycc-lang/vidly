@@ -12,7 +12,7 @@ A hands-on protocol for verifying Vidly's critical paths with two Android device
 - USB or Wi-Fi `adb` access to at least one device for log capture.
 - SSH access to the VPS (`ssh vm`) for server-side scenarios.
 - Wired headphones and a Bluetooth headset for scenario 6.
-- Put the two devices on **different networks** (one on Wi-Fi, one on mobile data) unless a scenario says otherwise — same-LAN calls hide TURN and NAT bugs.
+- Put the two devices on **different networks** unless a scenario says otherwise — same-LAN calls hide TURN and NAT bugs, and on this app's real deployment TURN is the normal path, not an exception (decisions/008). The realistic equivalent of production is **A on the mainland-China host / a Chinese mobile network, B on a US network**; when both devices are local, at least keep one on a different NAT (Wi-Fi vs. mobile data or a tethered hotspot).
 
 ## How to capture logs
 
@@ -62,7 +62,7 @@ A scenario "passes" only if **all** pass criteria hold and **no** fail criteria 
 
 **Tests:** the single observer-based ICE restart path (decisions/002).
 
-**Setup:** Baseline call, camera on both sides, A on mobile data.
+**Setup:** Baseline call, camera on both sides, A on a different network from B (mobile data or the China-side host — see above).
 
 **Steps:**
 1. On A, enable airplane mode.
@@ -113,7 +113,7 @@ A scenario "passes" only if **all** pass criteria hold and **no** fail criteria 
 
 **Tests:** server grace expiry and full re-join (`WS_REJOIN_GRACE_MS = 180s`).
 
-**Setup:** Baseline call, camera on, A on mobile data.
+**Setup:** Baseline call, camera on, A on a different network from B (mobile data or the China-side host).
 
 **Steps:**
 1. Enable airplane mode on A. Start a stopwatch.
@@ -285,7 +285,7 @@ Also verify: while A shares a **static** screen (no movement), B must **not** ge
 
 **Tests:** the 10 s rollback+re-offer (decisions/003).
 
-**Setup:** Baseline call, A on mobile data, camera off on both. The trick is to make A **lose an offer into a silently-dead socket**: kill the network and immediately force a renegotiation, before OkHttp's ping (20 s) notices the socket is dead.
+**Setup:** Baseline call, A on a lossy/different network, camera off on both. The trick is to make A **lose an offer into a silently-dead socket**: kill the network and immediately force a renegotiation, before OkHttp's ping (20 s) notices the socket is dead.
 
 **Steps:**
 1. On A: enable airplane mode and **within 1–2 s** toggle the camera **on** (camera on = `addTrack` → renegotiation → offer sent into the dead socket and lost).

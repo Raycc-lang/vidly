@@ -1,4 +1,27 @@
-# The Carrier That Only Speaks Cloudflare
+# 【历史案例】The Carrier That Only Speaks Cloudflare
+
+> **状态：已归档，不再是当前设计依据。**
+>
+> 本文记录的是 2026 年 1 月一次真实的排障过程。当时 Vidly 的对话对象是一位**沙特阿拉伯**的用户，
+> 她的运营商（STC/Mobily/Zain）按**国际流量配额**计费，并且对长连接流量做了模式识别。
+> **那个使用场景已经不存在了**：Vidly 现在主要服务于一位**美国**的朋友，链路是中国 ↔ 美国。
+>
+> **哪些内容仍然有效（通用经验）：**
+> - 区分「计费」与「封锁」——两者从外部看都是丢包，但解法完全不同
+> - 自己的域名能通 ⇒ 分类依据是 IP 段而非 SNI/主机名
+> - host candidate 落在 `100.64.0.0/10` (CGNAT) ⇒ 该端**必须**走 TURN，别再查信令
+> - 「同一主机的 HTTP 通、WebSocket 不通」⇒ 加密流量形态识别
+> - Durable Object 状态是全局的，Worker 内存是 per-PoP 的
+>
+> **哪些内容仅作历史参考（不要照抄）：**
+> - 沙特运营商的国际配额行为、`141.101.0.0/16` / `162.159.0.0/16` 被计费的结论
+> - 「Cloudflare 客户边缘 IP 免计费」这一前提
+> - 基于 CGNAT + 配额耗尽做出的任何路径决策
+>
+> 当前的网络假设与 TURN 选型见 `AGENTS.md` 与 `decisions/`。
+
+---
+
 
 A debugging story about trying to get a WebRTC calling app working behind a
 mobile carrier that bills international data aggressively — and what I
