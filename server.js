@@ -310,6 +310,15 @@ function send(ws, msg) {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
 
+// A seat is "live" while its occupant's departure has not been announced.
+// Seats in the rejoin grace period (socket closed, peer-left already sent,
+// leaveTimer pending) are kept only so the same clientId can resume them —
+// they must never be offered to joiners, counted toward the cap, block a
+// username, or receive relayed signals.
+function isLiveSeat(ws) {
+    return !!ws && !ws.leftAnnounced;
+}
+
 function leaveRoom(ws) {
     const { roomId, peerId } = ws;
     if (ws.leaveTimer) {
@@ -352,6 +361,7 @@ function announcePeerLeft(ws) {
         }
     }
     ws.leftAnnounced = true;
+    ws.leftAt = Date.now();
     unwatchRoom(ws);
 }
 
@@ -432,15 +442,25 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            if (!resumed && room.size >= 4) {
-                send(ws, { type: 'room-full' });
-                return;
+            if (!resumed) {
+                // Cap on live seats only; grace-period ghosts don't occupy one.
+                let liveCount = 0;
+                for (const [id, peerWs] of room.entries()) {
+                    if (id !== ws.peerId && isLiveSeat(peerWs)) liveCount++;
+                }
+                if (liveCount >= 4) {
+                    send(ws, { type: 'room-full' });
+                    return;
+                }
             }
 
-            // Capture existing peers with their usernames before adding ourselves
+            // Capture live peers with their usernames before adding ourselves.
+            // Ghost seats are excluded: the joiner would offer into a closed
+            // socket and, since their peer-left was already sent, never learn
+            // they are gone; they also must not hold a username.
             const existingPeers = [];
             for (const [id, peerWs] of room.entries()) {
-                if (id === ws.peerId) continue;
+                if (id === ws.peerId || !isLiveSeat(peerWs)) continue;
                 existingPeers.push({ peerId: id, username: peerWs.username || null });
             }
 
@@ -449,7 +469,24 @@ wss.on('connection', (ws) => {
                 send(ws, { type: 'username-taken', username });
                 return;
             }
-            if (!resumed) room.set(ws.peerId, ws);
+            if (!resumed) {
+                // Fits by live count but grace-period ghosts fill the map:
+                // evict the oldest ghost(s) so room.size never exceeds 4.
+                // Their peer-left was already announced, so leaveRoom() sends
+                // nothing new; an evicted client that comes back simply joins
+                // fresh (peer-joined -> rebuild, decisions/001).
+                while (room.size >= 4) {
+                    let oldest = null;
+                    for (const peerWs of room.values()) {
+                        if (isLiveSeat(peerWs)) continue;
+                        if (!oldest || (peerWs.leftAt || 0) < (oldest.leftAt || 0)) oldest = peerWs;
+                    }
+                    if (!oldest) break;
+                    leaveRoom(oldest);
+                }
+                if (!rooms.has(roomId)) rooms.set(roomId, room);
+                room.set(ws.peerId, ws);
+            }
             ws.roomId = roomId;
             ws.clientId = clientId || null;
             ws.pageSessionId = pageSessionId || null;
@@ -500,6 +537,7 @@ wss.on('connection', (ws) => {
             const room = rooms.get(roomId);
             if (room) {
                 for (const [peerId, peerWs] of room.entries()) {
+                    if (!isLiveSeat(peerWs)) continue;
                     send(ws, { type: 'peer-joined', peerId, username: peerWs.username || null });
                 }
             }
@@ -507,10 +545,16 @@ wss.on('connection', (ws) => {
         }
 
         if (msg.type === 'signal' && typeof msg.to === 'string') {
-            const room = rooms.get(ws.roomId);
-            if (!room) return;
-            const target = room.get(msg.to);
-            if (!target) return;
+            const room = ws.roomId ? rooms.get(ws.roomId) : null;
+            const target = room ? room.get(msg.to) : null;
+            if (!isLiveSeat(target) || target.readyState !== target.OPEN) {
+                // Tell the sender instead of dropping silently, so it can drop
+                // the peer rather than re-offer into the void. Never buffer or
+                // queue (decisions/001): a seat that comes back is announced
+                // with peer-joined/peer-resumed and both sides rebuild.
+                send(ws, { type: 'signal-undeliverable', to: msg.to });
+                return;
+            }
             send(target, { type: 'signal', from: ws.peerId, payload: msg.payload });
             return;
         }
