@@ -25,6 +25,9 @@ class NativeSignalingClient(
         fun onPeerJoined(peer: PeerInfo)
         fun onPeerLeft(peerId: String, username: String?)
         fun onSignal(from: String, payload: JSONObject)
+        // Server could not relay our signal to [peerId] (seat gone or a
+        // grace-period ghost). Handle like peer-left; may repeat per signal.
+        fun onSignalUndeliverable(peerId: String)
         fun onRoomFull()
         fun onUsernameTaken(username: String)
         fun onStatus(message: String)
@@ -132,6 +135,8 @@ class NativeSignalingClient(
                 msg.optString("username").takeIf { it.isNotBlank() }
             )
             "signal" -> listener.onSignal(msg.optString("from"), msg.optJSONObject("payload") ?: JSONObject())
+            "signal-undeliverable" -> msg.optString("to").takeIf { it.isNotBlank() }
+                ?.let { listener.onSignalUndeliverable(it) }
             "room-full" -> listener.onRoomFull()
             "username-taken" -> listener.onUsernameTaken(msg.optString("username"))
         }

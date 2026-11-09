@@ -14,6 +14,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.WindowManager
 import org.json.JSONObject
+import org.webrtc.AddIceObserver
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import org.webrtc.Camera2Enumerator
@@ -283,9 +284,37 @@ class NativeWebRtcClient(
                 it.optInt("sdpMLineIndex"),
                 it.optString("candidate")
             )
-            runCatching { peer.pc.addIceCandidate(candidate) }
+            // Async overload: it is queued on libwebrtc's operations chain, so a
+            // candidate for an offer whose SRD is still pending (e.g. chained
+            // behind an in-flight answer, see handleDescription) is applied
+            // after that SRD instead of against the previous description. The
+            // observer only logs — no negotiation state, so no main hop needed.
+            runCatching {
+                peer.pc.addIceCandidate(candidate, object : AddIceObserver {
+                    override fun onAddSuccess() = Unit
+                    override fun onAddFailure(error: String) {
+                        Log.w(NEGO_TAG, "addIceCandidate failed for ${peer.id}: $error")
+                    }
+                })
+            }
         }
     }
+
+    /**
+     * The server could not relay one of our signals to [peerId]: the seat is
+     * gone or is a grace-period ghost. Treat exactly like peer-left. The
+     * server may send one of these per undelivered signal (a burst of ICE
+     * candidates), so this is idempotent — onPeerLeft on an unknown id is a
+     * no-op for the peers map. A real rejoin arrives later as peer-joined /
+     * peer-resumed and rebuilds from scratch (decisions/001).
+     */
+    fun onSignalUndeliverable(peerId: String) {
+        if (!peers.containsKey(peerId)) return
+        Log.w(NEGO_TAG, "signal to $peerId undeliverable; dropping peer")
+        onPeerLeft(peerId)
+    }
+
+    fun hasPeer(peerId: String): Boolean = peers.containsKey(peerId)
 
     fun setMicEnabled(enabled: Boolean) {
         if (enabled) {
@@ -1118,18 +1147,69 @@ class NativeWebRtcClient(
     // call is torn down. If the state hasn't resolved in OFFER_TIMEOUT_MS,
     // roll back to STABLE and offer again. Cancelled on any successful
     // setRemoteDescription (answer applied / offer accepted).
+    //
+    // Bounded: peer.offerRetries counts consecutive fires with no remote
+    // description applied in between. Each fire rolls back; fires 1..
+    // OFFER_MAX_RETRIES re-offer, the next one only rolls back and logs
+    // "offer abandoned" — we stay STABLE, so a remote offer is still accepted,
+    // and any later negotiation (track change, ICE restart) still sends one
+    // fresh offer (which gets one more timeout before abandoning again). The
+    // counter is reset ONLY when a remote description applies successfully
+    // (setRemoteDescription.onSetSuccess) — never in schedule/cancel, which run
+    // on every re-offer. A signaling rejoin rebuilds the Peer (decisions/001),
+    // which also starts a fresh counter.
+    //
+    // If an answer is already in flight (settingRemoteAnswer) negotiation is
+    // moving: don't roll back (the ROLLBACK would be chained after the answer
+    // and fail against STABLE); just re-arm without counting.
 
     private fun scheduleOfferTimeout(peer: Peer) {
         cancelOfferTimeout(peer)
         val runnable = Runnable {
             peer.offerTimeout = null
             if (peers[peer.id] !== peer) return@Runnable
+            if (peer.settingRemoteAnswer) {
+                scheduleOfferTimeout(peer)
+                return@Runnable
+            }
             if (peer.pc.signalingState() != PeerConnection.SignalingState.HAVE_LOCAL_OFFER) return@Runnable
-            status("Renegotiating...")
+            peer.offerRetries += 1
+            val attempt = peer.offerRetries
+            val abandon = attempt > OFFER_MAX_RETRIES
+            Log.w(
+                NEGO_TAG,
+                "offer to ${peer.id} unanswered after ${OFFER_TIMEOUT_MS}ms: attempt $attempt/$OFFER_MAX_RETRIES " +
+                    "ice=${peer.pc.iceConnectionState()} signaling=${peer.pc.signalingState()}"
+            )
+            if (abandon) {
+                Log.w(NEGO_TAG, "offer abandoned for ${peer.id} after $OFFER_MAX_RETRIES retries; rolling back to STABLE")
+            } else {
+                status("Renegotiating...")
+            }
             peer.makingOffer = false
             peer.pc.setLocalDescription(object : SimpleSdpObserver() {
                 override fun onSetSuccess() {
-                    main.post { makeOffer(peer) }
+                    main.post {
+                        if (peers[peer.id] !== peer) return@post
+                        if (!abandon) makeOffer(peer)
+                    }
+                }
+
+                override fun onSetFailure(error: String) {
+                    main.post {
+                        if (peers[peer.id] !== peer) return@post
+                        Log.w(
+                            NEGO_TAG,
+                            "watchdog rollback failed for ${peer.id} (attempt $attempt): $error " +
+                                "signaling=${peer.pc.signalingState()}"
+                        )
+                        // Still stranded with our offer outstanding: keep the
+                        // watchdog alive so the next fire retries (counted).
+                        if (!abandon && peer.offerTimeout == null &&
+                            peer.pc.signalingState() == PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
+                            scheduleOfferTimeout(peer)
+                        }
+                    }
                 }
             }, SessionDescription(SessionDescription.Type.ROLLBACK, ""))
         }
@@ -1176,22 +1256,61 @@ class NativeWebRtcClient(
     private fun handleDescription(peer: Peer, json: JSONObject) {
         val type = SessionDescription.Type.fromCanonicalForm(json.optString("type"))
         val desc = SessionDescription(type, json.optString("sdp"))
-        val offerCollision = type == SessionDescription.Type.OFFER &&
-            (peer.makingOffer || peer.pc.signalingState() != PeerConnection.SignalingState.STABLE)
+        val state = peer.pc.signalingState()
+        // Answer-pending window: pc.setRemoteDescription is async, so after we
+        // hand it their answer signalingState() keeps reading HAVE_LOCAL_OFFER
+        // until the operation runs. The polite side typically follows its
+        // answer immediately with its own offer, which lands in exactly that
+        // window. It is NOT a collision: libwebrtc queues every SRD/SLD/
+        // createOffer/createAnswer on its per-PC operations chain (FIFO), so an
+        // SRD(offer) issued now runs after SRD(answer) has completed, against
+        // STABLE. Treating it as a collision made the impolite side drop it and
+        // made the polite side chain a ROLLBACK behind the answer, which then
+        // ran against STABLE, failed, and dropped the offer.
+        val readyForOffer = !peer.makingOffer &&
+            (state == PeerConnection.SignalingState.STABLE || peer.settingRemoteAnswer)
+        val offerCollision = type == SessionDescription.Type.OFFER && !readyForOffer
         peer.ignoreOffer = !peer.polite && offerCollision
-        if (peer.ignoreOffer) return
+        if (peer.ignoreOffer) {
+            Log.w(
+                NEGO_TAG,
+                "ignoring colliding offer from ${peer.id} (impolite): signaling=$state " +
+                    "makingOffer=${peer.makingOffer} settingRemoteAnswer=${peer.settingRemoteAnswer}"
+            )
+            return
+        }
 
-        if (type == SessionDescription.Type.OFFER && offerCollision) {
+        if (offerCollision) {
+            // Polite side of a genuine glare: yield. If our createOffer is still
+            // pending (STABLE), clearing makingOffer makes its onCreateSuccess
+            // drop the result. If our offer is already set (HAVE_LOCAL_OFFER)
+            // and no answer is in flight, roll it back first. With an answer in
+            // flight we must NOT roll back (it would be chained after the answer
+            // and fail against STABLE) — the answer will take us to STABLE and
+            // the offer's SRD is chained after it.
             peer.makingOffer = false
-            if (peer.pc.signalingState() != PeerConnection.SignalingState.STABLE) {
+            if (state != PeerConnection.SignalingState.STABLE && !peer.settingRemoteAnswer) {
                 cancelOfferTimeout(peer)
                 peer.pc.setLocalDescription(object : SimpleSdpObserver() {
                     override fun onSetSuccess() {
-                        main.post { setRemoteDescription(peer, desc, type) }
+                        main.post {
+                            if (peers[peer.id] !== peer) return@post
+                            setRemoteDescription(peer, desc, type)
+                        }
                     }
 
                     override fun onSetFailure(error: String) {
-                        main.post { status("Rollback failed: $error") }
+                        main.post {
+                            if (peers[peer.id] !== peer) return@post
+                            val now = peer.pc.signalingState()
+                            Log.w(NEGO_TAG, "polite rollback failed for ${peer.id}: $error signaling=$now")
+                            if (now == PeerConnection.SignalingState.STABLE) {
+                                // Nothing left to roll back — just accept the offer.
+                                setRemoteDescription(peer, desc, type)
+                            } else {
+                                status("Rollback failed: $error")
+                            }
+                        }
                     }
                 }, SessionDescription(SessionDescription.Type.ROLLBACK, ""))
                 return
@@ -1206,18 +1325,34 @@ class NativeWebRtcClient(
         desc: SessionDescription,
         type: SessionDescription.Type
     ) {
+        val isAnswer = type == SessionDescription.Type.ANSWER
+        // Set on main right before the async SRD; cleared on main in both
+        // callbacks. See handleDescription for why this matters.
+        if (isAnswer) peer.pendingRemoteAnswers += 1
         peer.pc.setRemoteDescription(object : SimpleSdpObserver() {
             override fun onSetSuccess() {
                 main.post {
+                    if (isAnswer) peer.pendingRemoteAnswers = (peer.pendingRemoteAnswers - 1).coerceAtLeast(0)
                     // The pending-offer state resolved (their answer applied,
-                    // or their offer accepted) — the watchdog can stand down.
+                    // or their offer accepted) — the watchdog can stand down,
+                    // and negotiation demonstrably progressed, so the retry
+                    // budget is refilled.
                     cancelOfferTimeout(peer)
+                    peer.offerRetries = 0
                     if (type == SessionDescription.Type.OFFER) makeAnswer(peer)
                 }
             }
 
             override fun onSetFailure(error: String) {
-                main.post { status("Remote SDP failed: $error") }
+                main.post {
+                    if (isAnswer) peer.pendingRemoteAnswers = (peer.pendingRemoteAnswers - 1).coerceAtLeast(0)
+                    Log.w(
+                        NEGO_TAG,
+                        "SRD(${type.canonicalForm()}) failed for ${peer.id}: $error " +
+                            "signaling=${peer.pc.signalingState()}"
+                    )
+                    status("Remote SDP failed: $error")
+                }
             }
         }, desc)
     }
@@ -1449,8 +1584,16 @@ class NativeWebRtcClient(
         var remoteScreenLive = false
         var chatChannel: DataChannel? = null
         var fileChannel: DataChannel? = null
+        // SRD(answer) calls handed to libwebrtc whose observer hasn't reported
+        // back on main yet. A count rather than a boolean so a stale answer
+        // and a fresh one in flight together can't clear it early. Main-only.
+        var pendingRemoteAnswers = 0
+        val settingRemoteAnswer: Boolean get() = pendingRemoteAnswers > 0
         // Pending stuck-offer watchdog (see scheduleOfferTimeout).
         var offerTimeout: Runnable? = null
+        // Consecutive watchdog fires with no remote description applied in
+        // between. Reset only in setRemoteDescription's onSetSuccess.
+        var offerRetries = 0
         // Monitor for event-driven backpressure on the file channel. Woken by
         // DataChannel.Observer.onBufferedAmountChange so the sender thread doesn't
         // have to poll bufferedAmount() with Thread.sleep().
@@ -1475,5 +1618,10 @@ class NativeWebRtcClient(
         // for weak-network RTTs + SDP processing; short enough to unstick a
         // deadlocked negotiation within one "why is this call dead" moment.
         const val OFFER_TIMEOUT_MS = 10_000L
+        // Consecutive watchdog re-offers before giving up on the current
+        // offer (see scheduleOfferTimeout). Bounds re-offering into a dead
+        // socket; signaling reconnect + rebuild (decisions/001) covers that.
+        const val OFFER_MAX_RETRIES = 3
+        const val NEGO_TAG = "VidlyNego"
     }
 }

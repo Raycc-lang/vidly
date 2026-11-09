@@ -389,6 +389,19 @@ class NativeCallActivity : Activity(),
 
     override fun onPeerLeft(peerId: String, username: String?) {
         rtc?.onPeerLeft(peerId)
+        removePeerUiState(peerId, username)
+    }
+
+    override fun onSignalUndeliverable(peerId: String) {
+        // Sent per undelivered signal, so it can arrive in bursts (ICE
+        // candidates) and after peer-left already ran — act only once.
+        if (rtc?.hasPeer(peerId) != true && !participants.containsKey(peerId)) return
+        val username = participants[peerId]
+        rtc?.onSignalUndeliverable(peerId)
+        removePeerUiState(peerId, username)
+    }
+
+    private fun removePeerUiState(peerId: String, username: String?) {
         participants.remove(peerId)
         peerMediaStates.remove(peerId)
         connectedPeerIds.remove(peerId)
