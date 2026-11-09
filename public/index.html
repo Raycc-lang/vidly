@@ -1380,22 +1380,36 @@ function preferH264(pc) {
 // have-local-offer; as the impolite side we would then ignore every incoming
 // offer forever (and restartPeerIce would keep rescheduling). After 10s roll
 // back to stable and re-offer. Cancelled by any successful setRemoteDescription.
+// Bounded: after OFFER_MAX_RETRIES consecutive re-offers with no answer we
+// roll back one last time and stop (offer-abandoned). We stay stable, so a
+// remote offer is still accepted, and any later negotiation still sends a
+// fresh offer (which gets one timeout + rollback). peer.offerRetries is reset
+// only by a successful setRemoteDescription in onPeerSignal — not here, since
+// schedule/cancel run on every re-offer. A peer whose seat the server no
+// longer holds is dropped via signal-undeliverable instead.
 const OFFER_TIMEOUT_MS = 10000;
+const OFFER_MAX_RETRIES = 3;
 
 function scheduleOfferTimeout(peer) {
     cancelOfferTimeout(peer);
     peer.offerTimer = setTimeout(async () => {
         peer.offerTimer = null;
         if (peers.get(peer.id) !== peer || peer.pc.signalingState !== 'have-local-offer') return;
-        console.warn('[WebRTC] offer unanswered for', OFFER_TIMEOUT_MS, 'ms — rolling back and re-offering');
-        logEvent('offer-timeout', { peer: peer.id.slice(0, 8) });
+        const n = (peer.offerRetries = (peer.offerRetries || 0) + 1);
+        const ice = peer.pc.iceConnectionState;
+        console.warn('[WebRTC] offer unanswered for', OFFER_TIMEOUT_MS, 'ms — rolling back (#' + n + ')');
+        logEvent('offer-timeout', { peer: peer.id.slice(0, 8), n, ice, pc: peer.pc.connectionState });
         try {
             await peer.pc.setLocalDescription({ type: 'rollback' });
         } catch (e) {
             console.warn('[WebRTC] rollback failed', e);
             return;
         }
-        const ice = peer.pc.iceConnectionState;
+        if (n > OFFER_MAX_RETRIES) {
+            console.warn('[WebRTC] offer abandoned after', n, 'timeouts');
+            logEvent('offer-abandoned', { peer: peer.id.slice(0, 8), n, ice });
+            return;
+        }
         if (ice === 'failed' || ice === 'disconnected') restartPeerIce(peer, 'offer timeout');
         else negotiatePeer(peer, 'offer timeout');
     }, OFFER_TIMEOUT_MS);
@@ -2197,7 +2211,10 @@ function sendWs(obj) {
 }
 
 function handleSignaling(msg) {
-    if (msg.type !== 'signal' && msg.type !== 'pong') {
+    if (msg.type === 'signal-undeliverable') {
+        // Logged once per peer we actually hold, not once per nacked candidate.
+        if (peers.has(msg.to)) logEvent('sig-signal-undeliverable', { peer: msg.to?.slice(0, 8) });
+    } else if (msg.type !== 'signal' && msg.type !== 'pong') {
         logEvent('sig-' + msg.type, { peer: msg.peerId?.slice(0, 8), resumed: msg.resumed });
     }
     switch (msg.type) {
@@ -2268,6 +2285,18 @@ function handleSignaling(msg) {
             onPeerSignal(msg.from, msg.payload);
             break;
 
+        case 'signal-undeliverable':
+            // The server no longer holds a live seat for this peer (gone, or in
+            // its rejoin grace period). Drop it rather than re-offer into the
+            // void; if it comes back the server announces peer-joined /
+            // peer-resumed and we rebuild (decisions/001). Idempotent — the
+            // server nacks every undeliverable signal, candidates included.
+            if (peers.has(msg.to)) {
+                removePeer(msg.to);
+                updateEmptyState();
+            }
+            break;
+
         case 'room-full':
             toast('Room is full (max 4 people)', 'error');
             setTimeout(() => { intentionalClose = true; ws && ws.close(); leaveCall(); }, 2000);
@@ -2299,7 +2328,8 @@ function ensurePeer(peerId, polite, createDC, username) {
         makingOffer: false, ignoreOffer: false,
         cameraSender: null, screenSender: null,
         iceRestartTimer: null,
-        offerTimer: null,
+        offerTimer: null, offerRetries: 0,
+        settingRemoteAnswer: false,
         statsPrev: null,
         videoEl, audioEl, tileEl, remoteStream, remoteAudioStream, remoteCameraStream: null, dot,
         username: username || null,
@@ -2497,13 +2527,28 @@ async function onPeerSignal(fromId, payload) {
     try {
         if (payload.description) {
             const desc = payload.description;
-            const offerCollision = desc.type === 'offer' &&
-                (peer.makingOffer || pc.signalingState !== 'stable');
+            // W3C perfect negotiation: while our setRemoteDescription(answer)
+            // is still pending we are about to be stable, so an offer arriving
+            // in that window is not a collision (the polite peer's follow-up
+            // offer right after answering used to be ignored here, stalling
+            // setup until the stuck-offer watchdog fired).
+            const readyForOffer = !peer.makingOffer &&
+                (pc.signalingState === 'stable' || peer.settingRemoteAnswer);
+            const offerCollision = desc.type === 'offer' && !readyForOffer;
             peer.ignoreOffer = !peer.polite && offerCollision;
-            if (peer.ignoreOffer) return;
+            if (peer.ignoreOffer) {
+                logEvent('offer-ignored', { peer: fromId.slice(0, 8), sig: pc.signalingState, makingOffer: peer.makingOffer });
+                return;
+            }
 
-            await pc.setRemoteDescription(desc);
+            peer.settingRemoteAnswer = desc.type === 'answer';
+            try {
+                await pc.setRemoteDescription(desc);
+            } finally {
+                peer.settingRemoteAnswer = false;
+            }
             cancelOfferTimeout(peer); // negotiation is moving (decisions/003)
+            peer.offerRetries = 0;
             if (desc.type === 'offer') {
                 preferH264(pc);
                 await pc.setLocalDescription();
