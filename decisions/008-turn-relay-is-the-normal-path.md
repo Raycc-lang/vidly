@@ -1,6 +1,6 @@
 # 008 — TURN relay is the normal path, not a fallback
 
-**Status:** accepted (2026-11-08)
+**Status:** accepted (2026-11-08); network model corrected by the 2026-11-09 addendum at the end
 **Supersedes:** the implicit assumption, inherited from the Saudi-era design, that
 TURN exists only to rescue the occasional CGNAT peer and that calls are
 "direct P2P with TURN as a last resort".
@@ -99,3 +99,26 @@ Reasons, in order of weight:
   ~150–200 ms band, or heavy relay-side packet loss that the direct pair did
   not have — that would mean the relay itself is the problem, not the link,
   and a nearby alternative relay should be measured.
+
+## 2026-11-09 addendum — Ray's media is tunnelled; the measurements above don't describe it
+
+The body above is left as written; this corrects its network model.
+
+**Ray's LAN is transparently proxied.** xray on his router carries traffic as VLESS over xhttp (packet-up) with TLS ALPN h3 (QUIC) to `95.169.1.13` — **the same LA VPS that runs Vidly**. xray routes geoip:cn/private and the VPS IP direct; everything else, **including all WebRTC UDP (STUN, TURN, media)**, goes through the tunnel. The VPS IP is in the router's nft bypass set, so Ray's signaling WebSocket goes direct. Consequence: Ray's media always egresses at the LA VPS, whatever ICE picks; srflx/srflx and relay-via-Cloudflare are physically almost the same path (Ray → tunnel → LA → …). On the VPS, TCP/443 is nginx and UDP/443 is xray's h3 listener; there is no coturn.
+
+Measured 2026-11-09 (STUN binding probes, 20 each, unless noted):
+
+| Path | RTT | Loss |
+|---|---|---|
+| Ray LAN → CF/Google STUN (tunnelled — what the browser uses) | 155–165 ms | 0% |
+| Router → CF/Google STUN (direct China Telecom, untunnelled) | 182–205 ms | 10–15% |
+| VPS → every STUN server tried, incl. `stun.cloudflare.com` | 1 ms | 0/20 |
+| Router → VPS (ICMP, evening) | 160 ms | 0% |
+| Friend (Charter residential, blocks ICMP) ↔ LA | ≈ 90 ms inferred (srflx RTT ≈ 250 − ≈ 160) | — |
+
+- The "Ray host → `turn.cloudflare.com` 196–207 ms / 20% loss" row (and the other Ray-host rows) describe a **direct** path Ray's browser never takes. The "Cloudflare is ~55 ms farther and ~6× lossier" argument in reason 1 does not apply to real calls.
+- Through the tunnel xray's UDP NAT is endpoint-independent (same mapped port to every STUN server), so srflx candidates are valid. In prod reports 3 of 4 PCs used **srflx/srflx (udp)** and one used relay/srflx (relay-tcp); why that one chose relay-tcp is unknown (telemetry has no candidate inventory). "The relay is the expected path" is therefore not what happens on Ray's LAN.
+- Bypassing the tunnel for WebRTC would be a regression (slower, lossier). No proxy change is needed.
+- **Revisit trigger, technically met:** relayed/observed RTT is 237–267 ms, above the "~150–200 ms" band. The cause is the trans-Pacific base (~160 ms) plus the friend's ~90 ms leg, not the relay; the call RTT floor is ≈ 250 ms and current paths already reach it.
+- **Shared fate (reason 3) is weaker:** media already transits the VPS via xray. The decision still stands — keep Cloudflare TURN, no coturn on the VPS — until loaded measurements exist.
+- All prod samples so far were idle (mic and camera off): their RTTs are ICE consent-check RTTs only. There is no media-quality (loss/jitter/bitrate under load) data yet; collect it before changing TURN topology.

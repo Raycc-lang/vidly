@@ -1,7 +1,7 @@
 # 001 — Symmetric PeerConnection Rebuild on Signaling Rejoin
 
-**Status:** Accepted (2026-07-10, commit e4a492d)
-**Code:** `NativeWebRtcClient.onJoined()`, `NativeWebRtcClient.onPeerJoined()`; server `scheduleLeaveRoom`/`announcePeerLeft` in `server.js`
+**Status:** Accepted (2026-07-10, commit e4a492d). Amended 2026-11-09: grace seats are invisible (see 009).
+**Code:** `NativeWebRtcClient.onJoined()`, `NativeWebRtcClient.onPeerJoined()`; server `scheduleLeaveRoom`/`announcePeerLeft`/`isLiveSeat` in `server.js`
 
 ## Problem
 
@@ -19,9 +19,15 @@ A related trap: signals (offers/answers/candidates) generated during the disconn
 
 ## Decision
 
-A (re)`joined` event and a `peer-resumed`/re-announced `peer-joined` event both mean: **close every PeerConnection you hold for that peer (or all peers, on your own rejoin) and negotiate from scratch.** Both sides do this, so the pair is always symmetric. Signals are never queued or buffered anywhere — `NativeSignalingClient.send()` on a dead socket is a deliberate no-op, and the server relays only to currently-connected sockets. A lost signal is recovered by rebuild or by the stuck-offer watchdog (003), never by replay.
+A (re)`joined` event and a `peer-resumed`/re-announced `peer-joined` event both mean: **close every PeerConnection you hold for that peer (or all peers, on your own rejoin) and negotiate from scratch.** Both sides do this, so the pair is always symmetric. Signals are never queued or buffered anywhere — `NativeSignalingClient.send()` on a dead socket is a deliberate no-op, and the server relays only to live, OPEN seats. A lost signal is recovered by rebuild or by the stuck-offer watchdog (003), never by replay.
 
 This also reaps zombie peers after a signaling-server restart: the fresh `joined` peer list is authoritative.
+
+### Amendment 2026-11-09
+
+- **Grace-period seats are invisible to everyone except their own clientId** (decisions/009). A seat whose `peer-left` was announced is kept only so that clientId can resume; it is not in `joined.peers`, not counted toward the cap, doesn't hold its username, isn't sent to `watch`, and receives no relayed signals.
+- **`signal-undeliverable` is not buffering.** The server answers a signal it can't relay with a nack and drops it; nothing is stored or replayed. The client drops the peer exactly as on `peer-left`, and a returning peer is rebuilt via `peer-joined`/`peer-resumed` as above.
+- **Which path a "rejoin" takes:** a page **reload** in Chromium fires `beforeunload` → `leave` → clean leave, then a fresh join with a **new peerId** — never the resume path. Resume-by-clientId is used only on a socket drop (and on iOS, which doesn't reliably fire `beforeunload`/`pagehide`; in prod the iPhone kept its peerId). Both paths end in the same symmetric rebuild.
 
 ## Trade-offs and failure modes
 

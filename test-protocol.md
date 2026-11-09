@@ -1,6 +1,6 @@
 # Vidly Manual Test Protocol
 
-A hands-on protocol for verifying Vidly's critical paths with two Android devices. No prior knowledge of the app is assumed. Run the full protocol before any release that touches `NativeWebRtcClient.kt`, `NativeSignalingClient.kt`, or `server.js`; run the relevant scenario after any targeted fix.
+A hands-on protocol for verifying Vidly's critical paths with two Android devices. No prior knowledge of the app is assumed. Run the full protocol before any release that touches `NativeWebRtcClient.kt`, `NativeSignalingClient.kt`, or `server.js`; run the relevant scenario after any targeted fix. The [automated harness](#automated-harness--toolsnegotiation-repromjs) covers the web client + server negotiation paths and must pass before **every** release; run it first.
 
 ## What you need
 
@@ -22,7 +22,7 @@ On the device you're observing:
 adb logcat -v time | grep -E "Vidly|libjingle|org.webrtc" > /tmp/vidly-test.log
 ```
 
-Tags you will see: `VidlyScreen` (screen share), `VidlyAudio` (audio routing), plus the in-app **header status label**, which is a first-class observable in this protocol. Status strings and what they mean:
+Tags you will see: `VidlyScreen` (screen share), `VidlyAudio` (audio routing), `VidlyNego` (negotiation: ignored colliding offers, watchdog attempts `n/3` + ICE state, `offer abandoned`, rollback/SRD failures, `signal ... undeliverable`), plus the in-app **header status label**, which is a first-class observable in this protocol. Status strings and what they mean:
 
 | Header status | Meaning |
 |---|---|
@@ -30,7 +30,7 @@ Tags you will see: `VidlyScreen` (screen share), `VidlyAudio` (audio routing), p
 | `Connected` | ICE reached CONNECTED for a peer |
 | `Reconnecting...` | ICE DISCONNECTED (restart scheduled in 8s) or signaling WS reconnecting |
 | `ICE failed` | ICE FAILED — immediate restart triggered |
-| `Renegotiating...` | Stuck-offer watchdog fired (rollback + re-offer) |
+| `Renegotiating...` | Stuck-offer watchdog fired (rollback + re-offer; at most 3 times, the 4th fire abandons silently — see `VidlyNego`) |
 | `Paused - poor network` | No remote video frame for >5s (UI-only overlay, never restarts ICE) |
 
 Server logs: `ssh vm`, then `journalctl -u <vidly service> -f` (the systemd unit running `server.js`; find it with `systemctl list-units --type=service | grep -iE 'vidly|voice|node'`).
@@ -42,6 +42,7 @@ Server logs: `ssh vm`, then `journalctl -u <vidly service> -f` (the systemd unit
 | ICE DISCONNECTED → restart | 8 s | `NativeWebRtcClient.ICE_RESTART_DELAY_MS` |
 | ICE FAILED → restart | immediate | `onIceConnectionChange` |
 | Stuck-offer watchdog | 10 s | `OFFER_TIMEOUT_MS` |
+| Watchdog re-offers before abandoning | 3 (4th fire rolls back only, ≈40 s after the first offer) | `OFFER_MAX_RETRIES` (web + Android) |
 | Signaling reconnect backoff | 1 s doubling to 10 s max | `NativeSignalingClient` |
 | WS keepalive pings | client 20 s / server 25 s | OkHttp `pingInterval` / `WS_PING_INTERVAL_MS` |
 | Server rejoin grace period | 180 s | `server.js WS_REJOIN_GRACE_MS` |
@@ -55,6 +56,32 @@ Server logs: `ssh vm`, then `journalctl -u <vidly service> -f` (the systemd unit
 3. Turn mic **on** on both; camera as the scenario requires.
 
 A scenario "passes" only if **all** pass criteria hold and **no** fail criteria appear.
+
+---
+
+## Automated harness — `tools/negotiation-repro.mjs`
+
+Headless reproduction of the web client's negotiation and the server's seat handling. Each scenario spawns its own `server.js` (free port 4100–4199, TURN unset — host/STUN candidates suffice on localhost; `/call-report` is blocked so nothing lands in `call-reports/`), drives real Chromium pages (one browser context per peer = separate clientId), and prints one `PASS|FAIL <scenario>: <numbers>` line. Exit code is non-zero on any FAIL. Runtime ≈ 4 min for the full set. **Must pass before a release.** It does not exercise the Android client.
+
+```bash
+node tools/negotiation-repro.mjs                        # all 6 scenarios, setup n=10
+node tools/negotiation-repro.mjs --only setup --n 20    # one or more scenarios, comma-separated
+node tools/negotiation-repro.mjs --server-dir ../old-checkout   # show a bug reproduces on old code
+node tools/negotiation-repro.mjs --verbose              # dump page events on FAIL
+```
+
+**Requirements:** `playwright-core` (from `$PLAYWRIGHT_CORE`, default `/home/ray/.bun/install/global/node_modules/playwright-core`, else `require('playwright-core')`); a Chromium headless shell (`$CHROME_EXE`, default the newest `~/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell`); `ws` installed in the server dir's `node_modules`. Any page `pageerror` fails the scenario.
+
+| Scenario | Proves | Pass |
+|---|---|---|
+| `setup` | Answer-pending guard (decisions/004): the polite peer's follow-up offer is not ignored while the joiner's SRD(answer) is pending. N trials of A joins, B joins 1.5 s later, observe ~13 s. | **0/N** trials with any `offer-timeout`, and every trial ends connected + stable on both sides. One `offer-ignored` per trial is expected (genuine glare). |
+| `ghost-join` | A grace-period seat isn't offered to a joiner (decisions/009). A joins, closes; C joins within grace. | C holds no peer for A and logs 0 `offer-timeout` over 15 s. |
+| `name-reuse` | A ghost doesn't hold its username (009). Ray leaves; a **new** context (new clientId) named Ray joins within grace. | New Ray gets `joined` (no `username-taken`) and connects to Friend. |
+| `resume` | Symmetric rebuild on both rejoin paths (decisions/001). Phase 1: Ray's page reloads (Chromium: clean `leave` + new peerId). Phase 2: Ray's WebSocket is closed without `leave` (resume: same peerId, `joined.resumed=true`). | Each phase: connected + stable again within ~15 s on a PC Friend didn't have before (or a `peer-joined`/`peer-resumed`); phase 2 additionally keeps the peerId and is a resumed join. |
+| `watchdog-cap` | Bounded watchdog (decisions/003). B drops every answer; A offers. | A's `offer-timeout` events carry `n` and `ice`, stop at n = 4 with `offer-abandoned`, and no further `offer-timeout` for ~15 s (~55–60 s total). |
+| `undeliverable` | Negative ack (009). A offers to a fake peer id. | A gets `signal-undeliverable`, drops the fake peer within a few seconds, and the real peer stays connected. |
+
+**`setup` is a rate, not a yes/no.** The bug it guards is a race: the old code stalled in 5/8, 12/12 and 4/8 trials on different runs, so a small N under-samples it. `--n` has a minimum of 8; only **0/N** passes. If you are validating a negotiation change, use `--n 20` or more.
 
 ---
 
@@ -222,12 +249,13 @@ Also verify: while A shares a **static** screen (no movement), B must **not** ge
 **Pass:**
 - Both show `Connected` and each device shows the other's video **within 15 s** of B joining.
 - Two-way audio confirmed by speaking.
-- Repeat once with both devices on cellular (forces TURN): still connects within 15 s.
+- Repeat once with both devices on cellular (usually forces TURN): still connects within 15 s.
+- No `Renegotiating...` during setup, and no `unanswered after` line under `VidlyNego` — a 10 s stall at call start is the answer-pending race (decisions/004), which the web harness can't catch on Android.
 
 **Fail:**
-- `ICE failed` on the cellular-only run → TURN credentials or coturn issue: verify `curl https://voice.raycc.org/turn-credentials` returns a JSON with `urls`, `username`, `credential`.
+- `ICE failed` on the cellular-only run → TURN credentials issue (Cloudflare; there is no coturn): verify `curl https://voice.raycc.org/turn-credentials` returns `{iceServers:[...]}` with `urls`, `username`, `credential` (503 = keys unset, 502 = Cloudflare error).
 - Connects on Wi-Fi but not cross-network → NAT/TURN, same check.
-- `room-full` or `username-taken` unexpectedly → stale grace-period entries from previous tests; use a fresh room name.
+- `room-full` or `username-taken` caused by a seat from a previous test that is still in its grace period → regression of decisions/009 (ghost seats must not count toward the cap or hold a name). Run the harness `ghost-join` / `name-reuse`.
 
 ---
 
@@ -283,7 +311,7 @@ Also verify: while A shares a **static** screen (no movement), B must **not** ge
 
 ## Scenario 10 — Stuck-offer watchdog
 
-**Tests:** the 10 s rollback+re-offer (decisions/003).
+**Tests:** the 10 s rollback+re-offer and its 3-retry cap (decisions/003).
 
 **Setup:** Baseline call, A on a lossy/different network, camera off on both. The trick is to make A **lose an offer into a silently-dead socket**: kill the network and immediately force a renegotiation, before OkHttp's ping (20 s) notices the socket is dead.
 
@@ -298,9 +326,9 @@ Also verify: while A shares a **static** screen (no movement), B must **not** ge
 
 **Fail:**
 - A stuck permanently: status frozen, B's incoming offers ignored, camera never appears on B — the pre-fix `HAVE_LOCAL_OFFER` deadlock.
-- `Renegotiating...` loops forever (watchdog fires but re-offers keep getting lost even though the network is back → signaling send path broken).
+- `Renegotiating...` shows 3 times and B still never gets A's camera although the network is back (`VidlyNego`: `attempt 1/3` … then `offer abandoned`) → re-offers are being lost on a live path; signaling send path broken. More than 3 consecutive `Renegotiating...` for one offer is a regression of the cap.
 
-**Logs:** on A, look for the rollback: signaling state leaving `HAVE_LOCAL_OFFER` without an answer having arrived, followed by a fresh `createOffer`. Timing between the lost offer and `Renegotiating...` should be ≈10 s.
+**Logs:** on A, `VidlyNego` `offer to <peer> unanswered after 10000ms: attempt 1/3 ice=... signaling=HAVE_LOCAL_OFFER`, then a fresh `createOffer`. Timing between the lost offer and `Renegotiating...` should be ≈10 s. `watchdog rollback failed` lines mean the rollback itself is broken — investigate even if the call recovered.
 
 ---
 
