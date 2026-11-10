@@ -87,7 +87,8 @@ The in-app **header status label** is the primary runtime observable (`Connected
 
 - **Server / web client / APK hosting** live on the VPS (`ssh vm`), domain `voice.raycc.org`: Node.js behind nginx (TCP/443, terminates wss://), managed by systemd. UDP/443 on the VPS is xray's h3 listener (Ray's tunnel). There is **no coturn**: TURN is Cloudflare Realtime, minted by `/turn-credentials`.
 - **Release flow**: use the `vidly-release` project skill — it bumps the version, builds the APK, uploads it to the VPS (served at `https://voice.raycc.org/vidly-native.apk`, advertised by `/version`), and restarts the systemd service.
-- Server env knobs (systemd unit): `TURN_KEY_ID`, `TURN_KEY_SECRET` (Cloudflare), `WS_REJOIN_GRACE_MS`, `ANDROID_VERSION_CODE/NAME`, `GIPHY_API_KEY`.
+- Server env knobs (systemd unit): `TURN_KEY_ID`, `TURN_KEY_SECRET` (Cloudflare), `WS_REJOIN_GRACE_MS`, `ANDROID_VERSION_CODE/NAME`, `GIPHY_API_KEY`, `CALL_SESSION_RETENTION_DAYS` (default 30; 0 = keep forever).
+- **Call telemetry (web)**, all under `call-reports/` on the VPS: a one-off snapshot (`<time>_<room>_<reason>_<rand>.json`, last 10 min) on leave / pagehide / "report problem", plus a per-page-session log `sessions/<start>_<room>_<user>_<pageSessionId>.jsonl` that each client appends to once a minute while in a call (one JSON object per line: the events and 5 s `getStats` samples new since the previous line). The session logs cover both sides for the whole call; they are capped at 8 MB per file and deleted after `CALL_SESSION_RETENTION_DAYS`. One-off reports and crash logs are never pruned.
 
 ## Where to look when something breaks
 
@@ -100,10 +101,20 @@ The in-app **header status label** is the primary runtime observable (`Connected
 | Call dies after a network blip and never recovers | ICE observer + watchdog in `NativeWebRtcClient`; scenarios 1–3, 10 in test-protocol.md |
 | One side reconnects, other side frozen | Symmetric rebuild (decisions/001) — check `onJoined`/`onPeerJoined` teardown |
 | Remote camera never resumes after off→on | `onFirstPacketReceived` path (decisions/007); scenario 4 |
+| Shared movie stutters (few fps) | Was it shared as "Movie or video"? `screen-share {mode}` event and `vOut` (`fps`, `res`, `limit`) in the sharer's session log; `SCREEN_MODES` in `public/index.html` |
 | Screen share renders in the wrong (PiP) tile | `reclassifyRemoteVideoTracks` (decisions/007); scenario 5 |
 | Audio on wrong output at call start | `VidlyAudio` logcat; reflection break after a WebRTC upgrade (decisions/006) |
 | Video freezes after camera switch with beauty on | GL generation lifecycle (decisions/005); scenario 8 |
 | Crashes in the field | `crash-logs/` on the VPS (uploaded via POST /crash) |
+
+## Screen share modes (web)
+
+The 🖥️ button asks what is being shared; `SCREEN_MODES` in `public/index.html` holds the settings and `applySenderLimits` applies them to the screen sender (and, for movie audio, the audio sender).
+
+- **Document or app** (`detail`): full capture resolution, 1.5 Mbps cap, encoder keeps resolution and drops frames. Right for text; a film at 2560×1440 ran at 3–7 fps like this (prod, 2026-11-10 — the sender was neither CPU- nor network-limited, it was the cap plus `contentHint = 'detail'`).
+- **Movie or video** (`motion`): sender-side downscale to fit 1280×720 (`scaleResolutionDownBy`, recomputed when the captured window changes size), 30 fps, 2.5 Mbps cap, `maintain-framerate`, and 96 kbps Opus for the shared audio. The `getDisplayMedia` width/height constraints are not relied on — Chrome did not honour them for window capture.
+
+The motion numbers come from one prod call (bandwidth estimate ≈ 2.4 Mbps on Ray's uplink) and a synthetic headless test; tune them against real session logs, not by feel.
 
 ## Known open issues (deliberate, don't rediscover)
 
