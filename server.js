@@ -30,6 +30,14 @@ const CRASH_LOGS_DIR = path.join(__dirname, 'crash-logs');
 const CRASH_MAX_BYTES = 512 * 1024; // cap per report — keep the 1GB VPS safe
 // Web client call-quality reports (getStats samples + lifecycle events), POST /call-report.
 const CALL_REPORTS_DIR = path.join(__dirname, 'call-reports');
+// While a call runs the web client also uploads what is new every minute
+// (reason "periodic"). Those chunks are appended, one JSON object per line, to
+// one file per page session under call-reports/sessions/, so both sides of a
+// call are on record for its whole length, not just the last 10 minutes of
+// whoever left or pressed "report problem". Bounded per file and by age.
+const CALL_SESSIONS_DIR = path.join(CALL_REPORTS_DIR, 'sessions');
+const CALL_SESSION_MAX_BYTES = 8 * 1024 * 1024; // ~10 h of one side at ~10 KB/min
+const CALL_SESSION_RETENTION_DAYS = parseInt(process.env.CALL_SESSION_RETENTION_DAYS || '30', 10);
 const WS_REJOIN_GRACE_MS = parseInt(process.env.WS_REJOIN_GRACE_MS || '180000', 10);
 const WS_PING_INTERVAL_MS = parseInt(process.env.WS_PING_INTERVAL_MS || '25000', 10);
 
@@ -184,9 +192,63 @@ const callReportName = (report) => {
     return `${room}_${reason}`;
 };
 
+// File a periodic chunk is appended to, or null if the report is not one.
+// Every part comes from the client, so each is reduced to [A-Za-z0-9_-].
+const callSessionLogName = (report) => {
+    if (report.reason !== 'periodic' || !report.pageSessionId) return null;
+    const clean = (v, n) => String(v || '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, n);
+    const start = clean(String(report.sessionStart || '').replace(/[:.]/g, '-'), 24) || 'nostart';
+    return `${start}_${clean(report.roomId, 32) || 'noroom'}_${clean(report.username, 24) || 'anon'}_${clean(report.pageSessionId, 36)}.jsonl`;
+};
+
+function appendSessionChunk(res, fileName, report) {
+    const file = path.join(CALL_SESSIONS_DIR, fileName);
+    const fail = () => {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Could not store report');
+    };
+    fs.mkdir(CALL_SESSIONS_DIR, { recursive: true }, (mkErr) => {
+        if (mkErr) return fail();
+        fs.stat(file, (statErr, st) => {
+            if (!statErr && st.size > CALL_SESSION_MAX_BYTES) {
+                res.writeHead(413, { 'Content-Type': 'text/plain' });
+                res.end('Session log full');
+                return;
+            }
+            fs.appendFile(file, JSON.stringify(report) + '\n', (writeErr) => {
+                if (writeErr) return fail();
+                if (statErr) console.log(`Session log started: call-reports/sessions/${fileName}`);
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ ok: true }));
+            });
+        });
+    });
+}
+
+// Session logs older than the retention window are deleted (only files under
+// call-reports/sessions/; one-off reports and crash logs are never pruned).
+function pruneCallSessions() {
+    if (!(CALL_SESSION_RETENTION_DAYS > 0)) return;
+    const cutoff = Date.now() - CALL_SESSION_RETENTION_DAYS * 24 * 3600 * 1000;
+    fs.readdir(CALL_SESSIONS_DIR, (err, names) => {
+        if (err) return; // directory not created yet
+        for (const name of names) {
+            if (!name.endsWith('.jsonl')) continue;
+            const file = path.join(CALL_SESSIONS_DIR, name);
+            fs.stat(file, (statErr, st) => {
+                if (statErr || st.mtimeMs >= cutoff) return;
+                fs.unlink(file, (rmErr) => { if (!rmErr) console.log(`Session log expired: ${name}`); });
+            });
+        }
+    });
+}
+pruneCallSessions();
+setInterval(pruneCallSessions, 24 * 3600 * 1000).unref();
+
 // Shared by /crash (Android) and /call-report (web): size-capped JSON body →
-// <dir>/<timestamp>_<label>_<rand>.json
-function saveJsonReport(req, res, dir, labelOf) {
+// <dir>/<timestamp>_<label>_<rand>.json, or, when appendNameOf returns a name
+// for the report, one more line in call-reports/sessions/<name>.
+function saveJsonReport(req, res, dir, labelOf, appendNameOf) {
     let size = 0;
     const chunks = [];
     let aborted = false;
@@ -214,6 +276,11 @@ function saveJsonReport(req, res, dir, labelOf) {
         if (!report || typeof report !== 'object') {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end('Invalid JSON');
+            return;
+        }
+        const appendName = appendNameOf && appendNameOf(report);
+        if (appendName) {
+            appendSessionChunk(res, appendName, report);
             return;
         }
         const ts = String(report.timestamp || new Date().toISOString()).replace(/[^0-9A-Za-z-]/g, '-').slice(0, 40);
@@ -260,7 +327,7 @@ const server = http.createServer((req, res) => {
     }
 
     if (urlPath === '/call-report' && req.method === 'POST') {
-        saveJsonReport(req, res, CALL_REPORTS_DIR, callReportName);
+        saveJsonReport(req, res, CALL_REPORTS_DIR, callReportName, callSessionLogName);
         return;
     }
 
