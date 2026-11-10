@@ -363,6 +363,19 @@
     padding: 8px;
     max-width: calc(100vw - 24px);
   }
+  .share-panel { padding: 8px; display: none; flex-direction: column; gap: 6px; width: 290px; max-width: calc(100vw - 24px); }
+  .share-panel.open { display: flex; }
+  .share-option {
+    display: flex; align-items: center; gap: 12px; text-align: left;
+    padding: 10px 12px; border: 1px solid transparent; border-radius: 10px;
+    background: transparent; color: var(--text); cursor: pointer; font: inherit;
+    transition: background .15s, border-color .15s;
+  }
+  .share-option:hover { background: rgba(255,255,255,.08); }
+  .share-option.last-used { border-color: var(--border); }
+  .share-option .share-icon { font-size: 24px; }
+  .share-option b { display: block; font-size: 14px; font-weight: 600; }
+  .share-option small { display: block; font-size: 12px; opacity: .7; margin-top: 2px; }
   .reaction-options {
     display: flex;
     flex-wrap: wrap;
@@ -825,6 +838,16 @@
     <button class="btn icon" id="chatBtn" title="Toggle chat">💬</button>
     <button class="btn icon danger" id="leaveBtn" title="Leave call">⛔</button>
   </footer>
+  <div class="floating-panel share-panel" id="sharePanel" aria-label="What are you sharing?">
+    <button class="share-option" type="button" data-share-mode="detail">
+      <span class="share-icon">📄</span>
+      <span><b>Document or app</b><small>Sharp text at full resolution; motion may stutter</small></span>
+    </button>
+    <button class="share-option" type="button" data-share-mode="motion">
+      <span class="share-icon">🎬</span>
+      <span><b>Movie or video</b><small>Smooth motion at 720p, better sound</small></span>
+    </button>
+  </div>
   <div class="floating-panel reaction-panel" id="reactionPanel" aria-label="Emoji reactions">
     <div class="reaction-options" id="reactionOptions"></div>
   </div>
@@ -964,17 +987,29 @@ function toast(message, type = '') {
 // the topbar "report problem" button. Exists so "no sound" / "unstable" reports
 // from remote users arrive with data: relay vs direct path, RTT, loss, codec,
 // blocked play() calls, mic interruptions.
+// Those snapshots only hold the last 10 minutes and only exist for whoever
+// left or pressed the button, so once a minute the events and samples that are
+// new since the last upload also go up as a "periodic" chunk; the server
+// appends them to one log per page session (call-reports/sessions/).
 const CALL_EVENTS_MAX = 300;
 const CALL_SAMPLES_MAX = 120;            // 10 min at 5s
 const STATS_INTERVAL_MS = 5000;
 const REPORT_KEEPALIVE_MAX = 60 * 1024;  // fetch keepalive bodies are capped at 64KB
+const REPORT_UPLOAD_INTERVAL_MS = 60000;
 const callEvents = [];
 const callSamples = [];
 let statsTimer = null;
 let callReportSent = false;
+// Periodic upload cursors: how many events/samples were ever recorded, and how
+// many of those the server already has.
+const sessionStart = new Date().toISOString();
+let callEventsTotal = 0, callSamplesTotal = 0;
+let uploadedEvents = 0, uploadedSamples = 0;
+let uploadSeq = 0, uploadTimer = null, uploadBusy = false;
 
 function logEvent(type, data) {
     callEvents.push(Object.assign({ t: Date.now(), type }, data));
+    callEventsTotal++;
     if (callEvents.length > CALL_EVENTS_MAX) callEvents.shift();
 }
 
@@ -1071,13 +1106,55 @@ function startStatsSampler() {
             peers: await Promise.all(Array.from(peers.values(), samplePeerStats))
         };
         callSamples.push(sample);
+        callSamplesTotal++;
         if (callSamples.length > CALL_SAMPLES_MAX) callSamples.shift();
     }, STATS_INTERVAL_MS);
+    uploadTimer = setInterval(uploadReportChunk, REPORT_UPLOAD_INTERVAL_MS);
 }
 
 function stopStatsSampler() {
     if (statsTimer) clearInterval(statsTimer);
     statsTimer = null;
+    if (uploadTimer) clearInterval(uploadTimer);
+    uploadTimer = null;
+}
+
+// Upload what was recorded since the last successful chunk. Nothing new (alone
+// in a room, no events) means no request. A failed upload leaves the cursors
+// alone, so the next tick resends; whatever fell out of the ring buffers in
+// the meantime is counted in `missed`.
+async function uploadReportChunk() {
+    if (uploadBusy || !roomId) return;
+    const eventsTotal = callEventsTotal, samplesTotal = callSamplesTotal;
+    const newEvents = eventsTotal - uploadedEvents, newSamples = samplesTotal - uploadedSamples;
+    if (!newEvents && !newSamples) return;
+    const tail = (list, n) => n > 0 ? list.slice(-Math.min(n, list.length)) : [];
+    const chunk = {
+        timestamp: new Date().toISOString(),
+        reason: 'periodic', seq: uploadSeq, sessionStart,
+        roomId, username: myUsername, clientId: getClientId(), pageSessionId, peerId: myPeerId,
+        mic: micTrackState(), cam: camEnabled, sharing: isSharing,
+        events: tail(callEvents, newEvents),
+        samples: tail(callSamples, newSamples)
+    };
+    if (uploadSeq === 0) chunk.ua = navigator.userAgent;
+    const missed = (newEvents - chunk.events.length) + (newSamples - chunk.samples.length);
+    if (missed > 0) chunk.missed = missed;
+    uploadBusy = true;
+    try {
+        const r = await fetch('/call-report', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(chunk)
+        });
+        if (r.ok) {
+            uploadedEvents = eventsTotal;
+            uploadedSamples = samplesTotal;
+            uploadSeq++;
+        }
+    } catch {} finally {
+        uploadBusy = false;
+    }
 }
 
 function sendCallReport(reason, { keepalive = false } = {}) {
@@ -1311,7 +1388,28 @@ function checkMicAfterResume() {
 // software there); both sides apply the same order, so the codec no longer
 // depends on who sends the offer.
 const CAMERA_MAX_BITRATE = 800_000;
-const SCREEN_MAX_BITRATE = 1_500_000;
+// Screen share comes in two flavours, picked when the share starts.
+//  detail: documents and apps. Full capture resolution; under pressure the
+//          encoder keeps resolution and drops frames.
+//  motion: movies. At 'detail' settings a 2560x1440 film ran at 3-7 fps on
+//          the 1.5 Mbps cap (prod call 2026-11-10: sender not CPU- or
+//          network-limited, bandwidth estimate ~2.4 Mbps). So: downscale to
+//          720p on the sender (the getDisplayMedia size constraints are not
+//          honoured for window capture), keep frame rate and give up
+//          resolution instead, a higher video cap, and music-grade Opus for
+//          the shared audio (the default is ~32 kbps, tuned for speech).
+// Every field is applied explicitly in both modes because a sender, and with
+// it its encoding parameters, is reused by the next share.
+const SCREEN_MODES = {
+    detail: { hint: 'detail', captureFps: 15, maxBitrate: 1_500_000, maxFramerate: 30,
+              maxWidth: Infinity, maxHeight: Infinity, degradation: 'maintain-resolution', audioMaxBitrate: 0 },
+    motion: { hint: 'motion', captureFps: 30, maxBitrate: 2_500_000, maxFramerate: 30,
+              maxWidth: 1280, maxHeight: 720, degradation: 'maintain-framerate', audioMaxBitrate: 96_000 }
+};
+const SCREEN_MODE_KEY = 'vidly-screen-mode';
+let screenMode = 'detail'; // mode of the current (or most recent) share
+const SENDER_LIMIT_RETRY_MS = 1000;
+const SENDER_LIMIT_MAX_RETRIES = 5;
 let h264FirstCodecs; // computed lazily; null = no H.264 / API unsupported
 
 // Serialized per peer: overlapping get/setParameters pairs fail with a stale
@@ -1330,7 +1428,18 @@ async function applySenderLimits(peer) {
     }
 }
 
+// Factor (>= 1) that brings the captured frame inside the mode's size limit.
+// The capture size follows the shared window (resize, fullscreen), so this is
+// re-evaluated while sharing (see the liveness check in startScreenShare).
+function screenScaleDown(track, mode) {
+    const st = track && typeof track.getSettings === 'function' ? track.getSettings() : {};
+    if (!st.width || !st.height) return 1;
+    const scale = Math.max(1, st.width / mode.maxWidth, st.height / mode.maxHeight);
+    return Math.round(scale * 100) / 100;
+}
+
 async function applySenderLimitsOnce(peer) {
+    let retry = false;
     for (const sender of peer.pc.getSenders()) {
         const kind = sender.track?.kind;
         if (!kind || sender._vidlyNoParams || typeof sender.getParameters !== 'function') continue;
@@ -1338,23 +1447,42 @@ async function applySenderLimitsOnce(peer) {
         const enc = params.encodings && params.encodings[0];
         if (!enc) continue; // not negotiated yet
         let changed = false;
-        if (kind === 'video') {
-            const max = sender === peer.screenSender ? SCREEN_MAX_BITRATE : CAMERA_MAX_BITRATE;
-            if (enc.maxBitrate !== max) { enc.maxBitrate = max; changed = true; }
-        } else if (enc.priority !== 'high' || enc.networkPriority !== 'high') {
-            enc.priority = 'high';
-            enc.networkPriority = 'high';
+        const set = (obj, key, value) => {
+            if (obj[key] === value) return;
+            if (value === undefined) delete obj[key]; else obj[key] = value;
             changed = true;
+        };
+        if (kind === 'video' && sender === peer.screenSender) {
+            const mode = SCREEN_MODES[screenMode];
+            set(enc, 'maxBitrate', mode.maxBitrate);
+            set(enc, 'maxFramerate', mode.maxFramerate);
+            set(enc, 'scaleResolutionDownBy', screenScaleDown(sender.track, mode));
+            set(params, 'degradationPreference', mode.degradation);
+        } else if (kind === 'video') {
+            set(enc, 'maxBitrate', CAMERA_MAX_BITRATE);
+        } else {
+            set(enc, 'priority', 'high');
+            set(enc, 'networkPriority', 'high');
+            // Shared movie audio rides this sender (mixed with the mic).
+            const movieAudio = isSharing && screenAudioTrack && SCREEN_MODES[screenMode].audioMaxBitrate;
+            set(enc, 'maxBitrate', movieAudio || undefined);
         }
         if (!changed) continue;
         try {
             await sender.setParameters(params);
         } catch (e) {
-            // Audio priority unsupported (older Safari) won't start working —
-            // stop retrying it. Video failures are retried next negotiation.
-            if (kind === 'audio') sender._vidlyNoParams = true;
+            // InvalidStateError is transient (a negotiation was in flight):
+            // try again shortly. Anything else on audio means the browser does
+            // not take these fields (older Safari) and never will.
+            if (kind === 'video' || e.name === 'InvalidStateError') retry = true;
+            else sender._vidlyNoParams = true;
             logEvent('set-params-failed', { kind, err: e.name });
         }
+    }
+    if (!retry) {
+        peer.limitRetries = 0;
+    } else if ((peer.limitRetries = (peer.limitRetries || 0) + 1) <= SENDER_LIMIT_MAX_RETRIES) {
+        setTimeout(() => { if (peers.get(peer.id) === peer) applySenderLimits(peer); }, SENDER_LIMIT_RETRY_MS);
     }
 }
 
@@ -3815,6 +3943,9 @@ document.addEventListener('click', (e) => {
     if (!$('reactionPanel')?.contains(e.target) && e.target !== $('reactionBtn')) {
         $('reactionPanel')?.classList.remove('open');
     }
+    if (!$('sharePanel').contains(e.target) && e.target !== $('screenBtn')) {
+        $('sharePanel').classList.remove('open');
+    }
     if (!$('stickerPicker')?.contains(e.target) && e.target !== $('stickerBtn')) {
         closeStickerPicker();
     }
@@ -3892,16 +4023,33 @@ $('camOnBtn').onclick = previewCamera;
 $('confirmCamBtn').onclick = confirmCamera;
 $('cancelCamBtn').onclick = cancelCamera;
 
+// The screen button stops a running share, otherwise asks what is being
+// shared (see SCREEN_MODES); the last choice is outlined.
 $('screenBtn').onclick = async () => {
-    if (isSharing) await stopScreenShare();
-    else await startScreenShare();
+    if (isSharing) { await stopScreenShare(); return; }
+    const panel = $('sharePanel');
+    let last = 'detail';
+    try { last = localStorage.getItem(SCREEN_MODE_KEY) || last; } catch {}
+    for (const btn of panel.querySelectorAll('.share-option')) {
+        btn.classList.toggle('last-used', btn.dataset.shareMode === last);
+    }
+    panel.classList.toggle('open');
 };
 
-async function startScreenShare() {
+for (const btn of $('sharePanel').querySelectorAll('.share-option')) {
+    btn.onclick = async () => {
+        $('sharePanel').classList.remove('open');
+        if (!isSharing) await startScreenShare(btn.dataset.shareMode);
+    };
+}
+
+async function startScreenShare(modeName) {
+    const mode = SCREEN_MODES[modeName] ? modeName : 'detail';
+    const cfg = SCREEN_MODES[mode];
     try {
         screenStream = await navigator.mediaDevices.getDisplayMedia({
             video: {
-                frameRate: { ideal: 15, max: 30 },
+                frameRate: { ideal: cfg.captureFps, max: 30 },
                 width: { max: 1920 },
                 height: { max: 1080 }
             },
@@ -3911,8 +4059,10 @@ async function startScreenShare() {
         toast('Could not start screen share: ' + (err.message || err.name), 'error');
         return;
     }
+    screenMode = mode;
+    try { localStorage.setItem(SCREEN_MODE_KEY, mode); } catch {}
     const screenTrack = screenStream.getVideoTracks()[0];
-    try { screenTrack.contentHint = 'detail'; } catch {}
+    try { screenTrack.contentHint = cfg.hint; } catch {}
     try { await screenTrack.applyConstraints({ frameRate: { max: 30 } }); } catch {}
 
     // Publish screen share as a separate video sender. Keeping camera on its own
@@ -3968,6 +4118,11 @@ async function startScreenShare() {
     isSharing = true;
     $('screenBtn').classList.add('active');
     broadcastLocalMediaState();
+    // The video cap/scale and the audio bitrate depend on the mode and on
+    // isSharing; the renegotiation above may have settled before either was set.
+    let captureSize = screenCaptureSize(screenTrack);
+    logEvent('screen-share', { mode, size: captureSize, audio: !!screenAudioTrack });
+    for (const peer of peers.values()) applySenderLimits(peer);
 
     // Auto-revert when user clicks "Stop sharing" in the browser UI.
     screenTrack.onended = () => {
@@ -3985,8 +4140,21 @@ async function startScreenShare() {
             clearInterval(screenTrackCheck);
             screenTrackCheck = null;
             stopScreenShare();
+            return;
+        }
+        // Window resized or went fullscreen: the downscale factor changes.
+        const size = screenCaptureSize(screenTrack);
+        if (size !== captureSize) {
+            captureSize = size;
+            logEvent('screen-resize', { size });
+            for (const peer of peers.values()) applySenderLimits(peer);
         }
     }, 3000);
+}
+
+function screenCaptureSize(track) {
+    const st = typeof track.getSettings === 'function' ? track.getSettings() : {};
+    return (st.width || '?') + 'x' + (st.height || '?');
 }
 
 async function stopScreenShare() {
@@ -4042,6 +4210,8 @@ async function stopScreenShare() {
     isSharing = false;
     $('screenBtn').classList.remove('active');
     broadcastLocalMediaState();
+    logEvent('screen-share-stop');
+    for (const peer of peers.values()) applySenderLimits(peer); // audio back to speech bitrate
 }
 
 $('leaveBtn').onclick = leaveCall;
