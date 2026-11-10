@@ -1,7 +1,7 @@
 # 004 — Perfect Negotiation with Rollback, Main-Thread-Only State
 
-**Status:** Accepted (2026-07-10, commit e4a492d; pattern predates, threading fix is new). Amended 2026-11-09: answer-pending guard (see below).
-**Code:** `NativeWebRtcClient.handleDescription`, `setRemoteDescription` (`pendingRemoteAnswers`), `makeOffer`, `PeerObserver.onRenegotiationNeeded`, the `main` Handler; web `onPeerSignal` (`peer.settingRemoteAnswer`) in `public/index.html`
+**Status:** Accepted (2026-07-10, commit e4a492d; pattern predates, threading fix is new). Amended 2026-11-09: answer-pending guard; 2026-11-10: the existing peer holds its first offer (web) — see below.
+**Code:** `NativeWebRtcClient.handleDescription`, `setRemoteDescription` (`pendingRemoteAnswers`), `makeOffer`, `PeerObserver.onRenegotiationNeeded`, the `main` Handler; web `onPeerSignal` (`peer.settingRemoteAnswer`), `ensurePeer` / `negotiatePeer` (`peer.holdOffer`) in `public/index.html`
 
 ## Problem
 
@@ -29,7 +29,23 @@ Android had a second, Android-only failure on the polite side: the explicit roll
 - **Web:** `peer.settingRemoteAnswer` is true for the duration of `await pc.setRemoteDescription(answer)`; an offer is ready-to-accept if `!makingOffer && (stable || settingRemoteAnswer)`. An ignored offer logs `offer-ignored {sig, makingOffer}`.
 - **Android:** counter `pendingRemoteAnswers` (main-only; incremented before the async SRD(answer), decremented in both observer callbacks — a counter so a stale and a fresh answer in flight can't clear it early), exposed as `settingRemoteAnswer`. The polite rollback branch is **skipped** while an answer is pending: the answer takes us to STABLE and the offer's SRD runs after it. This relies on libwebrtc M144's per-PC **operations chain** (SRD/SLD/createOffer/createAnswer run FIFO), confirmed from the `.so` symbols — re-check after a libwebrtc upgrade. ICE candidates now use the chained async `addIceCandidate(candidate, AddIceObserver)` so candidates for a chained offer apply after its SRD, not against the previous description. Rollback/SRD failures log to tag `VidlyNego` instead of being swallowed; a polite rollback that fails because we're already STABLE just applies the offer.
 
-**Expected residue.** After the fix, 0/48+ harness setup trials stalled (`tools/negotiation-repro.mjs --only setup`). Exactly **one** `offer-ignored` per setup remains and is genuine glare — the polite peer's first offer reaching the joiner while the joiner's own offer is outstanding. Expected and harmless; don't "fix" it.
+**Expected residue.** After the fix, 0/48+ harness setup trials stalled (`tools/negotiation-repro.mjs --only setup`). Exactly **one** `offer-ignored` per setup remained: the polite peer's first offer reaching the joiner while the joiner's own offer is outstanding. This record called that glare "expected and harmless; don't fix it". **That was wrong — superseded by the 2026-11-10 amendment below.**
+
+### Amendment 2026-11-10 — the existing peer holds its offer until the joiner's is applied (web)
+
+**Bug.** Prod, 2026-11-10: Ray (Chrome/Windows) was screen sharing a movie with the mic off; Maya (iPad Safari) reloaded and then rejoined twice. Each time both sides read connected + stable, and she received no audio and no video (her reports: no `inbound-rtp` at all; his: no `outbound-rtp`, `sharing: true`, `mic: off`).
+
+At setup the existing (polite) peer adds its tracks in `ensurePeer`, `negotiationneeded` fires, and it offers at the same moment as the joiner — the "harmless" glare. It rolls its offer back, answers the joiner's, and sends a follow-up offer for whatever the joiner's offer did not cover. With a share live and the mic off its PC holds `[video via addTrack, audio via addTransceiver placeholder carrying the mixer track]`, and after that rollback Chrome rejects the follow-up `setLocalDescription()`:
+
+`InvalidAccessError: Failed to set local offer sdp: A BUNDLE group contains a codec collision for header extension id=1.`
+
+`negotiatePeer` only `console.error`ed it. Nothing was sent, so the watchdog (003) never armed and nothing retried. Deterministic in headless Chromium (harness `join-during-share`: fails on 04ee095, passes now). Not triggered with the mic on (the audio transceiver comes from `addTrack` and is reused by the joiner's m-line), nor when the share starts after the join (no rollback has happened on that PC).
+
+**Fix (web).** The joiner always offers first, so the existing side does not need to race it. `ensurePeer(polite, !createDC)` sets `peer.holdOffer`; `negotiatePeer` returns while it is set. `onPeerSignal` clears it as soon as the joiner's offer is applied (we are then in `have-remote-offer`, so nothing can be offered until our answer is set), and the browser's own `negotiationneeded` after the answer sends the follow-up. A 3 s timer (`OFFER_HOLD_MS`, logs `offer-hold-timeout`) releases the hold and offers if the joiner's offer never arrives. No rollback happens on a fresh PC, so the collision cannot occur, and call setup has **zero** `offer-ignored` events. Mid-call glare (both sides change media at once) still goes through rollback as designed above.
+
+`negotiatePeer` and `onPeerSignal` failures now log `negotiate-failed` / `signal-failed` events, so a swallowed SDP error shows up in call-reports.
+
+**Not done.** Android (`NativeWebRtcClient`) still offers immediately as the existing peer. It is parked and runs a different libwebrtc; whether it hits the same collision is untested — check before reviving it. A receiver-side safety net ("`media-state` says screen is on but no video arrived") was considered and not added.
 
 ## Alternatives considered
 
@@ -46,5 +62,6 @@ Android had a second, Android-only failure on the polite side: the explicit roll
 ## Revisit if
 
 - Call-setup latency matters enough to spend a release on the placeholder transceiver (then remove it on both platforms together and re-run scenarios 5 and 7 plus the harness).
+- `offer-hold-timeout` shows up in call-reports from healthy calls — the joiner's first offer is taking longer than `OFFER_HOLD_MS` (3 s); raise it rather than remove the hold.
 - A libwebrtc upgrade changes SRD/addIceCandidate queuing semantics — re-verify the Android answer-pending path (harness covers web only; run manual scenario 7 on two Android devices and grep `VidlyNego`).
 - Negotiation work ever becomes heavy enough to jank the UI — then move it to a dedicated single-threaded handler, preserving the "one thread owns the state" invariant, never to "multiple threads with locks".

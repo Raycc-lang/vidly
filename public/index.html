@@ -1421,6 +1421,16 @@ function cancelOfferTimeout(peer) {
     peer.offerTimer = null;
 }
 
+// How long the existing (polite) side waits for a joiner's first offer before
+// offering itself; see the hold in ensurePeer.
+const OFFER_HOLD_MS = 3000;
+
+function releaseOfferHold(peer) {
+    peer.holdOffer = false;
+    if (peer.holdOfferTimer) clearTimeout(peer.holdOfferTimer);
+    peer.holdOfferTimer = null;
+}
+
 // ─── Routing ──────────────────────────────────────────────
 function route() {
     const m = location.pathname.match(/^\/room\/([A-Za-z0-9_-]+)$/);
@@ -2330,6 +2340,7 @@ function ensurePeer(peerId, polite, createDC, username) {
         iceRestartTimer: null,
         offerTimer: null, offerRetries: 0,
         settingRemoteAnswer: false,
+        holdOffer: false, holdOfferTimer: null,
         statsPrev: null,
         videoEl, audioEl, tileEl, remoteStream, remoteAudioStream, remoteCameraStream: null, dot,
         username: username || null,
@@ -2495,6 +2506,26 @@ function ensurePeer(peerId, polite, createDC, username) {
     pc.onnegotiationneeded = async () => {
         negotiatePeer(peer, 'negotiationneeded');
     };
+    // decisions/004 (2026-11-10 amendment): the joiner always offers first, so
+    // as the existing (polite) side we hold our own offer until theirs has
+    // been applied. Offering at the same time is glare that we resolve by
+    // rolling our offer back, and after that rollback Chrome rejects our
+    // follow-up offer when we are sharing with the mic off ("BUNDLE group
+    // contains a codec collision for header extension id") - the joiner then
+    // receives no media while both sides read connected + stable. Whatever
+    // their offer does not cover (screen track, audio placeholder) goes out in
+    // the follow-up offer that negotiationneeded fires once we are stable.
+    // The timer covers a joiner whose first offer never arrives.
+    if (polite && !createDC) {
+        peer.holdOffer = true;
+        peer.holdOfferTimer = setTimeout(() => {
+            peer.holdOfferTimer = null;
+            if (peers.get(peerId) !== peer || !peer.holdOffer) return;
+            peer.holdOffer = false;
+            logEvent('offer-hold-timeout', { peer: peerId.slice(0, 8) });
+            negotiatePeer(peer, 'hold timeout');
+        }, OFFER_HOLD_MS);
+    }
 
     // Encodings only exist once negotiated; (re)apply bitrate caps and audio
     // priority each time a negotiation settles (covers newly added senders).
@@ -2550,6 +2581,7 @@ async function onPeerSignal(fromId, payload) {
             cancelOfferTimeout(peer); // negotiation is moving (decisions/003)
             peer.offerRetries = 0;
             if (desc.type === 'offer') {
+                releaseOfferHold(peer); // their offer is in; ours may follow once stable
                 preferH264(pc);
                 await pc.setLocalDescription();
                 sendSignal(fromId, { description: pc.localDescription });
@@ -2563,6 +2595,7 @@ async function onPeerSignal(fromId, payload) {
         }
     } catch (err) {
         console.error('onPeerSignal error', err);
+        logEvent('signal-failed', { peer: fromId.slice(0, 8), kind: payload.description ? payload.description.type : 'candidate', err: String(err && err.message || err).slice(0, 160) });
     }
 }
 
@@ -2572,6 +2605,7 @@ function sendSignal(to, payload) {
 
 async function negotiatePeer(peer, reason) {
     if (!peer || peer.makingOffer || peer.pc.signalingState !== 'stable') return;
+    if (peer.holdOffer) return; // joiner offers first (see ensurePeer)
     try {
         peer.makingOffer = true;
         preferH264(peer.pc);
@@ -2580,6 +2614,7 @@ async function negotiatePeer(peer, reason) {
         scheduleOfferTimeout(peer);
     } catch (err) {
         console.error('negotiation failed:', reason, err);
+        logEvent('negotiate-failed', { peer: peer.id.slice(0, 8), reason, err: String(err && err.message || err).slice(0, 160) });
     } finally {
         peer.makingOffer = false;
     }
@@ -2759,6 +2794,7 @@ function removePeer(peerId) {
     if (!peer) return;
     cancelPeerIceRestart(peer);
     cancelOfferTimeout(peer);
+    releaseOfferHold(peer);
     for (const [fileId, transfer] of incomingFiles) {
         if (transfer.peer === peer) incomingFiles.delete(fileId);
     }

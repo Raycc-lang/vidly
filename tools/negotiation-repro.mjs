@@ -75,6 +75,13 @@
 //                 PASS iff A receives `signal-undeliverable`, the fake peer is
 //                 removed within a few seconds, and the real peer stays
 //                 connected.
+//   join-during-share  decisions/004 (2026-11-10): Ray is screen sharing with
+//                 the mic off (fake getDisplayMedia: canvas + oscillator) when
+//                 Maya joins, and again when Maya reloads. PASS iff Maya
+//                 decodes video frames and receives audio both times and Ray
+//                 logs no `negotiate-failed`. Before the fix Ray's follow-up
+//                 offer died in setLocalDescription after the setup glare
+//                 rollback and Maya got nothing.
 //
 // Every scenario also FAILs if any page throws an uncaught error (pageerror).
 
@@ -89,7 +96,7 @@ import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
-const ALL_SCENARIOS = ['setup', 'ghost-join', 'name-reuse', 'resume', 'watchdog-cap', 'undeliverable'];
+const ALL_SCENARIOS = ['setup', 'ghost-join', 'name-reuse', 'resume', 'watchdog-cap', 'undeliverable', 'join-during-share'];
 // WS_REJOIN_GRACE_MS per scenario (undefined = server default, 180s). The
 // ghost/name/resume scenarios must act well inside the grace period; set an
 // entry (e.g. 5000) to also observe behaviour after grace expiry.
@@ -225,10 +232,11 @@ class Run {
         this.contexts = [];
         this.pageErrors = [];
     }
-    async open(name, roomId) {
+    async open(name, roomId, { init } = {}) {
         const context = await this.browser.newContext();
         this.contexts.push(context);
         await context.addInitScript((n) => { try { localStorage.setItem('vidly-username', n); } catch {} }, name);
+        if (init) await context.addInitScript(init);
         await context.route('**/call-report', r => r.abort());
         const page = await context.newPage();
         // Signaling message types received, captured outside the page so they
@@ -248,6 +256,44 @@ class Run {
         this.contexts = [];
     }
 }
+
+// Init script: replace getDisplayMedia with an animated canvas plus an
+// oscillator, the same shape as a tab share with audio (headless Chromium has
+// no capture picker). The app's own startScreenShare() then runs unmodified.
+const fakeDisplayMedia = () => {
+    navigator.mediaDevices.getDisplayMedia = async () => {
+        const c = document.createElement('canvas');
+        c.width = 1280; c.height = 720;
+        const g = c.getContext('2d');
+        let n = 0;
+        setInterval(() => {
+            g.fillStyle = `hsl(${n++ % 360},80%,50%)`;
+            g.fillRect(0, 0, c.width, c.height);
+            g.fillStyle = '#fff';
+            g.font = '80px sans-serif';
+            g.fillText('frame ' + n, 100, 300);
+        }, 50);
+        const ac = new AudioContext();
+        const osc = ac.createOscillator();
+        const dest = ac.createMediaStreamDestination();
+        osc.connect(dest);
+        osc.start();
+        return new MediaStream([c.captureStream(20).getVideoTracks()[0], dest.stream.getAudioTracks()[0]]);
+    };
+};
+
+// Media actually received by a page: decoded video frames and audio bytes.
+const rxMedia = (client) => client.page.evaluate(async () => {
+    let frames = 0, audioBytes = 0;
+    for (const p of peers.values()) {
+        (await p.pc.getStats()).forEach((s) => {
+            if (s.type !== 'inbound-rtp') return;
+            if (s.kind === 'video') frames += s.framesDecoded || 0;
+            else audioBytes += s.bytesReceived || 0;
+        });
+    }
+    return { frames, audioBytes };
+});
 
 // Snapshot of the page's negotiation state.
 function snap(client) {
@@ -560,6 +606,41 @@ const scenarios = {
                 pass: !!removed && nack > 0 && realOk,
                 detail: `signal-undeliverable events=${nack}, fake peer removed=${!!removed}${removed ? ` in ${removedMs}ms` : ' (after 5s)'}, real peer connected+stable=${realOk}`,
                 debug: [`A[${summarizeEvents(s)}]`],
+            };
+        } finally {
+            ctx.pageErrors.push(...run.pageErrors);
+            await run.close();
+        }
+    },
+
+    async 'join-during-share'(ctx) {
+        const run = ctx.newRun();
+        try {
+            const room = newRoomId('share');
+            const ray = await run.open('Ray', room, { init: fakeDisplayMedia });
+            if (!(await waitJoined(ray))) return { pass: false, detail: 'Ray never joined' };
+            await ray.page.evaluate(() => startScreenShare()); // mic stays off
+            const sharing = await waitFor(() => ray.page.evaluate(() => isSharing), 5000);
+            if (!sharing) return { pass: false, detail: 'Ray could not start the fake screen share' };
+
+            const receives = (c) => waitFor(async () => {
+                try {
+                    const m = await rxMedia(c);
+                    return m.frames > 5 && m.audioBytes > 1000 ? m : null;
+                } catch { return null; } // page mid-reload
+            }, 15000);
+            const maya = await run.open('Maya', room);
+            const joinRx = await receives(maya);
+            await maya.page.reload({ waitUntil: 'domcontentloaded' });
+            const reloadRx = await receives(maya);
+
+            const sr = await snap(ray);
+            const failed = evCount(sr, 'negotiate-failed');
+            const fmt = (m) => m ? `yes (${m.frames} frames, ${m.audioBytes} audio bytes)` : 'NO';
+            return {
+                pass: !!joinRx && !!reloadRx && failed === 0,
+                detail: `join: media received=${fmt(joinRx)}; reload: media received=${fmt(reloadRx)}; sharer negotiate-failed=${failed}`,
+                debug: await pairDebug(ray, maya),
             };
         } finally {
             ctx.pageErrors.push(...run.pageErrors);

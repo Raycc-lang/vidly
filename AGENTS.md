@@ -29,9 +29,10 @@ Each one is a decision record in `decisions/`; read it before touching the area.
 6. **Camera off→on keeps the same track and sender** — pause capture + disable track, don't dispose. Replacing the track would not re-fire `pc.onTrack` on the receiver and the remote video never resumes.
 7. **Audio routing pins the output in `onWebRtcAudioTrackStart`** (decisions/006), not on fixed delays. Set the WebRTC track's preferred device (reflection) **before** `setCommunicationDevice`. Pre-Android-12 Bluetooth is a known gap.
 8. **BeautyVideoProcessor** (decisions/005): GL state lives in per-generation `Gl` objects so the processor survives camera pipeline rebuilds. Every `eglMakeCurrent` must **save and restore** the thread's prior EGL binding — never unbind; unbinding corrupts the SurfaceTextureHelper thread.
-9. **An offer arriving while our `setRemoteDescription(answer)` is pending is not a collision** (decisions/004 amendment). Web `peer.settingRemoteAnswer`, Android `pendingRemoteAnswers` (and the polite rollback is skipped while it's > 0). Without it every call setup can stall 10s on the watchdog. One `offer-ignored` per setup is genuine glare and expected.
+9. **An offer arriving while our `setRemoteDescription(answer)` is pending is not a collision** (decisions/004 amendment). Web `peer.settingRemoteAnswer`, Android `pendingRemoteAnswers` (and the polite rollback is skipped while it's > 0). Without it every call setup can stall 10s on the watchdog.
 10. **Grace-period seats are invisible** (decisions/009). Server: `isLiveSeat` gates `joined.peers`, the username check, the cap and `watch`; ghosts are evicted oldest-first when the map is full. A signal to a non-live target gets `signal-undeliverable`, which clients treat exactly like `peer-left`. It is a nack, not a buffer — never queue for a ghost.
 11. **TURN URLs**: pass the array. Credentials come from `/turn-credentials` as a Cloudflare `{iceServers:[...]}` passthrough and must be fetched synchronously **before** `signaling.connect()`. The set already includes UDP, TCP/80 and TLS/443 fallbacks — do not prune them, the China leg needs them.
+12. **The existing peer holds its first offer until the joiner's is applied** (decisions/004, 2026-11-10 amendment; web `peer.holdOffer`, 3s fallback). Offering simultaneously forces a rollback, after which Chrome rejects the follow-up offer when a share is live with the mic off — the joiner gets no media while both sides read connected. Call setup should log **zero** `offer-ignored`; a `negotiate-failed` event in a call-report is always a bug.
 
 ## Code map
 
@@ -45,7 +46,7 @@ Each one is a decision record in `decisions/`; read it before touching the area.
 │                                   #   behavior between platforms diverges.
 ├── decisions/                      # Architecture decision records (read before refactoring)
 ├── test-protocol.md                # Manual 2-device test protocol + automated harness (run before releases)
-├── tools/negotiation-repro.mjs     # Headless Chromium harness: 6 web/server negotiation &
+├── tools/negotiation-repro.mjs     # Headless Chromium harness: 7 web/server negotiation &
 │                                   #   seat scenarios against a local server.js (PASS/FAIL lines)
 ├── android/                        # Build root: cd android && ./gradlew ...
 │   ├── app-native/src/main/java/org/raycc/vidly/native/
@@ -94,6 +95,7 @@ The in-app **header status label** is the primary runtime observable (`Connected
 |---|---|
 | Call never connects cross-network | `curl https://voice.raycc.org/turn-credentials` (503 = keys unset, 502 = Cloudflare error) |
 | Call setup stalls ~10s / `Renegotiating...` right at call start | Answer-pending race (decisions/004 amendment); `node tools/negotiation-repro.mjs --only setup`; web `offer-timeout` with n=1 in call-reports, Android `VidlyNego` |
+| Someone joins/reloads during a screen share and sees nothing, both sides `Connected` | Offer hold (decisions/004, 2026-11-10); `negotiate-failed` in the sharer's call-report; harness `join-during-share` |
 | Joiner keeps offering to a peer that already left, or `username-taken` when rejoining from another device/browser within 3 min | Ghost seats (decisions/009); harness `ghost-join`, `name-reuse` |
 | Call dies after a network blip and never recovers | ICE observer + watchdog in `NativeWebRtcClient`; scenarios 1–3, 10 in test-protocol.md |
 | One side reconnects, other side frozen | Symmetric rebuild (decisions/001) — check `onJoined`/`onPeerJoined` teardown |

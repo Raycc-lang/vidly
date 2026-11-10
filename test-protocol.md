@@ -64,7 +64,7 @@ A scenario "passes" only if **all** pass criteria hold and **no** fail criteria 
 Headless reproduction of the web client's negotiation and the server's seat handling. Each scenario spawns its own `server.js` (free port 4100–4199, TURN unset — host/STUN candidates suffice on localhost; `/call-report` is blocked so nothing lands in `call-reports/`), drives real Chromium pages (one browser context per peer = separate clientId), and prints one `PASS|FAIL <scenario>: <numbers>` line. Exit code is non-zero on any FAIL. Runtime ≈ 4 min for the full set. **Must pass before a release.** It does not exercise the Android client.
 
 ```bash
-node tools/negotiation-repro.mjs                        # all 6 scenarios, setup n=10
+node tools/negotiation-repro.mjs                        # all 7 scenarios, setup n=10
 node tools/negotiation-repro.mjs --only setup --n 20    # one or more scenarios, comma-separated
 node tools/negotiation-repro.mjs --server-dir ../old-checkout   # show a bug reproduces on old code
 node tools/negotiation-repro.mjs --verbose              # dump page events on FAIL
@@ -74,11 +74,12 @@ node tools/negotiation-repro.mjs --verbose              # dump page events on FA
 
 | Scenario | Proves | Pass |
 |---|---|---|
-| `setup` | Answer-pending guard (decisions/004): the polite peer's follow-up offer is not ignored while the joiner's SRD(answer) is pending. N trials of A joins, B joins 1.5 s later, observe ~13 s. | **0/N** trials with any `offer-timeout`, and every trial ends connected + stable on both sides. One `offer-ignored` per trial is expected (genuine glare). |
+| `setup` | Answer-pending guard (decisions/004): the polite peer's follow-up offer is not ignored while the joiner's SRD(answer) is pending. N trials of A joins, B joins 1.5 s later, observe ~13 s. | **0/N** trials with any `offer-timeout`, and every trial ends connected + stable on both sides. `offer-ignored events=0` is expected since the offer hold (004, 2026-11-10). |
 | `ghost-join` | A grace-period seat isn't offered to a joiner (decisions/009). A joins, closes; C joins within grace. | C holds no peer for A and logs 0 `offer-timeout` over 15 s. |
 | `name-reuse` | A ghost doesn't hold its username (009). Ray leaves; a **new** context (new clientId) named Ray joins within grace. | New Ray gets `joined` (no `username-taken`) and connects to Friend. |
 | `resume` | Symmetric rebuild on both rejoin paths (decisions/001). Phase 1: Ray's page reloads (Chromium: clean `leave` + new peerId). Phase 2: Ray's WebSocket is closed without `leave` (resume: same peerId, `joined.resumed=true`). | Each phase: connected + stable again within ~15 s on a PC Friend didn't have before (or a `peer-joined`/`peer-resumed`); phase 2 additionally keeps the peerId and is a resumed join. |
 | `watchdog-cap` | Bounded watchdog (decisions/003). B drops every answer; A offers. | A's `offer-timeout` events carry `n` and `ice`, stop at n = 4 with `offer-abandoned`, and no further `offer-timeout` for ~15 s (~55–60 s total). |
+| `join-during-share` | Offer hold (decisions/004, 2026-11-10). Ray shares with the mic off (fake `getDisplayMedia`: canvas + oscillator); Maya joins, then reloads. | Maya decodes video frames and receives audio after the join **and** after the reload; Ray logs 0 `negotiate-failed`. |
 | `undeliverable` | Negative ack (009). A offers to a fake peer id. | A gets `signal-undeliverable`, drops the fake peer within a few seconds, and the real peer stays connected. |
 
 **`setup` is a rate, not a yes/no.** The bug it guards is a race: the old code stalled in 5/8, 12/12 and 4/8 trials on different runs, so a small N under-samples it. `--n` has a minimum of 8; only **0/N** passes. If you are validating a negotiation change, use `--n 20` or more.
